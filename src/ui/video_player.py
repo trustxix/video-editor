@@ -32,6 +32,7 @@ class PitchedAudioPlayer:
         self._pos = 0.0  # fractional frame position in input
         self._gen = 0
         self._automation = None  # set to AutomationLane for per-sample speed lookup
+        self._extract_proc: subprocess.Popen | None = None  # current ffmpeg PCM extraction
 
     def extract_audio(self, video_path: str):
         self.stop()
@@ -47,16 +48,19 @@ class PitchedAudioPlayer:
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = 0
-            r = subprocess.run(
+            # Use Popen (not run) so release() can terminate an in-progress extraction.
+            proc = subprocess.Popen(
                 [get_ffmpeg(), '-i', path, '-vn',
                  '-f', 's16le', '-acodec', 'pcm_s16le',
                  '-ac', '2', '-ar', '48000', '-'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 startupinfo=si,
             )
-            if gen == self._gen and r.stdout:
+            self._extract_proc = proc
+            stdout, _ = proc.communicate()
+            if gen == self._gen and stdout:
                 a = array.array('h')
-                a.frombytes(r.stdout)
+                a.frombytes(stdout)
                 self._pcm = a
         except Exception:
             pass
@@ -128,7 +132,20 @@ class PitchedAudioPlayer:
 
     def release(self):
         self.stop()
-        self._pcm_bytes = None
+        # Kill any in-progress audio extraction so the ffmpeg child doesn't
+        # outlive pythonw as an orphan.
+        if self._extract_proc is not None:
+            try:
+                if self._extract_proc.poll() is None:
+                    self._extract_proc.terminate()
+                    try:
+                        self._extract_proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        self._extract_proc.kill()
+            except Exception:
+                pass
+            self._extract_proc = None
+        self._pcm = None
         self._gen += 1
 
 

@@ -7,16 +7,18 @@ from PyQt6.QtWidgets import (
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QPushButton, QFileDialog,
     QProgressBar, QMessageBox, QApplication, QLineEdit, QSlider
 )
-from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QThread, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import QMediaPlayer
 
 from src.core.paths import get_config_dir
 from src.core.video_item import VideoItem
+from src.core.archive import archive_original
 from src.ui.video_player import VideoPlayer
 from src.ui.crop_overlay import CropOverlay
 from src.ui.trim_controls import TrimControls
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.automation_lane import AutomationLane
+from src.ui.themes import apply_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
     build_command, get_output_path, get_video_duration,
@@ -81,6 +83,8 @@ class MainWindow(QMainWindow):
         self._last_output: str = ""
         self._settings_path = get_config_dir() / "settings.json"
         self._settings = self._load_settings()
+        apply_theme(self._settings.get("theme", DEFAULT_THEME))
+        self._apply_stay_on_top(self._settings.get("stay_on_top", False))
 
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
@@ -441,6 +445,16 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"Video Editor \u2014 {name}")
 
     def closeEvent(self, event):
+        # Dead-man's switch: if clean shutdown hangs for any reason (stuck
+        # QThread, unresponsive subprocess, audio sink refusing to release),
+        # force-exit after 8 seconds so the user never has to kill pythonw
+        # manually. Daemon so it can't keep the process alive on its own.
+        import os as _os
+        import threading as _th
+        _watchdog = _th.Timer(8.0, lambda: _os._exit(1))
+        _watchdog.daemon = True
+        _watchdog.start()
+
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(5000)
@@ -479,6 +493,10 @@ class MainWindow(QMainWindow):
             "aspect_ratio": "16:9", "crop_mode": "crop",
             "default_speed": 1.0, "output_suffix": "_edited",
             "auto_advance": False, "audio_mode": "copy",
+            "move_originals_to_archive": False,
+            "untrimmed_archive_dir": "",
+            "theme": DEFAULT_THEME,
+            "stay_on_top": False,
         }
         try:
             data = json.loads(self._settings_path.read_text())
@@ -508,8 +526,39 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         dlg = SettingsDialog(self._settings, self)
         if dlg.exec():
+            prev_theme = self._settings.get("theme", DEFAULT_THEME)
+            prev_on_top = self._settings.get("stay_on_top", False)
             self._settings = dlg.get_settings()
             self._save_settings()
+            if self._settings.get("theme", DEFAULT_THEME) != prev_theme:
+                apply_theme(self._settings["theme"])
+            if self._settings.get("stay_on_top", False) != prev_on_top:
+                self._apply_stay_on_top(self._settings["stay_on_top"])
+
+    def _apply_stay_on_top(self, enabled: bool):
+        """Toggle always-on-top via the native Win32 API.
+
+        We can't use Qt's setWindowFlag(WindowStaysOnTopHint, ...) here: on
+        Windows it destroys and recreates the HWND, which segfaults the bound
+        QMediaPlayer / QVideoSink pipeline (native crash, no traceback).
+        SetWindowPos(HWND_TOPMOST) toggles the OS-level topmost bit directly
+        without touching any Qt resources.
+        """
+        import ctypes
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+        try:
+            hwnd = int(self.winId())
+            flag = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, flag, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        except Exception:
+            pass
 
     # ── Undo / Redo ────────────────────────────────────────
 
@@ -937,10 +986,55 @@ class MainWindow(QMainWindow):
             self._worker.wait()
             self._worker = None
         if success:
+            archive_status = self._archive_original_clip()
             QMessageBox.information(self, "Export Complete",
-                                    f"Saved to:\n{self._last_output}")
+                                    f"Saved to:\n{self._last_output}{archive_status}")
             if self._settings.get("auto_advance", False):
                 self._go_next()
         else:
             msg = error_msg or "FFmpeg returned an error. Check the console for details."
             QMessageBox.warning(self, "Export Failed", msg)
+
+    def _archive_original_clip(self) -> str:
+        """Move the just-exported source clip into the archive folder.
+
+        Returns a string to append to the success message (blank when disabled
+        or skipped). The media player is temporarily unloaded so Windows
+        releases the file handle — otherwise shutil.move fails with a sharing
+        violation. The player is reloaded from the new location afterward so
+        navigation back/forward through the queue still works.
+        """
+        if not self._settings.get("move_originals_to_archive"):
+            return ""
+        archive_dir = self._settings.get("untrimmed_archive_dir", "").strip()
+        if not archive_dir:
+            return "\n(Archive skipped: no archive folder configured.)"
+        if not self._video_path:
+            return ""
+
+        source = Path(self._video_path)
+        try:
+            # Release the QMediaPlayer file handle before touching the file.
+            self.player.player.setSource(QUrl())
+            QApplication.processEvents()
+
+            new_path = archive_original(source, Path(archive_dir))
+        except Exception as e:
+            # Reload the original so the player isn't left empty.
+            try:
+                self.player.load(str(source))
+            except Exception:
+                pass
+            return f"\nArchive failed: {e}"
+
+        new_path_str = str(new_path)
+        if new_path_str == str(source):
+            # No-op (source was already inside the archive). Reload player.
+            self.player.load(new_path_str)
+            return ""
+
+        if 0 <= self._queue_index < len(self._queue):
+            self._queue[self._queue_index].path = new_path_str
+        self._video_path = new_path_str
+        self.player.load(new_path_str)
+        return f"\nOriginal archived to:\n{new_path_str}"

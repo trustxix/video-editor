@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.presets import ASPECT_PRESETS
+from src.ui.themes import THEMES, DEFAULT_THEME
 
 QUALITY_PRESETS = {
     "Lossless (CRF 0)": 0,
@@ -131,6 +132,34 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(output_group)
 
+        # ── Archive Originals ─────────────────────────────────
+        archive_group = QGroupBox("Archive Originals")
+        ag = QVBoxLayout(archive_group)
+
+        self.chk_archive = QCheckBox("Move original clip to archive folder after export")
+        self.chk_archive.setChecked(self.settings.get("move_originals_to_archive", False))
+        ag.addWidget(self.chk_archive)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Archive to:"))
+        self.txt_archive_dir = QLineEdit(self.settings.get("untrimmed_archive_dir", ""))
+        self.txt_archive_dir.setPlaceholderText("e.g. D:\\Clips\\Untrimmed Clips")
+        row.addWidget(self.txt_archive_dir)
+        self.btn_browse_archive = QPushButton("Browse...")
+        self.btn_browse_archive.clicked.connect(self._browse_archive)
+        row.addWidget(self.btn_browse_archive)
+        ag.addLayout(row)
+
+        hint = QLabel(
+            "Year/month folder structure (e.g. 2026\\04 - April) is detected "
+            "automatically and preserved."
+        )
+        hint.setStyleSheet("color: gray; font-size: 9pt;")
+        hint.setWordWrap(True)
+        ag.addWidget(hint)
+
+        layout.addWidget(archive_group)
+
         # ── Workflow ──────────────────────────────────────────
         workflow_group = QGroupBox("Workflow")
         wg = QVBoxLayout(workflow_group)
@@ -139,7 +168,23 @@ class SettingsDialog(QDialog):
         self.chk_advance.setChecked(self.settings.get("auto_advance", False))
         wg.addWidget(self.chk_advance)
 
+        self.chk_on_top = QCheckBox("Keep window always on top")
+        self.chk_on_top.setChecked(self.settings.get("stay_on_top", False))
+        wg.addWidget(self.chk_on_top)
+
         layout.addWidget(workflow_group)
+
+        # ── Appearance ────────────────────────────────────────
+        appearance_group = QGroupBox("Appearance")
+        apg = QHBoxLayout(appearance_group)
+        apg.addWidget(QLabel("Theme:"))
+        self.cmb_theme = QComboBox()
+        self.cmb_theme.addItems(THEMES.keys())
+        current_theme = self.settings.get("theme", DEFAULT_THEME)
+        if current_theme in THEMES:
+            self.cmb_theme.setCurrentText(current_theme)
+        apg.addWidget(self.cmb_theme, stretch=1)
+        layout.addWidget(appearance_group)
 
         # ── Buttons ───────────────────────────────────────────
         buttons = QDialogButtonBox(
@@ -154,12 +199,18 @@ class SettingsDialog(QDialog):
         if folder:
             self.txt_output.setText(folder)
 
+    def _browse_archive(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose Archive Folder")
+        if folder:
+            self.txt_archive_dir.setText(folder)
+
     def get_settings(self) -> dict:
         codec = "h264" if self.cmb_codec.currentText() == "H.264" else "h265"
         crf = QUALITY_PRESETS[self.cmb_quality.currentText()]
         audio_mode = AUDIO_MODES[self.cmb_audio.currentText()]
         output_dir = self.txt_output.text().strip()
         suffix = self.txt_suffix.text().strip() or "_edited"
+        archive_dir = self.txt_archive_dir.text().strip()
         return {
             "codec": codec,
             "crf": crf,
@@ -170,4 +221,8 @@ class SettingsDialog(QDialog):
             "crop_mode": "stretch" if self.cmb_crop_mode.currentText() == "Stretch" else "crop",
             "default_speed": self.spn_speed.value(),
             "auto_advance": self.chk_advance.isChecked(),
+            "move_originals_to_archive": self.chk_archive.isChecked(),
+            "untrimmed_archive_dir": archive_dir,
+            "theme": self.cmb_theme.currentText(),
+            "stay_on_top": self.chk_on_top.isChecked(),
         }

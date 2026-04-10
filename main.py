@@ -42,7 +42,12 @@ def main():
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    rc = app.exec()
+    # Force-exit: guarantees the interpreter dies immediately instead of
+    # possibly hanging on a non-daemon thread or orphaned subprocess. By the
+    # time app.exec() returns, Qt's own cleanup has already finished, so we
+    # don't need atexit/stdlib teardown.
+    os._exit(rc)
 
 
 if __name__ == "__main__":
