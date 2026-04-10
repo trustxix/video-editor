@@ -1,40 +1,49 @@
 # Simple Video Editor
 
-(no description yet)
+A PyQt6 video editor with crop, trim, speed control, and batch export via FFmpeg.
 
-## Project Overview
+## Tech Stack
+- Python 3.14 + PyQt6 6.11 (Fusion style)
+- FFmpeg/FFprobe for video processing
+- No other dependencies
 
-Describe what this PowerShell project does and its primary goals.
+## Architecture
 
-## Key Files
+- `main.py` — Entry point, stderr suppression, single-instance mutex, QApplication
+- `src/core/paths.py` — Dynamic path resolution (frozen/source), FFmpeg detection
+- `src/core/presets.py` — Aspect ratio presets, calc_preset_crop, calc_stretch_to_fit
+- `src/core/video_item.py` — Dataclass: per-video state (crop, trim, speed, stretch, lock)
+- `src/core/ffmpeg_runner.py` — FFmpeg command builder, probing, export with progress
+- `src/ui/video_player.py` — VideoSurface (QVideoSink+QPainter) + VideoPlayer (QMediaPlayer)
+- `src/ui/crop_overlay.py` — Screen-fixed crop rectangle, view transform, stretch/pan
+- `src/ui/trim_controls.py` — Custom dual-handle RangeSlider + time text fields
+- `src/ui/main_window.py` — Main window, queue, settings, all signal wiring
+- `src/ui/settings_dialog.py` — Persisted settings dialog
+- `config/settings.json` — User settings (auto-created at runtime)
+- `tools/build.bat` — PyInstaller build script
+- `Video Editor.bat` — Launch script (uses pythonw)
 
-- List important .ps1 files and their purposes here
+## Key Patterns
 
-## PowerShell Conventions
-
-- UTF-8 BOM required on .ps1 files with non-ASCII characters
-- CRLF line endings for Windows PowerShell compatibility
-- Never use `$input` as a variable name — it is reserved by PowerShell
-- Modulo preserves sign in PS5: `-1 % n = -1`, not `n-1`. Guard negative indices.
-- Use `[PSCustomObject]@{...}` for objects; `@{...}` for hashtables
-- `ConvertFrom-Json` returns PSCustomObject — use `Add-Member` to add properties
-
-## Parameter Style
-
-```powershell
-function Do-Something {
-    param(
-        [string]$Name,
-        [int]$Count = 1
-    )
-    # implementation
-}
-```
+- VideoSurface uses QVideoSink (not QVideoWidget) — native surface kills overlays on Windows
+- Crop overlay is a child of VideoSurface, uses eventFilter for auto-resize
+- Two coordinate systems: content (affects export) and view (visual zoom/pan only)
+- Screen-fixed crop: crop box stays put, video moves behind it
+- Signal feedback prevention: blockSignals, _updating_spinboxes, _restoring flags
+- Audio speed: asetrate+aresample (natural pitch shift, no atempo)
+- FFmpeg `-t` (duration) not `-to` (absolute) when using `-ss` before `-i`
 
 ## Commands
 
-```powershell
-# Run the script
-powershell -ExecutionPolicy Bypass -File .\main.ps1
-```
+```bash
+# Run the app
+python main.py
+# or via launch script (no console window)
+"Video Editor.bat"
 
+# Build exe
+tools\build.bat
+
+# Install dependencies
+pip install -r requirements.txt
+```
