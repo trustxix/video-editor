@@ -38,6 +38,16 @@ class PitchedAudioPlayer:
 
     def extract_audio(self, video_path: str):
         self.stop()
+        # Kill any in-progress extraction before starting a new one —
+        # without this, rapid navigation spawns N concurrent ffmpeg
+        # processes that keep decoding audio for clips already left behind.
+        if self._extract_proc is not None:
+            try:
+                if self._extract_proc.poll() is None:
+                    self._extract_proc.terminate()
+            except Exception:
+                pass
+            self._extract_proc = None
         self._pcm = None
         self._gen += 1
         gen = self._gen
@@ -472,7 +482,13 @@ class VideoPlayer(QWidget):
             if self._pitched_active and self._pitched.ready:
                 # Delay by one tick so MainWindow._on_playback_state can
                 # correct the position first (for frame-step → play sync).
-                QTimer.singleShot(0, lambda: self._pitched.play(self.player.position()))
+                # Guard: only start if still playing when the tick fires
+                # (user may have paused in the meantime).
+                QTimer.singleShot(0, lambda: (
+                    self._pitched.play(self.player.position())
+                    if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                    else None
+                ))
         else:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self._pitched.stop()

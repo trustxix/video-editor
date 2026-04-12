@@ -195,6 +195,14 @@ class SettingsDialog(QDialog):
         self.chk_on_top.setChecked(self.settings.get("stay_on_top", False))
         wg.addWidget(self.chk_on_top)
 
+        self.chk_normalize = QCheckBox("Normalize audio on export (EBU R128, -14 LUFS)")
+        self.chk_normalize.setChecked(self.settings.get("normalize_audio", False))
+        self.chk_normalize.setToolTip(
+            "Applies loudness normalization to all exports globally. "
+            "Can also be toggled per-clip in the Adjustments panel."
+        )
+        wg.addWidget(self.chk_normalize)
+
         layout.addWidget(workflow_group)
 
         # ── Appearance ────────────────────────────────────────
@@ -261,6 +269,7 @@ class SettingsDialog(QDialog):
             "untrimmed_archive_dir": archive_dir,
             "theme": self.cmb_theme.currentText(),
             "stay_on_top": self.chk_on_top.isChecked(),
+            "normalize_audio": self.chk_normalize.isChecked(),
             "ui_scale": self.sld_scale.value(),
             "keybinds": self.keybind_editor.get_bindings(),
         }

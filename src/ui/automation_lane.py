@@ -220,12 +220,19 @@ class AutomationLane(QWidget):
                 return i
         return -1
 
-    def _sort_and_find(self, t: int, s: float) -> int:
-        self._keyframes.sort(key=lambda k: k[0])
-        for i, (kt, ks) in enumerate(self._keyframes):
-            if kt == t and ks == s:
-                return i
-        return 0
+    def _sort_and_find(self, tracked_idx: int) -> int:
+        """Sort keyframes by time and return the new index of the keyframe
+        that was at `tracked_idx` before the sort. Uses index tracking
+        rather than value matching to handle duplicate (t, s) pairs."""
+        indexed = list(enumerate(self._keyframes))
+        indexed.sort(key=lambda p: p[1][0])
+        new_idx = 0
+        self._keyframes = [kf for _, kf in indexed]
+        for j, (orig_idx, _) in enumerate(indexed):
+            if orig_idx == tracked_idx:
+                new_idx = j
+                break
+        return new_idx
 
     def mousePressEvent(self, event: QMouseEvent):
         self.setFocus()
@@ -250,7 +257,8 @@ class AutomationLane(QWidget):
                 t = self._x_to_t(x)
                 s = self._y_to_speed(y)
                 self._keyframes.append((t, s))
-                self._dragging_idx = self._sort_and_find(t, s)
+                appended_idx = len(self._keyframes) - 1
+                self._dragging_idx = self._sort_and_find(appended_idx)
                 self._selected_idx = self._dragging_idx
                 self.changed.emit()
                 self.update()
@@ -270,10 +278,14 @@ class AutomationLane(QWidget):
                 # Duplicate — works even on locked keyframes.
                 # Offset by 1ms so the new keyframe doesn't inherit
                 # the lock (lock is tracked by (t, s) identity).
+                # If already at the right edge, can't place a unique copy.
                 t, s = self._keyframes[idx]
-                new_t = min(t + 1, self._max_ms)
+                if t >= self._max_ms:
+                    return
+                new_t = t + 1
                 self._keyframes.append((new_t, s))
-                new_idx = self._sort_and_find(new_t, s)
+                appended_idx = len(self._keyframes) - 1
+                new_idx = self._sort_and_find(appended_idx)
                 self._dragging_idx = new_idx
                 self._selected_idx = new_idx
                 self._drag_lock_speed = s  # horizontal-only drag
@@ -308,7 +320,7 @@ class AutomationLane(QWidget):
         # If horizontal lock is active (duplicate drag), keep the original speed
         s = self._drag_lock_speed if self._drag_lock_speed is not None else self._y_to_speed(y)
         self._keyframes[self._dragging_idx] = (t, s)
-        self._dragging_idx = self._sort_and_find(t, s)
+        self._dragging_idx = self._sort_and_find(self._dragging_idx)
         self.changed.emit()
         self.update()
 
@@ -353,7 +365,7 @@ class AutomationLane(QWidget):
             return
 
         self._keyframes[idx] = (t, s)
-        self._selected_idx = self._sort_and_find(t, s)
+        self._selected_idx = self._sort_and_find(idx)
         self.changed.emit()
         self.update()
 

@@ -28,7 +28,8 @@ from src.ui.themes import apply_theme, is_dark_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
     build_command, extract_frame, get_output_path, get_video_duration,
-    get_video_fps, get_video_resolution, run_export, export_with_automation,
+    get_video_fps, get_video_resolution, loudnorm_analyze, run_export,
+    export_with_automation,
 )
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')
@@ -173,7 +174,7 @@ class MainWindow(QMainWindow):
     def _build_action_handlers(self):
         """Map action IDs to callables. Called once after _setup_ui."""
         self._action_handlers: dict[str, callable] = {
-            "play_pause":          self.player._toggle_play,
+            "play_pause":          self._play_pause,
             "frame_step_forward":  lambda: self._frame_step(1),
             "frame_step_backward": lambda: self._frame_step(-1),
             "seek_forward_5s":     lambda: self._seek_relative(5000),
@@ -338,69 +339,110 @@ class MainWindow(QMainWindow):
         self.lbl_speed.setStyleSheet("font-family: monospace;")
         efx.addWidget(self.lbl_speed)
 
-        efx.addWidget(QLabel("Stretch:"))
+        # ── Stretch (collapsible inside Effects) ──────────────
+        self.btn_toggle_stretch = QPushButton("Stretch \u25B6")
+        self.btn_toggle_stretch.setFixedWidth(70)
+        self.btn_toggle_stretch.setCheckable(True)
+        efx.addWidget(self.btn_toggle_stretch)
+
+        self.stretch_panel = QWidget()
+        sp = QHBoxLayout(self.stretch_panel)
+        sp.setContentsMargins(0, 0, 0, 0)
         self.spn_stretch_h = QSpinBox()
         self.spn_stretch_h.setPrefix("H:")
         self.spn_stretch_h.setSuffix("%")
         self.spn_stretch_h.setRange(10, 500)
         self.spn_stretch_h.setValue(100)
         self.spn_stretch_h.setSingleStep(10)
-        efx.addWidget(self.spn_stretch_h)
-
+        sp.addWidget(self.spn_stretch_h)
         self.spn_stretch_v = QSpinBox()
         self.spn_stretch_v.setPrefix("V:")
         self.spn_stretch_v.setSuffix("%")
         self.spn_stretch_v.setRange(10, 500)
         self.spn_stretch_v.setValue(100)
         self.spn_stretch_v.setSingleStep(10)
-        efx.addWidget(self.spn_stretch_v)
+        sp.addWidget(self.spn_stretch_v)
+        self.stretch_panel.setVisible(False)
+        efx.addWidget(self.stretch_panel)
+
+        self.btn_toggle_stretch.toggled.connect(lambda on: (
+            self.stretch_panel.setVisible(on),
+            self.btn_toggle_stretch.setText("Stretch \u25BC" if on else "Stretch \u25B6"),
+        ))
 
         bottom.addWidget(effects_group, stretch=2)
 
-        # ── Color adjustments ─────────────────────────────────
-        color_group = QGroupBox("Color")
-        cg = QVBoxLayout(color_group)
+        # ── Adjustments (collapsible: brightness, exposure, more later)
+        adj_group = QGroupBox("Adjustments")
+        ag = QVBoxLayout(adj_group)
+
+        self.btn_normalize = QPushButton("Normalize Audio")
+        self.btn_normalize.setCheckable(True)
+        self.btn_normalize.setEnabled(False)
+        self.btn_normalize.setToolTip(
+            "EBU R128 loudness normalization (-14 LUFS). "
+            "Analyzes and normalizes audio on export."
+        )
+        self.btn_normalize.toggled.connect(self._on_normalize_toggled)
+        ag.addWidget(self.btn_normalize)
+
+        self.btn_toggle_adj = QPushButton("Brightness / Exposure \u25B6")
+        self.btn_toggle_adj.setCheckable(True)
+        ag.addWidget(self.btn_toggle_adj)
+
+        self.adj_panel = QWidget()
+        ap = QVBoxLayout(self.adj_panel)
+        ap.setContentsMargins(0, 0, 0, 0)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Bright:"))
+        row.addWidget(QLabel("Brightness:"))
         self.sld_brightness = ClickSlider(Qt.Orientation.Horizontal)
         self.sld_brightness.setRange(-100, 100)
         self.sld_brightness.setValue(0)
-        self.sld_brightness.setMinimumWidth(130)
         self.sld_brightness.setToolTip("Preview is approximate; export is precise (ffmpeg eq)")
         self.sld_brightness.valueChanged.connect(self._on_brightness_changed)
+        self.sld_brightness.sliderReleased.connect(self._on_color_slider_released)
         row.addWidget(self.sld_brightness, stretch=1)
         self.lbl_brightness = QLabel("0")
         self.lbl_brightness.setFixedWidth(35)
         self.lbl_brightness.setStyleSheet("font-family: monospace;")
         row.addWidget(self.lbl_brightness)
-        cg.addLayout(row)
+        ap.addLayout(row)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Expose:"))
+        row.addWidget(QLabel("Exposure:"))
         self.sld_exposure = ClickSlider(Qt.Orientation.Horizontal)
         self.sld_exposure.setRange(-100, 100)
         self.sld_exposure.setValue(0)
-        self.sld_exposure.setMinimumWidth(130)
         self.sld_exposure.setToolTip("Photographic stops (-3 to +3). Export is precise (ffmpeg exposure)")
         self.sld_exposure.valueChanged.connect(self._on_exposure_changed)
+        self.sld_exposure.sliderReleased.connect(self._on_color_slider_released)
         row.addWidget(self.sld_exposure, stretch=1)
         self.lbl_exposure = QLabel("0")
         self.lbl_exposure.setFixedWidth(35)
         self.lbl_exposure.setStyleSheet("font-family: monospace;")
         row.addWidget(self.lbl_exposure)
-        cg.addLayout(row)
+        ap.addLayout(row)
 
-        # "Reset" button — one click to zero both sliders
         row = QHBoxLayout()
         row.addStretch()
         self.btn_reset_color = QPushButton("Reset")
         self.btn_reset_color.setFixedWidth(70)
         self.btn_reset_color.clicked.connect(self._reset_color)
         row.addWidget(self.btn_reset_color)
-        cg.addLayout(row)
+        ap.addLayout(row)
 
-        bottom.addWidget(color_group, stretch=2)
+        self.adj_panel.setVisible(False)
+        ag.addWidget(self.adj_panel)
+
+        self.btn_toggle_adj.toggled.connect(lambda on: (
+            self.adj_panel.setVisible(on),
+            self.btn_toggle_adj.setText(
+                "Brightness / Exposure \u25BC" if on else "Brightness / Exposure \u25B6"
+            ),
+        ))
+
+        bottom.addWidget(adj_group, stretch=2)
 
         export_group = QGroupBox("Export")
         eg = QVBoxLayout(export_group)
@@ -547,7 +589,9 @@ class MainWindow(QMainWindow):
 
         self.btn_export.setEnabled(True)
         self.btn_export_list.setEnabled(True)
+        self.btn_normalize.setEnabled(True)
         self._sync_export_list_button()
+        self._sync_normalize_button()
         self._update_nav()
         self._update_status_bar()
 
@@ -570,6 +614,8 @@ class MainWindow(QMainWindow):
         item.stretch_v = self.spn_stretch_v.value() / 100.0
         item.brightness = self.sld_brightness.value() * self._BRIGHTNESS_SCALE
         item.exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
+        item.pan_x = self.player.surface._pan_x
+        item.pan_y = self.player.surface._pan_y
         item.locked = self.btn_lock_crop.isChecked()
         item.speed_keyframes = self.automation.get_keyframes()
 
@@ -600,6 +646,8 @@ class MainWindow(QMainWindow):
         self.spn_stretch_v.setValue(int(item.stretch_v * 100))
         self._updating_stretch = False
         self.player.surface.set_stretch(item.stretch_h, item.stretch_v)
+        self.player.surface._pan_x = item.pan_x
+        self.player.surface._pan_y = item.pan_y
 
         # Restore color adjustments. Slider signals are silenced by the
         # outer self._restoring = True guard at the top of this method,
@@ -694,6 +742,8 @@ class MainWindow(QMainWindow):
         self.btn_export_list.setEnabled(False)
         self.btn_export_list.setChecked(False)
         self.btn_export_batch.setEnabled(False)
+        self.btn_normalize.setEnabled(False)
+        self.btn_normalize.setChecked(False)
         # Clear any stale editing state so it doesn't leak into the next
         # clip the user drops in.
         self.automation.clear()
@@ -871,8 +921,9 @@ class MainWindow(QMainWindow):
         # Use the stepped position if already stepping, else QMediaPlayer's
         base_ms = self._stepped_pos if self._stepped_pos is not None else self.player.player.position()
         new_ms = max(0, base_ms + direction * frame_ms)
-        if self.player._duration_ms > 0:
-            new_ms = min(new_ms, self.player._duration_ms)
+        # Clamp to trim zone — frame stepping must not escape the trim region
+        start_ms, end_ms = self.trim.slider.get_selection()
+        new_ms = max(start_ms, min(new_ms, end_ms))
 
         bmp = extract_frame(self._video_path, new_ms / 1000.0)
         if bmp:
@@ -924,7 +975,10 @@ class MainWindow(QMainWindow):
             "untrimmed_archive_dir": "",
             "theme": DEFAULT_THEME,
             "stay_on_top": False,
-            "preview_volume": 100,      # 0-100, preview playback only — never affects exports
+            "preview_volume": 100,
+            "normalize_audio": False,
+            "ui_scale": 90,
+            "keybinds": {},
         }
         try:
             data = json.loads(self._settings_path.read_text())
@@ -1081,6 +1135,7 @@ class MainWindow(QMainWindow):
             'exposure': self.sld_exposure.value(),
             'locked': self.btn_lock_crop.isChecked(),
             'keyframes': self.automation.get_keyframes(),
+            'locked_keyframes': list(self.automation._locked_keyframes),
         }
 
     def _push_undo(self):
@@ -1141,6 +1196,9 @@ class MainWindow(QMainWindow):
         self.btn_lock_crop.setChecked(state['locked'])
 
         self.automation.set_keyframes(state['keyframes'])
+        self.automation._locked_keyframes = set(
+            tuple(kf) for kf in state.get('locked_keyframes', [])
+        )
 
         if state['crop_mode'] == "Crop":
             self.crop_overlay.set_aspect_ratio(ASPECT_PRESETS.get(state['preset']))
@@ -1163,6 +1221,22 @@ class MainWindow(QMainWindow):
             return
         self._undo_stack.append(self._capture_state())
         self._apply_undo_state(self._redo_stack.pop())
+
+    def _play_pause(self):
+        """Play/pause with trim-zone awareness.
+
+        If paused at or past the trim end, pressing play restarts from
+        trim start — not from the beginning of the original clip.
+        If paused before the trim start, jump to trim start first.
+        """
+        if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.player.pause()
+            return
+        start_ms, end_ms = self.trim.slider.get_selection()
+        pos = self._stepped_pos if self._stepped_pos is not None else self.player.player.position()
+        if pos >= end_ms or pos < start_ms:
+            self.player.seek(start_ms)
+        self.player._toggle_play()
 
     def _apply_speed(self, rate: float):
         """Apply speed from any source (slider, semitone, or automation)."""
@@ -1208,6 +1282,7 @@ class MainWindow(QMainWindow):
         self._apply_speed(rate)
 
     def _on_stretch_dragged(self, h: float, v: float):
+        self._push_undo()
         self.player.surface.set_stretch(h, v)
         self._updating_stretch = True
         self.spn_stretch_h.setValue(int(h * 100))
@@ -1217,6 +1292,7 @@ class MainWindow(QMainWindow):
     def _on_stretch_spinbox_changed(self):
         if self._updating_stretch:
             return
+        self._push_undo()
         h = self.spn_stretch_h.value() / 100.0
         v = self.spn_stretch_v.value() / 100.0
         self.player.surface.set_stretch(h, v)
@@ -1250,18 +1326,22 @@ class MainWindow(QMainWindow):
 
     def _on_playback_position(self, pos_ms: int):
         """Update trim playhead, enforce trim boundaries, apply speed automation."""
-        self.trim.set_playhead(pos_ms)
-        self.automation.set_playhead(pos_ms)
+        start_ms, end_ms = self.trim.slider.get_selection()
+
+        # Clamp the visual playhead to the trim zone
+        clamped = max(start_ms, min(pos_ms, end_ms))
+        self.trim.set_playhead(clamped)
+        self.automation.set_playhead(clamped)
 
         if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             # Smooth automation: only update speed variable, never touch audio pipeline
             if self.automation.get_keyframes():
-                auto_speed = self.automation.get_speed_at(pos_ms)
+                auto_speed = self.automation.get_speed_at(clamped)
                 if abs(auto_speed - self.player._speed) > 0.005:
                     self._apply_speed_live(auto_speed)
 
-            start_ms, end_ms = self.trim.slider.get_selection()
-            if end_ms < self.trim.slider._max and pos_ms > end_ms:
+            # Stop at trim end — always, not just when trim < clip duration
+            if pos_ms >= end_ms:
                 self.player.player.pause()
                 self.player.seek(end_ms)
 
@@ -1311,6 +1391,7 @@ class MainWindow(QMainWindow):
         """Spin boxes edited -> update overlay."""
         if self._updating_spinboxes:
             return
+        self._push_undo()
         self.crop_overlay.set_crop_from_video(
             self.spn_x.value(), self.spn_y.value(),
             self.spn_w.value(), self.spn_h.value()
@@ -1421,6 +1502,55 @@ class MainWindow(QMainWindow):
             exposure=value * self._EXPOSURE_SCALE,
         )
 
+    def _on_color_slider_released(self):
+        """Show accurate ffmpeg-rendered preview frame on slider release.
+
+        The live drag preview is an alpha-blend approximation. On release,
+        we extract the current frame through ffmpeg with the real eq and
+        exposure filters applied, giving the user an exact preview of
+        what the export will look like. Skipped during playback — the
+        approximate overlay is good enough for moving video.
+        """
+        if not self._video_path:
+            return
+        if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            return
+        b = self.sld_brightness.value() * self._BRIGHTNESS_SCALE
+        e = self.sld_exposure.value() * self._EXPOSURE_SCALE
+        if abs(b) < 1e-4 and abs(e) < 1e-4:
+            # No adjustments — clear any stepped frame, let live video show
+            self.player.surface._stepping = False
+            return
+        from src.core.ffmpeg_runner import _build_color_filters, get_ffmpeg, _hide_window
+        import subprocess
+        filters = _build_color_filters(b, e)
+        if not filters:
+            return
+        pos_s = self.player.player.position() / 1000.0
+        cmd = [
+            get_ffmpeg(), '-loglevel', 'quiet',
+            '-ss', f'{pos_s:.3f}',
+            '-i', self._video_path,
+            '-vf', ','.join(filters),
+            '-frames:v', '1',
+            '-f', 'image2pipe', '-vcodec', 'bmp',
+            'pipe:1',
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, startupinfo=_hide_window(), timeout=3,
+            )
+            if result.returncode == 0 and result.stdout:
+                from PyQt6.QtGui import QImage
+                img = QImage()
+                if img.loadFromData(result.stdout, "BMP"):
+                    self.player.surface._stepping = True
+                    self.player.surface._image = img
+                    self.player.surface.set_color_adjust(0, 0)  # frame already has filters baked in
+                    self.player.surface.update()
+        except Exception:
+            pass
+
     def _reset_color(self):
         self._push_undo()
         # Block signals so we don't push two undo entries — this is
@@ -1434,6 +1564,34 @@ class MainWindow(QMainWindow):
         self.lbl_brightness.setText("0")
         self.lbl_exposure.setText("0")
         self.player.surface.set_color_adjust(brightness=0.0, exposure=0.0)
+        self.player.surface._stepping = False  # clear accurate preview frame
+
+    # ── Audio normalization ─────────────────────────────────
+
+    def _on_normalize_toggled(self, checked: bool):
+        if self._restoring:
+            return
+        if not (0 <= self._queue_index < len(self._queue)):
+            return
+        item = self._queue[self._queue_index]
+        item.audio_normalize = checked
+        self.btn_normalize.setText(
+            "\u2713 Normalize Audio" if checked else "Normalize Audio"
+        )
+        # Clear cached analysis when toggled off so a fresh analysis
+        # runs next time it's enabled and exported.
+        if not checked:
+            item.normalize_data = None
+
+    def _sync_normalize_button(self):
+        if 0 <= self._queue_index < len(self._queue):
+            item = self._queue[self._queue_index]
+            self.btn_normalize.blockSignals(True)
+            self.btn_normalize.setChecked(item.audio_normalize)
+            self.btn_normalize.blockSignals(False)
+            self.btn_normalize.setText(
+                "\u2713 Normalize Audio" if item.audio_normalize else "Normalize Audio"
+            )
 
     # ── Selection coordination ─────────────────────────────────
 
@@ -1584,6 +1742,32 @@ class MainWindow(QMainWindow):
         current_item = self._queue[self._queue_index] if 0 <= self._queue_index < len(self._queue) else None
         source_fps = current_item.fps if current_item else 0.0
 
+        # Audio normalization — run first-pass analysis if enabled and
+        # not yet cached. This is synchronous (~1-5s) and blocks the UI,
+        # but it's a prerequisite for the export command. The cached
+        # result is reused on re-exports of the same clip.
+        normalize_data = None
+        should_normalize = (
+            (current_item and current_item.audio_normalize)
+            or self._settings.get("normalize_audio", False)
+        ) and self._settings.get("audio_mode", "copy") != "mute"
+        if should_normalize and current_item:
+            cached = current_item.normalize_data
+            if cached is not None:
+                # {} = analysis ran but failed (no audio stream) — skip
+                normalize_data = cached if cached else None
+            else:
+                self.progress_bar.setFormat("Analyzing audio loudness...")
+                self.progress_bar.setValue(0)
+                QApplication.processEvents()
+                result = loudnorm_analyze(
+                    self._video_path, trim_start, trim_end - trim_start,
+                )
+                # Cache result: dict with data on success, {} on failure
+                current_item.normalize_data = result if result else {}
+                normalize_data = result
+                self.progress_bar.setFormat("%p%")
+
         if keyframes:
             # Automated export: pre-render audio + segmented video
             self._worker = ExportWorker(auto_kwargs=dict(
@@ -1605,13 +1789,14 @@ class MainWindow(QMainWindow):
                 source_fps=source_fps,
                 brightness=brightness,
                 exposure=exposure,
+                normalize_data=normalize_data,
             ))
         else:
             # Simple export: single speed
             cmd = build_command(
                 self._video_path, self._last_output,
-                trim_start=trim_start if trim_start > 0 else None,
-                trim_end=trim_end if trim_end < self._duration_s else None,
+                trim_start=trim_start,
+                trim_end=trim_end,
                 crop_x=None if is_full_frame else crop_x,
                 crop_y=None if is_full_frame else crop_y,
                 crop_w=None if is_full_frame else crop_w,
@@ -1624,6 +1809,7 @@ class MainWindow(QMainWindow):
                 audio_mode=self._settings.get("audio_mode", "copy"),
                 brightness=brightness,
                 exposure=exposure,
+                normalize_data=normalize_data,
             )
             duration = (trim_end - trim_start) / speed
             self._worker = ExportWorker(cmd=cmd, duration=duration)

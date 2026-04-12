@@ -27,7 +27,11 @@ class VideoItem:
     # export (precise, via ffmpeg's eq and exposure filters).
     brightness: float = 0.0
     exposure: float = 0.0
+    pan_x: float = 0.0   # content pan — persisted so crop framing survives navigation
+    pan_y: float = 0.0
     locked: bool = False
     probed: bool = False
     export_listed: bool = False  # manually added to the batch export list
+    audio_normalize: bool = False  # per-clip loudness normalization on export
+    normalize_data: dict | None = None  # cached first-pass loudnorm measurements
     speed_keyframes: list = field(default_factory=list)  # [(time_ms, speed), ...]

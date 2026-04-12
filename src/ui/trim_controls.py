@@ -38,7 +38,7 @@ class RangeSlider(QWidget):
         self.update()
 
     def set_playhead(self, pos: int):
-        self._playhead = pos
+        self._playhead = max(self._start, min(pos, self._end))
         self.update()
 
     def get_selection(self) -> tuple[int, int]:
@@ -98,10 +98,10 @@ class RangeSlider(QWidget):
         x = event.pos().x()
 
         if event.button() == Qt.MouseButton.LeftButton:
-            # Left click → seek playhead + select it
+            # Left click → seek playhead + select it (clamped to trim zone)
             self._dragging = "playhead"
             self._selected = "playhead"
-            val = self._x_to_val(x)
+            val = max(self._start, min(self._x_to_val(x), self._end))
             self._playhead = val
             self.playhead_changed.emit(val)
             self.update()
@@ -137,7 +137,7 @@ class RangeSlider(QWidget):
             self._end = max(val, self._start + 1)
             self.range_changed.emit(self._start, self._end)
         elif self._dragging == "playhead":
-            val = self._x_to_val(x)
+            val = max(self._start, min(self._x_to_val(x), self._end))
             self._playhead = val
             self.playhead_changed.emit(val)
 
@@ -168,7 +168,7 @@ class RangeSlider(QWidget):
             self._end = max(self._start + 1, min(self._end + delta, self._max))
             self.range_changed.emit(self._start, self._end)
         elif self._selected == "playhead":
-            self._playhead = max(self._min, min(self._playhead + delta, self._max))
+            self._playhead = max(self._start, min(self._playhead + delta, self._end))
             self.playhead_changed.emit(self._playhead)
         self.update()
 

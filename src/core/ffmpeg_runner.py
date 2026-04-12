@@ -75,6 +75,70 @@ def _build_color_filters(brightness: float, exposure: float) -> list[str]:
 # unattended jobs.
 
 
+def loudnorm_analyze(input_path: str, trim_start: float = 0,
+                     trim_duration: float = 0) -> dict | None:
+    """First pass of EBU R128 loudness normalization.
+
+    Returns a dict with measured_I, measured_TP, measured_LRA, measured_thresh
+    for the second pass, or None on failure. Target: -14 LUFS (YouTube/Spotify).
+    """
+    cmd = [get_ffmpeg(), '-hide_banner']
+    if trim_start > 0:
+        cmd += ['-ss', f'{trim_start:.3f}']
+    if trim_duration > 0:
+        cmd += ['-t', f'{trim_duration:.3f}']
+    cmd += [
+        '-i', input_path,
+        '-af', 'loudnorm=I=-14:TP=-1:LRA=11:print_format=json',
+        '-f', 'null', '-',
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding='utf-8',
+            errors='replace', startupinfo=_hide_window(), timeout=120,
+        )
+        # loudnorm JSON is in stderr after the standard log output
+        import json as _json
+        text = result.stderr
+        # Find the last JSON object in stderr with matched braces
+        brace = text.rfind('{')
+        if brace < 0:
+            return None
+        depth = 0
+        end = -1
+        for i in range(brace, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end < 0:
+            return None
+        data = _json.loads(text[brace:end + 1])
+        # Validate required keys
+        for k in ('input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset'):
+            if k not in data:
+                return None
+        return data
+    except Exception:
+        return None
+
+
+def loudnorm_filter(measured: dict) -> str:
+    """Build the second-pass loudnorm filter string from first-pass measurements."""
+    return (
+        f"loudnorm=I=-14:TP=-1:LRA=11"
+        f":measured_I={measured['input_i']}"
+        f":measured_TP={measured['input_tp']}"
+        f":measured_LRA={measured['input_lra']}"
+        f":measured_thresh={measured['input_thresh']}"
+        f":offset={measured['target_offset']}"
+        f":linear=true"
+    )
+
+
 def build_command(
     input_path: str,
     output_path: str,
@@ -92,6 +156,7 @@ def build_command(
     audio_mode: str = "copy",
     brightness: float = 0.0,
     exposure: float = 0.0,
+    normalize_data: dict | None = None,
 ) -> list[str]:
     cmd = [get_ffmpeg(), "-y"]
 
@@ -130,10 +195,18 @@ def build_command(
 
     # ── Audio ─────────────────────────────────────────────────
     # Precedence: mute > speed change (forces re-encode with pitch shift) > reencode > copy
+    # Normalization is chained after any speed filter when present.
+    norm_filter = loudnorm_filter(normalize_data) if normalize_data else ""
     if audio_mode == "mute":
         cmd += ["-an"]
     elif speed != 1.0:
-        cmd += ["-af", _build_speed_audio_filter(speed)]
+        af = _build_speed_audio_filter(speed)
+        if norm_filter:
+            af += "," + norm_filter
+        cmd += ["-af", af]
+        cmd += ["-c:a", "aac", "-b:a", "320k"]
+    elif norm_filter:
+        cmd += ["-af", norm_filter]
         cmd += ["-c:a", "aac", "-b:a", "320k"]
     elif audio_mode == "reencode":
         cmd += ["-c:a", "aac", "-b:a", "320k"]
@@ -159,11 +232,8 @@ def prerender_audio(
     """
     import array, wave
 
-    from src.ui.automation_lane import AutomationLane
-    lane = AutomationLane()
-    lane.set_keyframes(keyframes)
-    lane.set_base_speed(base_speed)
-    lane._max_ms = trim_end_ms
+    from src.core.speed_curve import SpeedCurve
+    lane = SpeedCurve(keyframes, base_speed)
 
     BASE_RATE = 48000
 
@@ -220,11 +290,8 @@ def build_video_segments(
     Coarser than audio (500ms steps) since video speed changes are less
     perceptible than audio pitch changes.
     """
-    from src.ui.automation_lane import AutomationLane
-    lane = AutomationLane()
-    lane.set_keyframes(keyframes)
-    lane.set_base_speed(base_speed)
-    lane._max_ms = trim_end_ms
+    from src.core.speed_curve import SpeedCurve
+    lane = SpeedCurve(keyframes, base_speed)
 
     segments = []
     t = trim_start_ms
@@ -232,7 +299,7 @@ def build_video_segments(
         t_end = min(t + step_ms, trim_end_ms)
         mid = (t + t_end) // 2
         speed = lane.get_speed_at(mid)
-        # Must match AutomationLane._MIN_SPEED / _MAX_SPEED — if the UI
+        # Must match the UI's min/max speed range — if the UI
         # floor is lowered without lowering this too, the export will
         # silently clamp every keyframe back up and the user will think
         # the slow-down didn't work.
@@ -269,6 +336,7 @@ def export_with_automation(
     source_fps: float = 0.0,
     brightness: float = 0.0,
     exposure: float = 0.0,
+    normalize_data: dict | None = None,
     progress_callback=None,
     process_callback=None,
 ) -> bool:
@@ -309,10 +377,19 @@ def export_with_automation(
             audio_ok = prerender_audio(input_path, audio_wav, keyframes, base_speed,
                                        trim_start_ms, trim_end_ms)
             if not audio_ok:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "prerender_audio failed for %s — export will have no audio", input_path
-                )
+                # Log to export_error.log so the user can see why audio
+                # is missing — logger alone goes nowhere under pythonw.
+                try:
+                    import datetime
+                    from src.core.paths import get_config_dir
+                    log_path = get_config_dir() / "export_error.log"
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"{'=' * 72}\n")
+                        f.write(f"TIMESTAMP: {datetime.datetime.now().isoformat()}\n")
+                        f.write(f"WARNING: Audio pre-render failed for {input_path}\n")
+                        f.write("Export will continue with video only (no audio).\n\n")
+                except Exception:
+                    pass
 
         # ── Step 2: Build single filter_complex for all segments ──
         #
@@ -387,9 +464,17 @@ def export_with_automation(
         if audio_mode == "mute" or not os.path.exists(audio_wav):
             os.replace(video_out, output_path)
         else:
+            # Re-analyze the pre-rendered WAV (not the source) for
+            # normalization — speed automation changes the loudness.
+            wav_norm = None
+            if normalize_data:
+                wav_norm = loudnorm_analyze(audio_wav)
             cmd = [ffmpeg, "-y", "-i", video_out, "-i", audio_wav,
-                   "-c:v", "copy", "-c:a", "aac", "-b:a", "320k",
-                   "-map", "0:v:0", "-map", "1:a:0", output_path]
+                   "-c:v", "copy"]
+            if wav_norm:
+                cmd += ["-af", loudnorm_filter(wav_norm)]
+            cmd += ["-c:a", "aac", "-b:a", "320k",
+                    "-map", "0:v:0", "-map", "1:a:0", output_path]
             proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, startupinfo=_hide_window())
             if proc.returncode != 0:
