@@ -1,11 +1,14 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QPushButton, QLineEdit, QFileDialog, QGroupBox, QDialogButtonBox,
-    QDoubleSpinBox
+    QDoubleSpinBox, QTabWidget, QWidget,
 )
+from PyQt6.QtCore import Qt
+from src.ui.widgets import ClickSlider
 
 from src.core.presets import ASPECT_PRESETS
 from src.ui.themes import THEMES, DEFAULT_THEME
+from src.ui.keybind_editor import KeybindEditor
 
 QUALITY_PRESETS = {
     "Lossless (CRF 0)": 0,
@@ -25,12 +28,32 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(580)
+        self.setMinimumHeight(620)
         self.settings = dict(settings)
         self._setup_ui()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_general_tab(), "General")
+
+        self.keybind_editor = KeybindEditor(self.settings.get("keybinds"))
+        tabs.addTab(self.keybind_editor, "Shortcuts")
+
+        layout.addWidget(tabs)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _build_general_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
 
         # ── Video ─────────────────────────────────────────────
         video_group = QGroupBox("Video")
@@ -186,13 +209,26 @@ class SettingsDialog(QDialog):
         apg.addWidget(self.cmb_theme, stretch=1)
         layout.addWidget(appearance_group)
 
-        # ── Buttons ───────────────────────────────────────────
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # ── UI Scale ─────────────────────────────────────────
+        scale_group = QGroupBox("UI Scale")
+        sg = QHBoxLayout(scale_group)
+        sg.addWidget(QLabel("Compact"))
+        self.sld_scale = ClickSlider(Qt.Orientation.Horizontal)
+        self.sld_scale.setRange(70, 120)  # 70% to 120%
+        self.sld_scale.setValue(int(self.settings.get("ui_scale", 90)))
+        self.sld_scale.setTickInterval(10)
+        from PyQt6.QtWidgets import QSlider
+        self.sld_scale.setTickPosition(QSlider.TickPosition.TicksBelow)
+        sg.addWidget(self.sld_scale, stretch=1)
+        sg.addWidget(QLabel("Large"))
+        self.lbl_scale = QLabel(f"{self.sld_scale.value()}%")
+        self.lbl_scale.setFixedWidth(36)
+        self.sld_scale.valueChanged.connect(lambda v: self.lbl_scale.setText(f"{v}%"))
+        sg.addWidget(self.lbl_scale)
+        layout.addWidget(scale_group)
+
+        layout.addStretch()
+        return tab
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose Output Folder")
@@ -225,4 +261,6 @@ class SettingsDialog(QDialog):
             "untrimmed_archive_dir": archive_dir,
             "theme": self.cmb_theme.currentText(),
             "stay_on_top": self.chk_on_top.isChecked(),
+            "ui_scale": self.sld_scale.value(),
+            "keybinds": self.keybind_editor.get_bindings(),
         }

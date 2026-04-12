@@ -5,23 +5,29 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QPushButton, QFileDialog,
-    QProgressBar, QMessageBox, QApplication, QLineEdit, QSlider
+    QProgressBar, QMessageBox, QApplication, QLineEdit, QSlider,
 )
-from PyQt6.QtCore import Qt, QEvent, QThread, QTimer, QUrl, pyqtSignal
+from src.ui.widgets import ClickSlider
+from PyQt6.QtCore import Qt, QByteArray, QEvent, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer
 
 from src.core.paths import get_config_dir
 from src.core.video_item import VideoItem
 from src.core.archive import archive_original
-from src.ui.video_player import VideoPlayer
+from src.core.keybinds import (
+    ACTION_DEFS, KeybindManager,
+    keybind_from_key_event, keybind_from_mouse_event,
+)
+from src.ui.video_player import VideoPlayer, VideoSurface
 from src.ui.crop_overlay import CropOverlay
-from src.ui.trim_controls import TrimControls
+from src.ui.trim_controls import TrimControls, RangeSlider
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.automation_lane import AutomationLane
-from src.ui.themes import apply_theme, DEFAULT_THEME
+from src.ui.themes import apply_theme, is_dark_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
-    build_command, get_output_path, get_video_duration,
+    build_command, extract_frame, get_output_path, get_video_duration,
     get_video_fps, get_video_resolution, run_export, export_with_automation,
 )
 
@@ -92,7 +98,8 @@ class MainWindow(QMainWindow):
         self._batch_return_to: int = -1  # where to navigate when done
         self._settings_path = get_config_dir() / "settings.json"
         self._settings = self._load_settings()
-        apply_theme(self._settings.get("theme", DEFAULT_THEME))
+        apply_theme(self._settings.get("theme", DEFAULT_THEME),
+                    scale=self._settings.get("ui_scale", 90) / 100.0)
         # Stay-on-top is applied *after* the window has been shown — see
         # the QTimer.singleShot at the end of __init__. Calling winId()
         # here during __init__ (which _apply_stay_on_top does) would
@@ -102,9 +109,28 @@ class MainWindow(QMainWindow):
 
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
+        self._export_cancelled = False
+        self._stepped_pos: int | None = None  # accurate position during frame stepping
+
+        self._keybind_manager = KeybindManager(self._settings.get("keybinds"))
 
         self._setup_ui()
         self._setup_menu()
+        self._build_action_handlers()
+
+        # Status bar — persistent clip info (resolution, fps, duration)
+        self._status_label = QLabel("Drop a video file to begin")
+        self.statusBar().addPermanentWidget(self._status_label, stretch=1)
+
+        # Restore saved window geometry (position, size, maximized state).
+        import base64
+        geo_str = self._settings.get("window_geometry", "")
+        if geo_str:
+            try:
+                self.restoreGeometry(QByteArray(base64.b64decode(geo_str)))
+            except Exception:
+                pass
+
         QApplication.instance().installEventFilter(self)
 
         # Apply stay-on-top after the event loop has processed show().
@@ -116,22 +142,61 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self._apply_stay_on_top(
             self._settings.get("stay_on_top", False)
         ))
+        QTimer.singleShot(0, lambda: self._apply_dark_title_bar(
+            is_dark_theme(self._settings.get("theme", DEFAULT_THEME))
+        ))
 
     def _setup_menu(self):
+        self._menu_actions: dict[str, object] = {}
         menu = self.menuBar()
-        file_menu = menu.addMenu("&File")
-        file_menu.addAction("&Open Video...", "Ctrl+O", self._open_file)
-        file_menu.addSeparator()
-        file_menu.addAction("&Close Current Clip", "Ctrl+W", self._remove_current_clip)
-        file_menu.addAction("Clear Qu&eue", "Ctrl+Shift+W", self._clear_queue)
-        file_menu.addSeparator()
-        file_menu.addAction("&Settings...", self._open_settings)
-        file_menu.addSeparator()
-        file_menu.addAction("E&xit", "Ctrl+Q", self.close)
 
-        edit_menu = menu.addMenu("&Edit")
-        edit_menu.addAction("&Undo", "Ctrl+Z", self._undo)
-        edit_menu.addAction("&Redo", "Ctrl+Y", self._redo)
+        fm = menu.addMenu("&File")
+        self._menu_actions["open_file"] = fm.addAction("&Open Video...", self._open_file)
+        fm.addSeparator()
+        self._menu_actions["export_current"] = fm.addAction("&Export Current", self._export)
+        self._menu_actions["export_all"] = fm.addAction("Export &List", self._start_batch_export)
+        self._menu_actions["show_in_explorer"] = fm.addAction("Show in E&xplorer", self._show_in_explorer)
+        fm.addSeparator()
+        self._menu_actions["close_clip"] = fm.addAction("&Close Current Clip", self._remove_current_clip)
+        self._menu_actions["clear_queue"] = fm.addAction("Clear Qu&eue", self._clear_queue)
+        fm.addSeparator()
+        self._menu_actions["settings"] = fm.addAction("&Settings...", self._open_settings)
+        fm.addSeparator()
+        self._menu_actions["quit"] = fm.addAction("E&xit", self.close)
+
+        em = menu.addMenu("&Edit")
+        self._menu_actions["undo"] = em.addAction("&Undo", self._undo)
+        self._menu_actions["redo"] = em.addAction("&Redo", self._redo)
+
+        self._sync_menu_shortcuts()
+
+    def _build_action_handlers(self):
+        """Map action IDs to callables. Called once after _setup_ui."""
+        self._action_handlers: dict[str, callable] = {
+            "play_pause":          self.player._toggle_play,
+            "frame_step_forward":  lambda: self._frame_step(1),
+            "frame_step_backward": lambda: self._frame_step(-1),
+            "seek_forward_5s":     lambda: self._seek_relative(5000),
+            "seek_backward_5s":    lambda: self._seek_relative(-5000),
+            "queue_prev":          self._go_prev,
+            "queue_next":          self._go_next,
+            "open_file":           self._open_file,
+            "export_current":      self._export,
+            "export_all":          self._start_batch_export,
+            "show_in_explorer":    self._show_in_explorer,
+            "close_clip":          self._remove_current_clip,
+            "clear_queue":         self._clear_queue,
+            "undo":                self._undo,
+            "redo":                self._redo,
+            "settings":            self._open_settings,
+            "quit":                self.close,
+        }
+
+    def _sync_menu_shortcuts(self):
+        """Update menu shortcut display labels from the keybind manager."""
+        for aid, action in self._menu_actions.items():
+            display = self._keybind_manager.get_menu_shortcut(aid)
+            action.setShortcut(QKeySequence(display) if display else QKeySequence())
 
     def _setup_ui(self):
         central = QWidget()
@@ -192,6 +257,8 @@ class MainWindow(QMainWindow):
         # ── Speed automation lane ─────────────────────────────
         self.automation = AutomationLane()
         self.automation.changed.connect(self._on_automation_changed)
+        self.automation.focus_taken.connect(lambda: self._on_widget_focus("automation"))
+        self.trim.slider.focus_taken.connect(lambda: self._on_widget_focus("trim"))
         root.addWidget(self.automation)
         self.player.set_automation(self.automation)
 
@@ -242,7 +309,6 @@ class MainWindow(QMainWindow):
         efx = QHBoxLayout(effects_group)
 
         self._semitones = 0
-        SEMITONE = 2 ** (1 / 12)
 
         self.btn_st_down = QPushButton("\u25BC")
         self.btn_st_down.setFixedSize(28, 28)
@@ -260,7 +326,7 @@ class MainWindow(QMainWindow):
         self.btn_st_up.clicked.connect(lambda: self._change_semitone(1))
         efx.addWidget(self.btn_st_up)
 
-        self.sld_speed = QSlider(Qt.Orientation.Horizontal)
+        self.sld_speed = ClickSlider(Qt.Orientation.Horizontal)
         self.sld_speed.setRange(25, 200)  # 25% to 200%
         self.sld_speed.setValue(100)
         self.sld_speed.setMinimumWidth(120)  # floor, not ceiling — grows with window
@@ -297,7 +363,7 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Bright:"))
-        self.sld_brightness = QSlider(Qt.Orientation.Horizontal)
+        self.sld_brightness = ClickSlider(Qt.Orientation.Horizontal)
         self.sld_brightness.setRange(-100, 100)
         self.sld_brightness.setValue(0)
         self.sld_brightness.setMinimumWidth(130)
@@ -312,7 +378,7 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Expose:"))
-        self.sld_exposure = QSlider(Qt.Orientation.Horizontal)
+        self.sld_exposure = ClickSlider(Qt.Orientation.Horizontal)
         self.sld_exposure.setRange(-100, 100)
         self.sld_exposure.setValue(0)
         self.sld_exposure.setMinimumWidth(130)
@@ -343,17 +409,26 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self._export)
         eg.addWidget(self.btn_export)
 
-        # Batch export: exports every queued clip that has any non-default
-        # edit (trim, crop, speed, stretch, or keyframes) and skips the
-        # rest. Designed for "load 30 clips, edit some, let it run".
-        self.btn_export_all = QPushButton("Export All Edited")
-        self.btn_export_all.setEnabled(False)
-        self.btn_export_all.clicked.connect(self._start_batch_export)
-        eg.addWidget(self.btn_export_all)
+        self.btn_export_list = QPushButton("Add to Export List")
+        self.btn_export_list.setCheckable(True)
+        self.btn_export_list.setEnabled(False)
+        self.btn_export_list.setToolTip("Toggle whether this clip is included in batch export")
+        self.btn_export_list.toggled.connect(self._on_export_list_toggled)
+        eg.addWidget(self.btn_export_list)
+
+        self.btn_export_batch = QPushButton("Export List")
+        self.btn_export_batch.setEnabled(False)
+        self.btn_export_batch.clicked.connect(self._start_batch_export)
+        eg.addWidget(self.btn_export_batch)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         eg.addWidget(self.progress_bar)
+
+        self.btn_cancel_export = QPushButton("Cancel")
+        self.btn_cancel_export.setVisible(False)
+        self.btn_cancel_export.clicked.connect(self._cancel_export)
+        eg.addWidget(self.btn_cancel_export)
 
         bottom.addWidget(export_group)
         root.addLayout(bottom)
@@ -361,6 +436,7 @@ class MainWindow(QMainWindow):
         # ── Signals ───────────────────────────────────────────
         self.player.duration_changed.connect(self._on_video_duration)
         self.player.position_changed.connect(self._on_playback_position)
+        self.player.player.playbackStateChanged.connect(self._on_playback_state)
         self.trim.trim_changed.connect(self._on_trim_changed)
         self.trim.seek_requested.connect(self._on_seek_requested)
         self.crop_overlay.crop_changed.connect(self._on_overlay_crop_changed)
@@ -404,6 +480,8 @@ class MainWindow(QMainWindow):
     def _navigate_to(self, index: int):
         if index < 0 or index >= len(self._queue):
             return
+        self._stepped_pos = None
+        self.player.surface._stepping = False
         if 0 <= self._queue_index < len(self._queue):
             self._save_current_state()
 
@@ -426,15 +504,21 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error",
                     f"Could not read video file:\n{e}")
                 self._queue.pop(index)
-                self._queue_index = max(0, min(old_index, len(self._queue) - 1)) if self._queue else -1
-                self._update_nav()
+                if self._queue:
+                    self._queue_index = -1  # reset before navigating
+                    self._navigate_to(max(0, min(old_index, len(self._queue) - 1)))
+                else:
+                    self._unload_all_clips()
                 return
             if item.video_w == 0 or item.video_h == 0:
                 QMessageBox.warning(self, "Invalid Video",
                     f"Could not read video dimensions for:\n{Path(item.path).name}")
                 self._queue.pop(index)
-                self._queue_index = max(0, min(old_index, len(self._queue) - 1)) if self._queue else -1
-                self._update_nav()
+                if self._queue:
+                    self._queue_index = -1
+                    self._navigate_to(max(0, min(old_index, len(self._queue) - 1)))
+                else:
+                    self._unload_all_clips()
                 return
             item.duration_ms = int(item.duration_s * 1000)
             item.trim_end_ms = item.duration_ms
@@ -462,8 +546,10 @@ class MainWindow(QMainWindow):
         self._restore_state(item)
 
         self.btn_export.setEnabled(True)
-        self.btn_export_all.setEnabled(True)
+        self.btn_export_list.setEnabled(True)
+        self._sync_export_list_button()
         self._update_nav()
+        self._update_status_bar()
 
     def _save_current_state(self):
         # Guard for post-unload state: if no clip is active, saving is
@@ -605,7 +691,9 @@ class MainWindow(QMainWindow):
         self._duration_s = 0.0
         self._last_output = ""
         self.btn_export.setEnabled(False)
-        self.btn_export_all.setEnabled(False)
+        self.btn_export_list.setEnabled(False)
+        self.btn_export_list.setChecked(False)
+        self.btn_export_batch.setEnabled(False)
         # Clear any stale editing state so it doesn't leak into the next
         # clip the user drops in.
         self.automation.clear()
@@ -623,6 +711,7 @@ class MainWindow(QMainWindow):
         self._redo_stack.clear()
         self.progress_bar.setVisible(False)
         self._update_nav()
+        self._update_status_bar()
 
     def _clear_queue(self):
         """Remove every clip from the queue (with confirmation)."""
@@ -666,6 +755,15 @@ class MainWindow(QMainWindow):
         self.btn_clear_queue.setEnabled(count >= 1)
 
     def closeEvent(self, event):
+        # Persist window geometry so the next launch restores position/size.
+        import base64 as _b64
+        try:
+            self._settings["window_geometry"] = _b64.b64encode(
+                bytes(self.saveGeometry())).decode()
+            self._save_settings()
+        except Exception:
+            pass
+
         # Dead-man's switch: if clean shutdown hangs for any reason (stuck
         # QThread, unresponsive subprocess, audio sink refusing to release),
         # force-exit after 8 seconds so the user never has to kill pythonw
@@ -685,26 +783,134 @@ class MainWindow(QMainWindow):
         self.player.release()
         super().closeEvent(event)
 
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Space:
-            focused = QApplication.instance().focusWidget()
-            if isinstance(focused, (QLineEdit, QComboBox)):
-                return False
-            self.player._toggle_play()
-            return True
-        return super().eventFilter(obj, event)
+    # ── Unified keybind dispatch ─────────────────────────────
 
-    def keyPressEvent(self, event):
-        focused = QApplication.instance().focusWidget()
-        if isinstance(focused, (QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit)):
-            super().keyPressEvent(event)
+    # Mouse-interactive widget types — mouse button keybinds are
+    # NOT dispatched when the event target is one of these, so
+    # crop dragging, trim handles, etc. keep working normally.
+    _MOUSE_INTERACTIVE = (
+        CropOverlay, AutomationLane, RangeSlider, VideoSurface,
+        QSlider, ClickSlider, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
+        QLineEdit,
+    )
+
+    def eventFilter(self, obj, event):
+        # Don't intercept during modal dialogs (settings, message boxes)
+        if QApplication.activeModalWidget():
+            return super().eventFilter(obj, event)
+
+        etype = event.type()
+        kb = None
+        is_repeat = False
+
+        if etype == QEvent.Type.KeyPress:
+            # Skip when focus is on a text-entry widget
+            focused = QApplication.instance().focusWidget()
+            if isinstance(focused, (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
+                return super().eventFilter(obj, event)
+            # Let arrow keys through to selection-aware widgets that have
+            # an active selection — they handle their own keyPressEvent.
+            if isinstance(focused, (AutomationLane, RangeSlider)):
+                if hasattr(focused, '_selected_idx') and focused._selected_idx >= 0:
+                    return super().eventFilter(obj, event)
+                if hasattr(focused, '_selected') and focused._selected is not None:
+                    return super().eventFilter(obj, event)
+            is_repeat = event.isAutoRepeat()
+            kb = keybind_from_key_event(event.modifiers(), event.key())
+
+        elif etype == QEvent.Type.MouseButtonPress:
+            btn = event.button()
+            # Mouse4/5 (Back/Forward) are safe to intercept globally —
+            # no Qt widget uses them. Other buttons only fire keybinds
+            # when the target is NOT a mouse-interactive widget.
+            safe = btn in (Qt.MouseButton.BackButton, Qt.MouseButton.ForwardButton)
+            if not safe and isinstance(obj, self._MOUSE_INTERACTIVE):
+                return super().eventFilter(obj, event)
+            kb = keybind_from_mouse_event(event.modifiers(), btn)
+
+        if kb is None:
+            return super().eventFilter(obj, event)
+
+        action_ids = self._keybind_manager.lookup(kb)
+        if not action_ids:
+            return super().eventFilter(obj, event)
+
+        # Always consume matched keybinds — even when auto-repeat is
+        # suppressed — so the event never leaks to QAction shortcuts
+        # (which don't respect our allow_repeat rules).
+        for aid in action_ids:
+            if is_repeat and not ACTION_DEFS[aid].allow_repeat:
+                continue
+            handler = self._action_handlers.get(aid)
+            if handler:
+                handler()
+
+        return True
+
+    def _frame_step(self, direction: int):
+        """Step one frame forward (1) or backward (-1) with ffmpeg accuracy.
+
+        QMediaPlayer.setPosition() on Windows snaps to the nearest keyframe
+        (GOP can be 30-120 frames apart). For precise trim-point selection
+        we need the exact frame. FFmpeg's -ss decodes forward from the
+        previous keyframe, giving frame-accurate output.
+
+        The decoded BMP is shown on VideoSurface directly. A _stepping
+        flag prevents QVideoSink from overwriting it. When playback
+        resumes, _on_playback_state syncs QMediaPlayer to our position.
+        """
+        if not self._video_path:
             return
-        if event.key() == Qt.Key.Key_Left:
-            self._go_prev()
-        elif event.key() == Qt.Key.Key_Right:
-            self._go_next()
-        else:
-            super().keyPressEvent(event)
+        if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.player.pause()
+
+        item = self._queue[self._queue_index] if 0 <= self._queue_index < len(self._queue) else None
+        fps = item.fps if item and item.fps > 0 else 30.0
+        frame_ms = max(1, int(round(1000 / fps)))
+
+        # Use the stepped position if already stepping, else QMediaPlayer's
+        base_ms = self._stepped_pos if self._stepped_pos is not None else self.player.player.position()
+        new_ms = max(0, base_ms + direction * frame_ms)
+        if self.player._duration_ms > 0:
+            new_ms = min(new_ms, self.player._duration_ms)
+
+        bmp = extract_frame(self._video_path, new_ms / 1000.0)
+        if bmp:
+            from PyQt6.QtGui import QImage
+            image = QImage()
+            if image.loadFromData(bmp, "BMP"):
+                self.player.surface._stepping = True
+                self.player.surface._image = image
+                self.player.surface.update()
+                self._stepped_pos = new_ms
+                # Update position-dependent UI manually
+                self.player.lbl_time.setText(
+                    f"{self.player._fmt(new_ms)} / {self.player._fmt(self.player._duration_ms)}"
+                )
+                self.trim.set_playhead(new_ms)
+                self.automation.set_playhead(new_ms)
+                return
+
+        # Fallback: QMediaPlayer seek (keyframe-snapped but better than nothing)
+        self._stepped_pos = None
+        self.player.surface._stepping = False
+        self.player.seek(new_ms)
+
+    def _seek_relative(self, delta_ms: int):
+        """Seek forward or backward by delta_ms. Clears stepped state."""
+        if not self._video_path:
+            return
+        self._stepped_pos = None
+        self.player.surface._stepping = False
+        base = self.player.player.position()
+        self.player.seek(max(0, base + delta_ms))
+
+    def _on_playback_state(self, state):
+        """Sync QMediaPlayer to the accurate stepped position when play resumes."""
+        if state == QMediaPlayer.PlaybackState.PlayingState and self._stepped_pos is not None:
+            self.player.player.setPosition(self._stepped_pos)
+            self._stepped_pos = None
+            self.player.surface._stepping = False
 
     # ── Settings ──────────────────────────────────────────────
 
@@ -764,11 +970,20 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self._settings, self)
         if dlg.exec():
             prev_theme = self._settings.get("theme", DEFAULT_THEME)
+            prev_scale = self._settings.get("ui_scale", 90) / 100.0
             prev_on_top = self._settings.get("stay_on_top", False)
-            self._settings = dlg.get_settings()
+            # .update() preserves keys the dialog doesn't manage
+            # (window_geometry, preview_volume, etc.)
+            self._settings.update(dlg.get_settings())
             self._save_settings()
-            if self._settings.get("theme", DEFAULT_THEME) != prev_theme:
-                apply_theme(self._settings["theme"])
+            # Reload keybind manager from updated settings
+            self._keybind_manager = KeybindManager(self._settings.get("keybinds"))
+            self._sync_menu_shortcuts()
+            new_theme = self._settings.get("theme", DEFAULT_THEME)
+            new_scale = self._settings.get("ui_scale", 90) / 100.0
+            if new_theme != prev_theme or new_scale != prev_scale:
+                apply_theme(new_theme, scale=new_scale)
+                self._apply_dark_title_bar(is_dark_theme(new_theme))
             if self._settings.get("stay_on_top", False) != prev_on_top:
                 self._apply_stay_on_top(self._settings["stay_on_top"])
 
@@ -829,6 +1044,23 @@ class MainWindow(QMainWindow):
                 "SetWindowPos(topmost=%s) failed: GetLastError=%d hwnd=%d",
                 enabled, err, int(self.winId()),
             )
+
+    def _apply_dark_title_bar(self, dark: bool):
+        """Match the Windows title bar to the app theme via DWM.
+
+        Without this, a dark QSS theme still shows a bright white title
+        bar — jarring on every dark theme except Light.
+        """
+        try:
+            import ctypes
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            hwnd = int(self.winId())
+            value = ctypes.c_int(1 if dark else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(value), ctypes.sizeof(value))
+        except Exception:
+            pass
 
     # ── Undo / Redo ────────────────────────────────────────
 
@@ -1044,6 +1276,8 @@ class MainWindow(QMainWindow):
 
     def _on_seek_requested(self, ms: int):
         """User clicked/dragged on the timeline to seek."""
+        self._stepped_pos = None
+        self.player.surface._stepping = False
         self.player.seek(ms)
 
     def _on_trim_changed(self, start_s: float, end_s: float):
@@ -1201,6 +1435,68 @@ class MainWindow(QMainWindow):
         self.lbl_exposure.setText("0")
         self.player.surface.set_color_adjust(brightness=0.0, exposure=0.0)
 
+    # ── Selection coordination ─────────────────────────────────
+
+    def _on_widget_focus(self, source: str):
+        """One selection-aware widget grabbed focus — deselect the others."""
+        if source != "automation":
+            self.automation.deselect()
+        if source != "trim":
+            self.trim.slider.deselect()
+
+    # ── Navigation helpers ────────────────────────────────────
+
+    def _show_in_explorer(self):
+        """Open Explorer with the last exported file highlighted."""
+        if not self._last_output:
+            return
+        path = Path(self._last_output)
+        if path.exists():
+            import subprocess
+            subprocess.Popen(['explorer', '/select,', str(path)])
+        elif path.parent.exists():
+            import os
+            os.startfile(str(path.parent))
+
+    def _update_status_bar(self):
+        """Update the status bar with current clip info."""
+        if not (0 <= self._queue_index < len(self._queue)):
+            self._status_label.setText("Drop a video file to begin")
+            return
+        item = self._queue[self._queue_index]
+        parts = [f"{item.video_w}\u00d7{item.video_h}"]
+        if item.fps > 0:
+            fps_str = f"{item.fps:.0f}" if item.fps == int(item.fps) else f"{item.fps:.1f}"
+            parts.append(f"{fps_str} fps")
+        if item.duration_s > 0:
+            m = int(item.duration_s // 60)
+            s = item.duration_s - m * 60
+            parts.append(f"{m:02d}:{s:05.2f}")
+        self._status_label.setText("  \u2502  ".join(parts))
+
+    # ── Export list ────────────────────────────────────────────
+
+    def _on_export_list_toggled(self, checked: bool):
+        if not (0 <= self._queue_index < len(self._queue)):
+            return
+        self._queue[self._queue_index].export_listed = checked
+        self._sync_export_list_button()
+
+    def _sync_export_list_button(self):
+        """Sync the export list toggle button with the current clip's state."""
+        if 0 <= self._queue_index < len(self._queue):
+            item = self._queue[self._queue_index]
+            self.btn_export_list.blockSignals(True)
+            self.btn_export_list.setChecked(item.export_listed)
+            self.btn_export_list.blockSignals(False)
+            self.btn_export_list.setText(
+                "\u2713 On Export List" if item.export_listed else "Add to Export List"
+            )
+        # Enable batch button only if at least one clip is listed
+        listed = sum(1 for i in self._queue if i.export_listed)
+        self.btn_export_batch.setEnabled(listed > 0)
+        self.btn_export_batch.setText(f"Export List ({listed})" if listed else "Export List")
+
     # ── Export ────────────────────────────────────────────────
 
     def _export(self):
@@ -1280,6 +1576,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.btn_export.setEnabled(False)
+        self.btn_cancel_export.setVisible(True)
 
         # Source fps — needed for fps normalization in the automation
         # filter_complex so slow/fast segments come out at a consistent
@@ -1337,11 +1634,21 @@ class MainWindow(QMainWindow):
 
     def _on_export_done(self, success: bool):
         self.progress_bar.setVisible(False)
+        self.btn_cancel_export.setVisible(False)
         error_msg = ""
         if self._worker is not None:
             error_msg = self._worker._error_msg
             self._worker.wait()
             self._worker = None
+
+        # User hit Cancel — absorb silently and restore UI.
+        if self._export_cancelled:
+            self._export_cancelled = False
+            self._batch_queue = None
+            self._batch_results = []
+            self.btn_export.setEnabled(True)
+            self._sync_export_list_button()
+            return
 
         # Batch path: record the result, archive (silently), and advance
         # to the next clip without any popup dialogs. The whole point of
@@ -1361,83 +1668,65 @@ class MainWindow(QMainWindow):
 
         # Single-clip path: original behavior.
         self.btn_export.setEnabled(True)
-        self.btn_export_all.setEnabled(True)
+        self._sync_export_list_button()
         if success:
             archive_status = self._archive_original_clip()
-            QMessageBox.information(self, "Export Complete",
-                                    f"Saved to:\n{self._last_output}{archive_status}")
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Export Complete")
+            msg.setText(f"Saved to:\n{self._last_output}{archive_status}")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.addButton(QMessageBox.StandardButton.Ok)
+            open_btn = msg.addButton("Show in Explorer", QMessageBox.ButtonRole.ActionRole)
+            msg.exec()
+            if msg.clickedButton() == open_btn:
+                self._show_in_explorer()
             if self._settings.get("auto_advance", False):
                 self._go_next()
         else:
-            msg = error_msg or "FFmpeg returned an error. Check the console for details."
+            msg = error_msg or "FFmpeg returned an error. Check config/export_error.log for details."
             QMessageBox.warning(self, "Export Failed", msg)
 
-    # ── Batch export ──────────────────────────────────────────
+    def _cancel_export(self):
+        """Cancel the running export (and batch if active)."""
+        self._export_cancelled = True
+        if self._worker is not None:
+            self._worker.cancel()
 
-    def _is_edited(self, item: VideoItem) -> bool:
-        """A clip counts as 'edited' — and therefore ships in a batch
-        export — if any of its editable fields differs from the default
-        loaded state. Unedited clips (just dropped in, untouched) are
-        skipped so a batch doesn't pointlessly re-encode them.
-        """
-        if item.duration_ms == 0 or not item.probed:
-            return False  # never loaded, no way to know
-        if item.trim_start_ms > 0:
-            return True
-        if 0 < item.trim_end_ms < item.duration_ms:
-            return True
-        if item.speed != 1.0:
-            return True
-        if item.stretch_h != 1.0 or item.stretch_v != 1.0:
-            return True
-        if abs(item.brightness) > 1e-4 or abs(item.exposure) > 1e-4:
-            return True
-        if item.speed_keyframes:
-            return True
-        # Crop check — same "full frame after even-rounding" logic we
-        # use in _export so the two definitions stay in sync.
-        even_w = item.video_w - item.video_w % 2
-        even_h = item.video_h - item.video_h % 2
-        if item.crop_x != 0 or item.crop_y != 0:
-            return True
-        if 0 < item.crop_w < even_w or 0 < item.crop_h < even_h:
-            return True
-        return False
+    # ── Batch export ──────────────────────────────────────────
 
     def _start_batch_export(self):
         if self._worker is not None or self._batch_queue is not None:
             return  # already exporting something
 
-        # Flush current UI state into the active VideoItem so its edit
-        # state is accurate before we scan.
+        # Flush current UI state into the active VideoItem
         if 0 <= self._queue_index < len(self._queue):
             self._save_current_state()
 
-        edited = [i for i, item in enumerate(self._queue) if self._is_edited(item)]
-        if not edited:
+        listed = [i for i, item in enumerate(self._queue) if item.export_listed]
+        if not listed:
             QMessageBox.information(
                 self, "Nothing to Export",
-                "No clips in the queue have been edited. Trim, crop, or "
-                "change the speed of a clip first, then try Export All.",
+                "No clips on the export list. Use \"Add to Export List\" on "
+                "each clip you want to include in the batch.",
             )
             return
 
         reply = QMessageBox.question(
-            self, "Export All",
-            f"Export {len(edited)} of {len(self._queue)} clip(s)?\n\n"
-            "Unedited clips will be skipped. The editor will cycle through "
-            "each edited clip and export it. You can walk away.",
+            self, "Export List",
+            f"Export {len(listed)} clip(s)?\n\n"
+            "The editor will cycle through each listed clip and export it. "
+            "You can walk away.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self._batch_queue = edited
+        self._batch_queue = listed
         self._batch_index = 0
         self._batch_results = []
         self._batch_return_to = self._queue_index
         self.btn_export.setEnabled(False)
-        self.btn_export_all.setEnabled(False)
+        self.btn_export_batch.setEnabled(False)
         self._export_next_in_batch()
 
     def _export_next_in_batch(self):
@@ -1450,7 +1739,7 @@ class MainWindow(QMainWindow):
             self._batch_queue = None
             self._batch_results = []
             self.btn_export.setEnabled(True)
-            self.btn_export_all.setEnabled(True)
+            self.btn_export_batch.setEnabled(True)
             self.progress_bar.setFormat("%p%")  # reset label
             self.progress_bar.setVisible(False)
 

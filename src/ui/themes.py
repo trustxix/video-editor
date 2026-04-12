@@ -61,13 +61,19 @@ THEMES: dict[str, dict[str, str]] = {
 DEFAULT_THEME = "Dark"
 
 
-def _build_qss(c: dict[str, str]) -> str:
+def _build_qss(c: dict[str, str], scale: float = 1.0) -> str:
+    # Scale helper — rounds to int for pixel values, 1 decimal for pt
+    def px(base: int) -> int:
+        return max(1, round(base * scale))
+    def pt(base: float) -> str:
+        return f"{base * scale:.1f}"
+
     return f"""
 QWidget {{
     background-color: {c['bg']};
     color: {c['fg']};
     font-family: 'Segoe UI', 'Inter', sans-serif;
-    font-size: 10pt;
+    font-size: {pt(9)}pt;
 }}
 QMainWindow, QDialog {{
     background-color: {c['bg']};
@@ -75,16 +81,16 @@ QMainWindow, QDialog {{
 QGroupBox {{
     background-color: {c['bg_alt']};
     border: 1px solid {c['border']};
-    border-radius: 6px;
-    margin-top: 12px;
-    padding: 12px 8px 8px 8px;
+    border-radius: {px(4)}px;
+    margin-top: {px(10)}px;
+    padding: {px(8)}px {px(6)}px {px(6)}px {px(6)}px;
     font-weight: 600;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    left: 10px;
-    padding: 0 6px;
+    left: {px(8)}px;
+    padding: 0 {px(4)}px;
     color: {c['fg_dim']};
     background-color: {c['bg']};
 }}
@@ -96,9 +102,9 @@ QPushButton {{
     background-color: {c['bg_input']};
     color: {c['fg']};
     border: 1px solid {c['border']};
-    border-radius: 4px;
-    padding: 5px 14px;
-    min-height: 18px;
+    border-radius: {px(4)}px;
+    padding: {px(3)}px {px(10)}px;
+    min-height: {px(16)}px;
 }}
 QPushButton:hover {{
     background-color: {c['bg_hover']};
@@ -121,9 +127,9 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {c['bg_input']};
     color: {c['fg']};
     border: 1px solid {c['border']};
-    border-radius: 4px;
-    padding: 4px 6px;
-    min-height: 18px;
+    border-radius: {px(4)}px;
+    padding: {px(3)}px {px(4)}px;
+    min-height: {px(16)}px;
     selection-background-color: {c['accent']};
     selection-color: {c['bg']};
 }}
@@ -156,19 +162,19 @@ QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
     background-color: {c['accent']};
 }}
 QSlider::groove:horizontal {{
-    height: 4px;
+    height: {px(4)}px;
     background: {c['border']};
-    border-radius: 2px;
+    border-radius: {px(2)}px;
 }}
 QSlider::sub-page:horizontal {{
     background: {c['accent']};
-    border-radius: 2px;
+    border-radius: {px(2)}px;
 }}
 QSlider::handle:horizontal {{
     background: {c['accent']};
-    width: 14px;
-    margin: -5px 0;
-    border-radius: 7px;
+    width: {px(12)}px;
+    margin: {px(-4)}px 0;
+    border-radius: {px(6)}px;
 }}
 QSlider::handle:horizontal:hover {{
     background: {c['accent_hover']};
@@ -176,24 +182,24 @@ QSlider::handle:horizontal:hover {{
 QProgressBar {{
     background-color: {c['bg_input']};
     border: 1px solid {c['border']};
-    border-radius: 4px;
+    border-radius: {px(4)}px;
     text-align: center;
     color: {c['fg']};
-    min-height: 16px;
+    min-height: {px(14)}px;
 }}
 QProgressBar::chunk {{
     background-color: {c['accent']};
-    border-radius: 3px;
+    border-radius: {px(3)}px;
 }}
 QCheckBox {{
     spacing: 6px;
     background: transparent;
 }}
 QCheckBox::indicator {{
-    width: 14px;
-    height: 14px;
+    width: {px(13)}px;
+    height: {px(13)}px;
     border: 1px solid {c['border']};
-    border-radius: 3px;
+    border-radius: {px(3)}px;
     background-color: {c['bg_input']};
 }}
 QCheckBox::indicator:checked {{
@@ -206,7 +212,7 @@ QMenuBar {{
 }}
 QMenuBar::item {{
     background: transparent;
-    padding: 4px 10px;
+    padding: {px(3)}px {px(8)}px;
 }}
 QMenuBar::item:selected {{
     background-color: {c['bg_hover']};
@@ -217,8 +223,8 @@ QMenu {{
     padding: 4px;
 }}
 QMenu::item {{
-    padding: 5px 22px;
-    border-radius: 3px;
+    padding: {px(4)}px {px(18)}px;
+    border-radius: {px(3)}px;
 }}
 QMenu::item:selected {{
     background-color: {c['accent']};
@@ -233,8 +239,21 @@ QToolTip {{
     background-color: {c['bg_alt']};
     color: {c['fg']};
     border: 1px solid {c['accent']};
-    padding: 4px;
-    border-radius: 3px;
+    padding: {px(3)}px;
+    border-radius: {px(3)}px;
+}}
+QStatusBar {{
+    background-color: {c['bg']};
+    border-top: 1px solid {c['border']};
+    color: {c['fg_dim']};
+    font-family: 'Segoe UI', monospace;
+    font-size: {pt(8)}pt;
+    padding: {px(1)}px {px(6)}px;
+}}
+QStatusBar QLabel {{
+    background: transparent;
+    color: {c['fg_dim']};
+    padding: 0 4px;
 }}
 QScrollBar:vertical {{
     background: {c['bg_alt']};
@@ -255,9 +274,23 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
 """
 
 
-def apply_theme(name: str) -> None:
+def is_dark_theme(name: str) -> bool:
+    """True if the theme has a dark background (for DWM title bar matching)."""
+    palette = THEMES.get(name) or THEMES[DEFAULT_THEME]
+    bg = palette["bg"].lstrip("#")
+    r, g, b = int(bg[0:2], 16), int(bg[2:4], 16), int(bg[4:6], 16)
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+
+
+_current_scale: float = 0.9  # default slightly compact
+
+
+def apply_theme(name: str, scale: float | None = None) -> None:
     """Apply a theme to the running QApplication. Unknown names fall back to default."""
+    global _current_scale
+    if scale is not None:
+        _current_scale = scale
     palette = THEMES.get(name) or THEMES[DEFAULT_THEME]
     app = QApplication.instance()
     if app is not None:
-        app.setStyleSheet(_build_qss(palette))
+        app.setStyleSheet(_build_qss(palette, _current_scale))

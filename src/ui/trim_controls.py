@@ -10,16 +10,19 @@ class RangeSlider(QWidget):
 
     range_changed = pyqtSignal(int, int)  # start_ms, end_ms
     playhead_changed = pyqtSignal(int)   # ms — user clicked/dragged to seek
+    focus_taken = pyqtSignal()  # this widget grabbed focus
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(40)
         self.setMinimumWidth(200)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._min = 0
         self._max = 1000
         self._start = 0
         self._end = 1000
         self._dragging = None  # "start", "end", or "playhead"
+        self._selected = None  # "start", "end", or "playhead" — for arrow keys
         self._drag_offset = 0
         self._playhead = 0
 
@@ -74,13 +77,15 @@ class RangeSlider(QWidget):
 
         # Playhead
         px = self._val_to_x(self._playhead)
-        p.setPen(QPen(QColor(255, 80, 80), 2))
+        playhead_selected = self._selected == "playhead"
+        p.setPen(QPen(QColor(120, 255, 120) if playhead_selected else QColor(255, 80, 80), 2))
         p.drawLine(px, track_y - 4, px, track_y + track_h + 4)
 
         # Handles
-        for x in (x1, x2):
-            p.setBrush(QColor(255, 255, 255))
-            p.setPen(QPen(QColor(100, 100, 100), 1))
+        for label, x in (("start", x1), ("end", x2)):
+            sel = (self._selected == label)
+            p.setBrush(QColor(120, 255, 120) if sel else QColor(255, 255, 255))
+            p.setPen(QPen(QColor(80, 200, 80) if sel else QColor(100, 100, 100), 1))
             p.drawRoundedRect(x - 5, track_y - 6, 10, track_h + 12, 3, 3)
 
         p.end()
@@ -88,26 +93,31 @@ class RangeSlider(QWidget):
     # ── Mouse interaction ───────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent):
+        self.setFocus()
+        self.focus_taken.emit()
         x = event.pos().x()
 
         if event.button() == Qt.MouseButton.LeftButton:
-            # Left click → seek playhead
+            # Left click → seek playhead + select it
             self._dragging = "playhead"
+            self._selected = "playhead"
             val = self._x_to_val(x)
             self._playhead = val
             self.playhead_changed.emit(val)
             self.update()
 
         elif event.button() == Qt.MouseButton.RightButton:
-            # Right click → move whichever trim handle is closer
+            # Right click → move whichever trim handle is closer + select it
             x1 = self._val_to_x(self._start)
             x2 = self._val_to_x(self._end)
             if abs(x - x1) <= abs(x - x2):
                 self._dragging = "start"
+                self._selected = "start"
                 val = self._x_to_val(x)
                 self._start = min(val, self._end - 1)
             else:
                 self._dragging = "end"
+                self._selected = "end"
                 val = self._x_to_val(x)
                 self._end = max(val, self._start + 1)
             self.range_changed.emit(self._start, self._end)
@@ -135,6 +145,36 @@ class RangeSlider(QWidget):
 
     def mouseReleaseEvent(self, event):
         self._dragging = None
+
+    def keyPressEvent(self, event):
+        if self._selected is None:
+            super().keyPressEvent(event)
+            return
+        # Step: ~1% of range per press, minimum 10ms
+        step = max(10, self._max // 100)
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            self._nudge_selected(-step)
+        elif key == Qt.Key.Key_Right:
+            self._nudge_selected(step)
+        else:
+            super().keyPressEvent(event)
+
+    def _nudge_selected(self, delta: int):
+        if self._selected == "start":
+            self._start = max(self._min, min(self._start + delta, self._end - 1))
+            self.range_changed.emit(self._start, self._end)
+        elif self._selected == "end":
+            self._end = max(self._start + 1, min(self._end + delta, self._max))
+            self.range_changed.emit(self._start, self._end)
+        elif self._selected == "playhead":
+            self._playhead = max(self._min, min(self._playhead + delta, self._max))
+            self.playhead_changed.emit(self._playhead)
+        self.update()
+
+    def deselect(self):
+        self._selected = None
+        self.update()
 
 
 class TrimControls(QWidget):

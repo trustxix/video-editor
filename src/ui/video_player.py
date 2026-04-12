@@ -2,7 +2,8 @@ import array
 import subprocess
 import threading
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QStyle, QSlider
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QStyle
+from src.ui.widgets import ClickSlider
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame, QAudioSink, QAudioFormat
 from PyQt6.QtCore import Qt, QRect, QPointF, pyqtSignal, QUrl, QTimer
 from PyQt6.QtGui import QPainter
@@ -193,7 +194,14 @@ class VideoSurface(QWidget):
         self._brightness = 0.0
         self._exposure = 0.0
 
+        # Frame stepping: when True, ignore QVideoSink frames so the
+        # accurate ffmpeg-decoded frame isn't overwritten by QMediaPlayer's
+        # keyframe-snapped seek. Cleared when playback resumes.
+        self._stepping = False
+
     def _on_frame(self, frame: QVideoFrame):
+        if self._stepping:
+            return  # Keep the accurate stepped frame on screen
         first = self._image is None
         self._image = frame.toImage()
         self.update()
@@ -391,13 +399,16 @@ class VideoPlayer(QWidget):
         vol_icon.setToolTip("Preview volume (does not affect exports)")
         controls.addWidget(vol_icon)
 
-        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider = ClickSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(100)
-        self.vol_slider.setFixedWidth(110)
+        self.vol_slider.setFixedWidth(80)
+        self.vol_slider.setFixedHeight(16)
         self.vol_slider.setToolTip("Preview volume (does not affect exports)")
-        # Live updates on every tick for responsive feel; persistence only
-        # fires on release so we're not rewriting settings.json 100 times/sec.
+        self.vol_slider.setStyleSheet("""
+            QSlider::groove:horizontal { height: 3px; }
+            QSlider::handle:horizontal { width: 8px; margin: -3px 0; border-radius: 4px; }
+        """)
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         self.vol_slider.sliderReleased.connect(
             lambda: self.volume_changed.emit(self.vol_slider.value())
@@ -459,7 +470,9 @@ class VideoPlayer(QWidget):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
             if self._pitched_active and self._pitched.ready:
-                self._pitched.play(self.player.position())
+                # Delay by one tick so MainWindow._on_playback_state can
+                # correct the position first (for frame-step → play sync).
+                QTimer.singleShot(0, lambda: self._pitched.play(self.player.position()))
         else:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self._pitched.stop()

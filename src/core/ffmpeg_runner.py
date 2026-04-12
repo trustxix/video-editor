@@ -157,7 +157,7 @@ def prerender_audio(
     Reads raw PCM extracted by FFmpeg, runs the same resampling loop as the
     live PitchedAudioPlayer, writes a WAV file.
     """
-    import array, struct, wave
+    import array, wave
 
     from src.ui.automation_lane import AutomationLane
     lane = AutomationLane()
@@ -240,6 +240,8 @@ def build_video_segments(
         segments.append((t / 1000, t_end / 1000, speed))
         t = t_end
 
+    if not segments:
+        return []
     merged = [segments[0]]
     for seg in segments[1:]:
         prev_start, prev_end, prev_speed = merged[-1]
@@ -294,6 +296,8 @@ def export_with_automation(
 
     temp_dir = tempfile.mkdtemp(prefix="ve_export_")
     segments = build_video_segments(keyframes, base_speed, trim_start_ms, trim_end_ms)
+    if not segments:
+        return False
     total_out_dur = sum((e - s) / spd for s, e, spd in segments)
 
     try:
@@ -302,8 +306,13 @@ def export_with_automation(
         if audio_mode != "mute":
             if progress_callback:
                 progress_callback(0)
-            prerender_audio(input_path, audio_wav, keyframes, base_speed,
-                            trim_start_ms, trim_end_ms)
+            audio_ok = prerender_audio(input_path, audio_wav, keyframes, base_speed,
+                                       trim_start_ms, trim_end_ms)
+            if not audio_ok:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "prerender_audio failed for %s — export will have no audio", input_path
+                )
 
         # ── Step 2: Build single filter_complex for all segments ──
         #
@@ -464,6 +473,35 @@ def get_video_fps(input_path: str) -> float:
         return num / den
     except ValueError:
         return 0.0
+
+
+def extract_frame(input_path: str, timestamp_s: float) -> bytes | None:
+    """Extract a single frame at the exact timestamp as BMP bytes.
+
+    Uses `-ss` before `-i` for fast seeking: ffmpeg jumps to the nearest
+    keyframe then decodes forward to the target frame. This is frame-
+    accurate in modern ffmpeg (4+), unlike QMediaPlayer.setPosition()
+    which snaps to the keyframe on Windows.
+
+    Returns raw BMP data suitable for QImage.loadFromData(), or None.
+    """
+    cmd = [
+        get_ffmpeg(), '-loglevel', 'quiet',
+        '-ss', f'{timestamp_s:.6f}',
+        '-i', input_path,
+        '-frames:v', '1',
+        '-f', 'image2pipe', '-vcodec', 'bmp',
+        'pipe:1',
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, startupinfo=_hide_window(), timeout=5,
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
 
 
 def run_export(cmd: list[str], duration: float, progress_callback=None, process_callback=None) -> bool:

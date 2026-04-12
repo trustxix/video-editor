@@ -29,4 +29,5 @@ class VideoItem:
     exposure: float = 0.0
     locked: bool = False
     probed: bool = False
+    export_listed: bool = False  # manually added to the batch export list
     speed_keyframes: list = field(default_factory=list)  # [(time_ms, speed), ...]

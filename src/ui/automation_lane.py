@@ -1,16 +1,17 @@
 from PyQt6.QtWidgets import QWidget, QInputDialog
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPainter, QColor, QPen, QMouseEvent, QFont, QPainterPath
+from PyQt6.QtGui import QPainter, QColor, QPen, QMouseEvent, QFont
 
 
 class AutomationLane(QWidget):
     """Speed automation lane with linear interpolation between keyframes.
 
-    Left click to add/drag, right click to remove, middle click to duplicate,
-    double-click a keyframe to type a value.
+    Left click to add/select/drag, right click to remove,
+    middle click to duplicate (horizontal only), double-click to type a value.
     """
 
     changed = pyqtSignal()  # keyframes were modified
+    focus_taken = pyqtSignal()  # this lane grabbed focus (for global selection tracking)
 
     _MIN_SPEED = 0.05
     _MAX_SPEED = 2.0
@@ -21,9 +22,13 @@ class AutomationLane(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(80)
         self.setMaximumHeight(80)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._max_ms = 1000
         self._keyframes: list[tuple[int, float]] = []  # sorted by time_ms
         self._dragging_idx = -1
+        self._drag_lock_speed: float | None = None  # non-None = horizontal-only drag (duplicate)
+        self._locked_keyframes: set[tuple[int, float]] = set()  # locked (time_ms, speed) pairs
+        self._selected_idx: int = -1  # currently selected keyframe for arrow-key nudge
         self._playhead = 0
         self._base_speed = 1.0
 
@@ -39,10 +44,28 @@ class AutomationLane(QWidget):
 
     def set_keyframes(self, kf: list[tuple[int, float]]):
         self._keyframes = sorted(kf, key=lambda k: k[0])
+        self._locked_keyframes.clear()
+        self._selected_idx = -1
         self.update()
 
     def get_keyframes(self) -> list[tuple[int, float]]:
         return list(self._keyframes)
+
+    def _is_locked(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self._keyframes):
+            return False
+        # Lock is tracked by (time_ms, speed) identity since indices shift on sort
+        return self._keyframes[idx] in self._locked_keyframes
+
+    def _toggle_lock(self, idx: int):
+        if idx < 0 or idx >= len(self._keyframes):
+            return
+        kf = self._keyframes[idx]
+        if kf in self._locked_keyframes:
+            self._locked_keyframes.discard(kf)
+        else:
+            self._locked_keyframes.add(kf)
+        self.update()
 
     def set_base_speed(self, speed: float):
         self._base_speed = speed
@@ -77,6 +100,8 @@ class AutomationLane(QWidget):
 
     def clear(self):
         self._keyframes.clear()
+        self._locked_keyframes.clear()
+        self._selected_idx = -1
         self.changed.emit()
         self.update()
 
@@ -150,13 +175,28 @@ class AutomationLane(QWidget):
 
         # Keyframe dots + value labels
         p.setFont(QFont("monospace", 8))
-        for t, s in self._keyframes:
+        for i, (t, s) in enumerate(self._keyframes):
             kx = self._t_to_x(t)
             ky = self._speed_to_y(s)
 
-            p.setBrush(QColor(255, 255, 255))
-            p.setPen(QPen(QColor(100, 200, 255), 2))
+            locked = (t, s) in self._locked_keyframes
+            selected = (i == self._selected_idx)
+
+            if locked:
+                p.setBrush(QColor(255, 180, 60))   # orange = locked
+                p.setPen(QPen(QColor(200, 140, 40), 2))
+            elif selected:
+                p.setBrush(QColor(120, 255, 120))   # green = selected
+                p.setPen(QPen(QColor(80, 200, 80), 2))
+            else:
+                p.setBrush(QColor(255, 255, 255))
+                p.setPen(QPen(QColor(100, 200, 255), 2))
             p.drawEllipse(int(kx) - 5, int(ky) - 5, 10, 10)
+
+            # Lock icon indicator
+            if locked:
+                p.setPen(QColor(200, 140, 40))
+                p.drawText(int(kx) + 8, int(ky) + 4, "\U0001F512")
 
             label = f"{s:.2f}x"
             p.setPen(QColor(220, 220, 220))
@@ -188,33 +228,55 @@ class AutomationLane(QWidget):
         return 0
 
     def mousePressEvent(self, event: QMouseEvent):
+        self.setFocus()
+        self.focus_taken.emit()
         x, y = event.pos().x(), event.pos().y()
 
         if event.button() == Qt.MouseButton.LeftButton:
             idx = self._hit_test(x, y)
+
+            # Shift+click on a keyframe = toggle lock
+            if idx >= 0 and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._toggle_lock(idx)
+                return
+
             if idx >= 0:
-                self._dragging_idx = idx
+                self._selected_idx = idx
+                if not self._is_locked(idx):
+                    self._dragging_idx = idx
+                self.update()
             else:
+                # Click empty space = add new keyframe
                 t = self._x_to_t(x)
                 s = self._y_to_speed(y)
                 self._keyframes.append((t, s))
                 self._dragging_idx = self._sort_and_find(t, s)
+                self._selected_idx = self._dragging_idx
                 self.changed.emit()
                 self.update()
 
         elif event.button() == Qt.MouseButton.RightButton:
             idx = self._hit_test(x, y)
-            if idx >= 0:
+            if idx >= 0 and not self._is_locked(idx):
                 self._keyframes.pop(idx)
+                if self._selected_idx == idx:
+                    self._selected_idx = -1
                 self.changed.emit()
                 self.update()
 
         elif event.button() == Qt.MouseButton.MiddleButton:
             idx = self._hit_test(x, y)
             if idx >= 0:
+                # Duplicate — works even on locked keyframes.
+                # Offset by 1ms so the new keyframe doesn't inherit
+                # the lock (lock is tracked by (t, s) identity).
                 t, s = self._keyframes[idx]
-                self._keyframes.append((t, s))
-                self._dragging_idx = self._sort_and_find(t, s)
+                new_t = min(t + 1, self._max_ms)
+                self._keyframes.append((new_t, s))
+                new_idx = self._sort_and_find(new_t, s)
+                self._dragging_idx = new_idx
+                self._selected_idx = new_idx
+                self._drag_lock_speed = s  # horizontal-only drag
                 self.changed.emit()
                 self.update()
 
@@ -238,9 +300,13 @@ class AutomationLane(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent):
         if self._dragging_idx < 0:
             return
+        # Locked keyframes cannot be dragged at all
+        if self._is_locked(self._dragging_idx):
+            return
         x, y = event.pos().x(), event.pos().y()
         t = self._x_to_t(x)
-        s = self._y_to_speed(y)
+        # If horizontal lock is active (duplicate drag), keep the original speed
+        s = self._drag_lock_speed if self._drag_lock_speed is not None else self._y_to_speed(y)
         self._keyframes[self._dragging_idx] = (t, s)
         self._dragging_idx = self._sort_and_find(t, s)
         self.changed.emit()
@@ -248,3 +314,50 @@ class AutomationLane(QWidget):
 
     def mouseReleaseEvent(self, event):
         self._dragging_idx = -1
+        self._drag_lock_speed = None
+
+    # ── Arrow key nudging for selected keyframe ─────────────
+
+    def keyPressEvent(self, event):
+        idx = self._selected_idx
+        if idx < 0 or idx >= len(self._keyframes):
+            super().keyPressEvent(event)
+            return
+        if self._is_locked(idx):
+            super().keyPressEvent(event)
+            return
+
+        t, s = self._keyframes[idx]
+        # Time step: ~1% of duration per press, minimum 10ms
+        t_step = max(10, self._max_ms // 100)
+        # Speed step: 0.05 (matches snap grid)
+        s_step = 0.05
+
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            t = max(0, t - t_step)
+        elif key == Qt.Key.Key_Right:
+            t = min(self._max_ms, t + t_step)
+        elif key == Qt.Key.Key_Up:
+            s = min(self._MAX_SPEED, round(s + s_step, 2))
+        elif key == Qt.Key.Key_Down:
+            s = max(self._MIN_SPEED, round(s - s_step, 2))
+        elif key == Qt.Key.Key_Delete:
+            self._keyframes.pop(idx)
+            self._selected_idx = -1
+            self.changed.emit()
+            self.update()
+            return
+        else:
+            super().keyPressEvent(event)
+            return
+
+        self._keyframes[idx] = (t, s)
+        self._selected_idx = self._sort_and_find(t, s)
+        self.changed.emit()
+        self.update()
+
+    def deselect(self):
+        """Clear selection (called by main window when another widget takes focus)."""
+        self._selected_idx = -1
+        self.update()
