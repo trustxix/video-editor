@@ -11,6 +11,8 @@ pyinstaller ^
     --noconfirm ^
     --clean ^
     --contents-directory "lib" ^
+    --icon "assets\icon.ico" ^
+    --add-data "assets\icon.ico;assets" ^
     --collect-submodules PyQt6 ^
     --hidden-import PyQt6.QtMultimedia ^
     --hidden-import PyQt6.QtMultimediaWidgets ^

@@ -12,7 +12,7 @@ class AutomationLane(QWidget):
 
     changed = pyqtSignal()  # keyframes were modified
 
-    _MIN_SPEED = 0.25
+    _MIN_SPEED = 0.05
     _MAX_SPEED = 2.0
     _MARGIN = 8
     _HIT_RADIUS = 10
@@ -114,9 +114,10 @@ class AutomationLane(QWidget):
         # Background
         p.fillRect(0, 0, w, h, QColor(40, 40, 40))
 
-        # Grid lines
+        # Grid lines. Extra low-end references (0.1, 0.25) help eyeball
+        # extreme slow-down values now that the floor is 0.05x.
         p.setPen(QPen(QColor(60, 60, 60), 1))
-        for spd in (0.5, 1.0, 1.5, 2.0):
+        for spd in (0.1, 0.25, 0.5, 1.0, 1.5, 2.0):
             y = self._speed_to_y(spd)
             p.drawLine(self._MARGIN, int(y), w - self._MARGIN, int(y))
 

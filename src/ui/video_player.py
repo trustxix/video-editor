@@ -2,7 +2,7 @@ import array
 import subprocess
 import threading
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QStyle
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QStyle, QSlider
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame, QAudioSink, QAudioFormat
 from PyQt6.QtCore import Qt, QRect, QPointF, pyqtSignal, QUrl, QTimer
 from PyQt6.QtGui import QPainter
@@ -29,6 +29,7 @@ class PitchedAudioPlayer:
         self._timer = QTimer()
         self._timer.timeout.connect(self._feed)
         self._speed = 1.0
+        self._volume = 1.0  # Linear 0.0-1.0 — re-applied to each new sink in play()
         self._pos = 0.0  # fractional frame position in input
         self._gen = 0
         self._automation = None  # set to AutomationLane for per-sample speed lookup
@@ -69,6 +70,17 @@ class PitchedAudioPlayer:
         """Update speed smoothly — no sink recreation needed."""
         self._speed = speed
 
+    def set_volume(self, volume: float):
+        """Set preview volume (linear 0.0-1.0).
+
+        Stored on the player and re-applied each time a new QAudioSink
+        is created in play() — without that, the next play() call would
+        start a fresh sink at 100% regardless of the slider position.
+        """
+        self._volume = max(0.0, min(1.0, volume))
+        if self._sink is not None:
+            self._sink.setVolume(self._volume)
+
     def play(self, position_ms: int = 0):
         """Start push-mode playback at fixed 48 kHz."""
         self.stop()
@@ -79,6 +91,7 @@ class PitchedAudioPlayer:
         fmt.setChannelCount(self._CHANNELS)
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
         self._sink = QAudioSink(fmt)
+        self._sink.setVolume(self._volume)  # Re-apply persisted slider value
         self._io = self._sink.start()
         self._pos = float(position_ms * self._BASE_RATE / 1000)
         self._feed()  # prime buffer immediately
@@ -173,6 +186,13 @@ class VideoSurface(QWidget):
         self._view_pan_x = 0.0
         self._view_pan_y = 0.0
 
+        # Color adjustments (preview only — the export pipeline applies
+        # precise ffmpeg `eq` and `exposure` filters from the same values).
+        # `_brightness` is normalized -0.5..0.5 (matches ffmpeg eq.brightness).
+        # `_exposure` is in stops, -3.0..3.0 (matches ffmpeg exposure.exposure).
+        self._brightness = 0.0
+        self._exposure = 0.0
+
     def _on_frame(self, frame: QVideoFrame):
         first = self._image is None
         self._image = frame.toImage()
@@ -210,6 +230,19 @@ class VideoSurface(QWidget):
         self.update()
         self.zoom_changed.emit()
 
+    def set_color_adjust(self, brightness: float, exposure: float):
+        """Update preview brightness/exposure.
+
+        `brightness` is normalized -0.5..0.5 (matches ffmpeg eq).
+        `exposure` is in photographic stops, -3.0..3.0 (matches ffmpeg
+        exposure filter). Both are clamped defensively. paintEvent uses
+        the combined effect to draw an alpha overlay — see the comment
+        in paintEvent for why that's approximate.
+        """
+        self._brightness = max(-0.5, min(0.5, brightness))
+        self._exposure = max(-3.0, min(3.0, exposure))
+        self.update()
+
     def reset_zoom(self):
         self._pan_x = 0.0
         self._pan_y = 0.0
@@ -228,7 +261,33 @@ class VideoSurface(QWidget):
             p.save()
             p.translate(self._view_pan_x, self._view_pan_y)
             p.scale(self._view_zoom, self._view_zoom)
-            p.drawImage(self.video_display_rect(), self._image)
+            video_rect = self.video_display_rect()
+            p.drawImage(video_rect, self._image)
+
+            # Color adjust overlay — APPROXIMATE preview only. True
+            # brightness/exposure math requires per-pixel access which
+            # we can't cheaply afford in Python for live 60fps preview.
+            # Instead, we alpha-blend a black or white rectangle over
+            # the frame with opacity proportional to the combined
+            # adjustment. At small magnitudes this matches visually;
+            # at large magnitudes it washes toward gray rather than
+            # clipping to white like true additive brightness. That's
+            # fine for preview feedback — the exported file uses the
+            # real ffmpeg filters and will look correct.
+            #
+            # Combined effect: brightness is already in normalized
+            # [-0.5, 0.5]. Exposure is in stops: +1 stop ≈ doubling
+            # which feels roughly like +0.25 brightness on mid-grey,
+            # so exposure_stops * 0.25 gives a reasonable preview
+            # approximation.
+            combined = self._brightness + self._exposure * 0.25
+            if combined != 0:
+                alpha = min(abs(combined), 0.85)  # never fully opaque
+                p.setOpacity(alpha)
+                color = Qt.GlobalColor.white if combined > 0 else Qt.GlobalColor.black
+                p.fillRect(video_rect, color)
+                p.setOpacity(1.0)
+
             p.restore()
         p.end()
 
@@ -269,6 +328,7 @@ class VideoSurface(QWidget):
 class VideoPlayer(QWidget):
     position_changed = pyqtSignal(int)  # ms
     duration_changed = pyqtSignal(int)  # ms
+    volume_changed = pyqtSignal(int)    # 0-100, fired on slider release for persistence
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -281,6 +341,26 @@ class VideoPlayer(QWidget):
     def set_automation(self, automation_lane):
         """Give the pitched audio player a reference to the automation lane for per-sample speed."""
         self._pitched._automation = automation_lane
+
+    def set_volume(self, value: int):
+        """Sync the slider from a persisted setting (0-100).
+
+        Doesn't emit volume_changed — this is the "load from disk" path,
+        not a user action, so we don't want to trigger a save-to-disk.
+        """
+        clamped = max(0, min(100, int(value)))
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(clamped)
+        self.vol_slider.blockSignals(False)
+        # Still apply the volume to the audio paths — blockSignals only
+        # stops valueChanged from firing, not our explicit apply.
+        self._on_volume_changed(clamped)
+
+    def _on_volume_changed(self, value: int):
+        """Live apply slider value (0-100) to both audio paths."""
+        linear = value / 100.0
+        self.audio.setVolume(linear)
+        self._pitched.set_volume(linear)
 
     def _setup_ui(self):
         self.layout_main = QVBoxLayout(self)
@@ -297,9 +377,33 @@ class VideoPlayer(QWidget):
         controls.addWidget(self.btn_play)
 
         self.lbl_time = QLabel("00:00.00 / 00:00.00")
-        self.lbl_time.setStyleSheet("font-family: monospace; font-size: 13px;")
+        # Monospace so digits don't jitter as the time advances; font
+        # size follows the app font so DPI scaling works correctly.
+        self.lbl_time.setStyleSheet("font-family: monospace;")
         controls.addWidget(self.lbl_time)
         controls.addStretch()
+
+        # Preview volume slider — affects playback only, never the export.
+        vol_icon = QLabel()
+        vol_icon.setPixmap(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume).pixmap(16, 16)
+        )
+        vol_icon.setToolTip("Preview volume (does not affect exports)")
+        controls.addWidget(vol_icon)
+
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(100)
+        self.vol_slider.setFixedWidth(110)
+        self.vol_slider.setToolTip("Preview volume (does not affect exports)")
+        # Live updates on every tick for responsive feel; persistence only
+        # fires on release so we're not rewriting settings.json 100 times/sec.
+        self.vol_slider.valueChanged.connect(self._on_volume_changed)
+        self.vol_slider.sliderReleased.connect(
+            lambda: self.volume_changed.emit(self.vol_slider.value())
+        )
+        controls.addWidget(self.vol_slider)
+
         self.layout_main.addLayout(controls)
 
     def _setup_player(self):

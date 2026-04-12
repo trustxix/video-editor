@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QPushButton, QFileDialog,
     QProgressBar, QMessageBox, QApplication, QLineEdit, QSlider
 )
-from PyQt6.QtCore import Qt, QEvent, QThread, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import QMediaPlayer
 
 from src.core.paths import get_config_dir
@@ -22,7 +22,7 @@ from src.ui.themes import apply_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
     build_command, get_output_path, get_video_duration,
-    get_video_resolution, run_export, export_with_automation,
+    get_video_fps, get_video_resolution, run_export, export_with_automation,
 )
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')
@@ -81,10 +81,24 @@ class MainWindow(QMainWindow):
         self._queue: list[VideoItem] = []
         self._queue_index: int = -1
         self._last_output: str = ""
+
+        # Batch export state. _batch_queue is a list of queue indices to
+        # process; _batch_index is how far we've gotten; _batch_results is
+        # parallel to _batch_queue with 'ok' / 'failed' per clip, used for
+        # the summary at the end. None when no batch is running.
+        self._batch_queue: list[int] | None = None
+        self._batch_index: int = 0
+        self._batch_results: list[tuple[str, bool]] = []
+        self._batch_return_to: int = -1  # where to navigate when done
         self._settings_path = get_config_dir() / "settings.json"
         self._settings = self._load_settings()
         apply_theme(self._settings.get("theme", DEFAULT_THEME))
-        self._apply_stay_on_top(self._settings.get("stay_on_top", False))
+        # Stay-on-top is applied *after* the window has been shown — see
+        # the QTimer.singleShot at the end of __init__. Calling winId()
+        # here during __init__ (which _apply_stay_on_top does) would
+        # force the native HWND to be realized before _setup_ui()
+        # creates any child widgets, and the topmost bit wouldn't stick
+        # through Qt's first ShowWindow pass.
 
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
@@ -93,10 +107,23 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         QApplication.instance().installEventFilter(self)
 
+        # Apply stay-on-top after the event loop has processed show().
+        # QTimer.singleShot(0, ...) runs the callback on the next event
+        # loop iteration, by which point main.py has already called
+        # window.show() and Qt has finished its first ShowWindow pass.
+        # Doing this here (instead of in __init__) is what makes the
+        # topmost bit actually stick on a cold launch.
+        QTimer.singleShot(0, lambda: self._apply_stay_on_top(
+            self._settings.get("stay_on_top", False)
+        ))
+
     def _setup_menu(self):
         menu = self.menuBar()
         file_menu = menu.addMenu("&File")
         file_menu.addAction("&Open Video...", "Ctrl+O", self._open_file)
+        file_menu.addSeparator()
+        file_menu.addAction("&Close Current Clip", "Ctrl+W", self._remove_current_clip)
+        file_menu.addAction("Clear Qu&eue", "Ctrl+Shift+W", self._clear_queue)
         file_menu.addSeparator()
         file_menu.addAction("&Settings...", self._open_settings)
         file_menu.addSeparator()
@@ -120,13 +147,29 @@ class MainWindow(QMainWindow):
 
         self.lbl_queue = QLabel("")
         self.lbl_queue.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_queue.setStyleSheet("font-size: 13px;")
+        # No hardcoded font-size — inherit from the app font so
+        # Windows DPI scaling and theme changes apply cleanly.
         nav.addWidget(self.lbl_queue, stretch=1)
 
         self.btn_next = QPushButton("Next \u25B6")
         self.btn_next.setFixedWidth(70)
         self.btn_next.clicked.connect(self._go_next)
         nav.addWidget(self.btn_next)
+
+        # Small separator so Remove/Clear don't look like navigation buttons.
+        nav.addSpacing(12)
+
+        self.btn_remove = QPushButton("\u2715 Remove")
+        self.btn_remove.setFixedWidth(90)
+        self.btn_remove.setToolTip("Remove the current clip from the queue (Ctrl+W)")
+        self.btn_remove.clicked.connect(self._remove_current_clip)
+        nav.addWidget(self.btn_remove)
+
+        self.btn_clear_queue = QPushButton("Clear All")
+        self.btn_clear_queue.setFixedWidth(80)
+        self.btn_clear_queue.setToolTip("Remove all clips from the queue")
+        self.btn_clear_queue.clicked.connect(self._clear_queue)
+        nav.addWidget(self.btn_clear_queue)
 
         self.nav_widget = QWidget()
         self.nav_widget.setLayout(nav)
@@ -135,6 +178,8 @@ class MainWindow(QMainWindow):
 
         # ── Video area ─────────────────────────────────────────
         self.player = VideoPlayer()
+        self.player.set_volume(self._settings.get("preview_volume", 100))
+        self.player.volume_changed.connect(self._on_preview_volume_changed)
         self.crop_overlay = CropOverlay(self.player.surface)
         self.crop_overlay.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
@@ -186,7 +231,11 @@ class MainWindow(QMainWindow):
         self.btn_lock_crop.toggled.connect(self._on_crop_lock_toggled)
         cg.addWidget(self.btn_lock_crop)
 
-        bottom.addWidget(crop_group)
+        # Bottom bar stretch factors: crop/effects/color all grow with
+        # the window; export (just buttons) stays compact on the right.
+        # QGroupBox defaults to sizeHint-only sizing, so without explicit
+        # stretch here the extra width never reaches the sliders inside.
+        bottom.addWidget(crop_group, stretch=2)
 
         # Effects
         effects_group = QGroupBox("Effects")
@@ -214,9 +263,9 @@ class MainWindow(QMainWindow):
         self.sld_speed = QSlider(Qt.Orientation.Horizontal)
         self.sld_speed.setRange(25, 200)  # 25% to 200%
         self.sld_speed.setValue(100)
-        self.sld_speed.setFixedWidth(120)
+        self.sld_speed.setMinimumWidth(120)  # floor, not ceiling — grows with window
         self.sld_speed.valueChanged.connect(self._on_speed_slider_changed)
-        efx.addWidget(self.sld_speed)
+        efx.addWidget(self.sld_speed, stretch=1)
 
         self.lbl_speed = QLabel("100%")
         self.lbl_speed.setFixedWidth(40)
@@ -240,7 +289,52 @@ class MainWindow(QMainWindow):
         self.spn_stretch_v.setSingleStep(10)
         efx.addWidget(self.spn_stretch_v)
 
-        bottom.addWidget(effects_group)
+        bottom.addWidget(effects_group, stretch=2)
+
+        # ── Color adjustments ─────────────────────────────────
+        color_group = QGroupBox("Color")
+        cg = QVBoxLayout(color_group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Bright:"))
+        self.sld_brightness = QSlider(Qt.Orientation.Horizontal)
+        self.sld_brightness.setRange(-100, 100)
+        self.sld_brightness.setValue(0)
+        self.sld_brightness.setMinimumWidth(130)
+        self.sld_brightness.setToolTip("Preview is approximate; export is precise (ffmpeg eq)")
+        self.sld_brightness.valueChanged.connect(self._on_brightness_changed)
+        row.addWidget(self.sld_brightness, stretch=1)
+        self.lbl_brightness = QLabel("0")
+        self.lbl_brightness.setFixedWidth(35)
+        self.lbl_brightness.setStyleSheet("font-family: monospace;")
+        row.addWidget(self.lbl_brightness)
+        cg.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Expose:"))
+        self.sld_exposure = QSlider(Qt.Orientation.Horizontal)
+        self.sld_exposure.setRange(-100, 100)
+        self.sld_exposure.setValue(0)
+        self.sld_exposure.setMinimumWidth(130)
+        self.sld_exposure.setToolTip("Photographic stops (-3 to +3). Export is precise (ffmpeg exposure)")
+        self.sld_exposure.valueChanged.connect(self._on_exposure_changed)
+        row.addWidget(self.sld_exposure, stretch=1)
+        self.lbl_exposure = QLabel("0")
+        self.lbl_exposure.setFixedWidth(35)
+        self.lbl_exposure.setStyleSheet("font-family: monospace;")
+        row.addWidget(self.lbl_exposure)
+        cg.addLayout(row)
+
+        # "Reset" button — one click to zero both sliders
+        row = QHBoxLayout()
+        row.addStretch()
+        self.btn_reset_color = QPushButton("Reset")
+        self.btn_reset_color.setFixedWidth(70)
+        self.btn_reset_color.clicked.connect(self._reset_color)
+        row.addWidget(self.btn_reset_color)
+        cg.addLayout(row)
+
+        bottom.addWidget(color_group, stretch=2)
 
         export_group = QGroupBox("Export")
         eg = QVBoxLayout(export_group)
@@ -248,6 +342,14 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self._export)
         eg.addWidget(self.btn_export)
+
+        # Batch export: exports every queued clip that has any non-default
+        # edit (trim, crop, speed, stretch, or keyframes) and skips the
+        # rest. Designed for "load 30 clips, edit some, let it run".
+        self.btn_export_all = QPushButton("Export All Edited")
+        self.btn_export_all.setEnabled(False)
+        self.btn_export_all.clicked.connect(self._start_batch_export)
+        eg.addWidget(self.btn_export_all)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -313,6 +415,7 @@ class MainWindow(QMainWindow):
             try:
                 item.video_w, item.video_h = get_video_resolution(item.path)
                 item.duration_s = get_video_duration(item.path)
+                item.fps = get_video_fps(item.path)
             except FileNotFoundError:
                 QMessageBox.warning(self, "FFmpeg Not Found",
                     "FFmpeg/FFprobe is required but was not found.\n"
@@ -359,9 +462,15 @@ class MainWindow(QMainWindow):
         self._restore_state(item)
 
         self.btn_export.setEnabled(True)
+        self.btn_export_all.setEnabled(True)
         self._update_nav()
 
     def _save_current_state(self):
+        # Guard for post-unload state: if no clip is active, saving is
+        # a no-op. Without this, any UI signal that fires during or after
+        # a queue-clear could crash with IndexError.
+        if not (0 <= self._queue_index < len(self._queue)):
+            return
         item = self._queue[self._queue_index]
         item.trim_start_ms, item.trim_end_ms = self.trim.slider.get_selection()
         item.crop_x = self.spn_x.value()
@@ -373,6 +482,8 @@ class MainWindow(QMainWindow):
         item.speed = self.sld_speed.value() / 100.0
         item.stretch_h = self.spn_stretch_h.value() / 100.0
         item.stretch_v = self.spn_stretch_v.value() / 100.0
+        item.brightness = self.sld_brightness.value() * self._BRIGHTNESS_SCALE
+        item.exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
         item.locked = self.btn_lock_crop.isChecked()
         item.speed_keyframes = self.automation.get_keyframes()
 
@@ -404,6 +515,19 @@ class MainWindow(QMainWindow):
         self._updating_stretch = False
         self.player.surface.set_stretch(item.stretch_h, item.stretch_v)
 
+        # Restore color adjustments. Slider signals are silenced by the
+        # outer self._restoring = True guard at the top of this method,
+        # so setting the values here won't trigger _on_brightness_changed.
+        self.sld_brightness.blockSignals(True)
+        self.sld_exposure.blockSignals(True)
+        self.sld_brightness.setValue(int(round(item.brightness / self._BRIGHTNESS_SCALE)))
+        self.sld_exposure.setValue(int(round(item.exposure / self._EXPOSURE_SCALE)))
+        self.sld_brightness.blockSignals(False)
+        self.sld_exposure.blockSignals(False)
+        self.lbl_brightness.setText(f"{self.sld_brightness.value():+d}" if self.sld_brightness.value() else "0")
+        self.lbl_exposure.setText(f"{self.sld_exposure.value():+d}" if self.sld_exposure.value() else "0")
+        self.player.surface.set_color_adjust(item.brightness, item.exposure)
+
         # Set aspect ratio lock only in Crop mode, not Stretch mode
         if item.crop_mode == "Crop":
             self.crop_overlay.set_aspect_ratio(ASPECT_PRESETS.get(item.preset_name))
@@ -430,19 +554,116 @@ class MainWindow(QMainWindow):
             return
         self._navigate_to(self._queue_index + 1)
 
+    def _remove_current_clip(self):
+        """Remove the currently-viewed clip from the queue.
+
+        If there are more clips, auto-advance to the next one (or the
+        previous one if we removed the tail). If the queue is empty
+        after removal, drop into the no-clip-loaded state so the user
+        can add more without restarting.
+
+        Disabled mid-export — removing the clip being exported would
+        cause all sorts of chaos with the worker thread.
+        """
+        if self._worker is not None or self._batch_queue is not None:
+            return
+        if not (0 <= self._queue_index < len(self._queue)):
+            return
+
+        idx = self._queue_index
+
+        # Release the QMediaPlayer file handle before removing. Not
+        # strictly required (we're not deleting the file) but it avoids
+        # any lingering Windows sharing locks and matches the pattern
+        # we use in _archive_original_clip.
+        self.player.player.setSource(QUrl())
+        QApplication.processEvents()
+
+        # Mark the slot as invalid *before* popping so that if anything
+        # reacts to the pop via a signal and tries to read the current
+        # item, _save_current_state's guard short-circuits safely.
+        self._queue_index = -1
+        self._queue.pop(idx)
+
+        if not self._queue:
+            self._unload_all_clips()
+            return
+
+        # Pick a reasonable replacement: the clip that took over the
+        # removed index, or the last clip if we just removed the tail.
+        new_idx = min(idx, len(self._queue) - 1)
+        self._navigate_to(new_idx)
+
+    def _unload_all_clips(self):
+        """Empty the queue and reset the UI to the no-clip-loaded state."""
+        self.player.release()
+        self._queue.clear()
+        self._queue_index = -1
+        self._video_path = None
+        self._video_w = 0
+        self._video_h = 0
+        self._duration_s = 0.0
+        self._last_output = ""
+        self.btn_export.setEnabled(False)
+        self.btn_export_all.setEnabled(False)
+        # Clear any stale editing state so it doesn't leak into the next
+        # clip the user drops in.
+        self.automation.clear()
+        self.automation.set_duration(1)
+        self.sld_brightness.blockSignals(True)
+        self.sld_exposure.blockSignals(True)
+        self.sld_brightness.setValue(0)
+        self.sld_exposure.setValue(0)
+        self.sld_brightness.blockSignals(False)
+        self.sld_exposure.blockSignals(False)
+        self.lbl_brightness.setText("0")
+        self.lbl_exposure.setText("0")
+        self.player.surface.set_color_adjust(0.0, 0.0)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.progress_bar.setVisible(False)
+        self._update_nav()
+
+    def _clear_queue(self):
+        """Remove every clip from the queue (with confirmation)."""
+        if self._worker is not None or self._batch_queue is not None:
+            return
+        if not self._queue:
+            return
+        reply = QMessageBox.question(
+            self, "Clear Queue",
+            f"Remove all {len(self._queue)} clip(s) from the queue?\n\n"
+            "This does not delete any files on disk — it only unloads them "
+            "from the editor.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._unload_all_clips()
+
     def _update_nav(self):
         count = len(self._queue)
-        self.nav_widget.setVisible(count > 1)
-        if count > 1:
+        # Show the nav bar whenever there's at least one clip, so the
+        # Remove / Clear All buttons are always reachable. Prev/Next
+        # disable themselves when there's only one clip.
+        self.nav_widget.setVisible(count >= 1)
+        has_current = 0 <= self._queue_index < count
+        if has_current:
             name = Path(self._queue[self._queue_index].path).name
-            self.lbl_queue.setText(
-                f"Video {self._queue_index + 1} of {count}  \u2014  {name}"
-            )
-            self.btn_prev.setEnabled(self._queue_index > 0)
-            self.btn_next.setEnabled(self._queue_index < count - 1)
-        if 0 <= self._queue_index < count:
-            name = Path(self._queue[self._queue_index].path).name
+            if count > 1:
+                self.lbl_queue.setText(
+                    f"Video {self._queue_index + 1} of {count}  \u2014  {name}"
+                )
+            else:
+                self.lbl_queue.setText(name)
             self.setWindowTitle(f"Video Editor \u2014 {name}")
+        else:
+            self.lbl_queue.setText("")
+            self.setWindowTitle("Video Editor")
+        self.btn_prev.setEnabled(has_current and self._queue_index > 0)
+        self.btn_next.setEnabled(has_current and self._queue_index < count - 1)
+        self.btn_remove.setEnabled(has_current)
+        self.btn_clear_queue.setEnabled(count >= 1)
 
     def closeEvent(self, event):
         # Dead-man's switch: if clean shutdown hangs for any reason (stuck
@@ -497,6 +718,7 @@ class MainWindow(QMainWindow):
             "untrimmed_archive_dir": "",
             "theme": DEFAULT_THEME,
             "stay_on_top": False,
+            "preview_volume": 100,      # 0-100, preview playback only — never affects exports
         }
         try:
             data = json.loads(self._settings_path.read_text())
@@ -516,12 +738,27 @@ class MainWindow(QMainWindow):
             defaults["codec"] = "h264"
         if defaults.get("audio_mode") not in ("copy", "reencode", "mute"):
             defaults["audio_mode"] = "copy"
+        try:
+            defaults["preview_volume"] = max(0, min(100, int(defaults["preview_volume"])))
+        except (ValueError, TypeError):
+            defaults["preview_volume"] = 100
         return defaults
 
     def _save_settings(self):
         tmp = self._settings_path.with_suffix('.tmp')
         tmp.write_text(json.dumps(self._settings, indent=2))
         tmp.replace(self._settings_path)
+
+    def _on_preview_volume_changed(self, value: int):
+        """Persist preview volume when the user releases the slider.
+
+        Fires from VideoPlayer.volume_changed (sliderReleased), not on
+        every valueChanged tick — so we rewrite settings.json once per
+        drag, not 100 times. The live volume is already applied to the
+        audio paths inside VideoPlayer; we're just persisting here.
+        """
+        self._settings["preview_volume"] = max(0, min(100, int(value)))
+        self._save_settings()
 
     def _open_settings(self):
         dlg = SettingsDialog(self._settings, self)
@@ -538,27 +775,60 @@ class MainWindow(QMainWindow):
     def _apply_stay_on_top(self, enabled: bool):
         """Toggle always-on-top via the native Win32 API.
 
-        We can't use Qt's setWindowFlag(WindowStaysOnTopHint, ...) here: on
-        Windows it destroys and recreates the HWND, which segfaults the bound
-        QMediaPlayer / QVideoSink pipeline (native crash, no traceback).
-        SetWindowPos(HWND_TOPMOST) toggles the OS-level topmost bit directly
-        without touching any Qt resources.
+        We can't use Qt's setWindowFlag(WindowStaysOnTopHint, ...) here:
+        on Windows it destroys and recreates the HWND, which segfaults
+        the bound QMediaPlayer / QVideoSink pipeline (native crash, no
+        traceback). SetWindowPos(HWND_TOPMOST) toggles the OS-level
+        topmost bit directly without touching any Qt resources.
+
+        Two gotchas this function carefully avoids:
+          1. Without argtypes, ctypes marshals Python ints as c_int
+             (32-bit), silently truncating 64-bit HWNDs on x64 Python.
+             Declare full argtypes via wintypes so the handle is passed
+             pointer-sized.
+          2. HWND_TOPMOST (-1) and HWND_NOTOPMOST (-2) are sentinel
+             pseudo-HWNDs, not real handles — they must be marshaled in
+             the HWND slot (c_void_p), not as signed ints, or the OS
+             won't recognize them.
         """
         import ctypes
-        HWND_TOPMOST = -1
-        HWND_NOTOPMOST = -2
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
+        from ctypes import wintypes
+        import logging
+
+        SWP_NOMOVE     = 0x0002
+        SWP_NOSIZE     = 0x0001
         SWP_NOACTIVATE = 0x0010
-        try:
-            hwnd = int(self.winId())
-            flag = HWND_TOPMOST if enabled else HWND_NOTOPMOST
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, flag, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,   # hWnd
+            wintypes.HWND,   # hWndInsertAfter (HWND_TOPMOST is a sentinel HWND)
+            ctypes.c_int,    # X
+            ctypes.c_int,    # Y
+            ctypes.c_int,    # cx
+            ctypes.c_int,    # cy
+            wintypes.UINT,   # uFlags
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+
+        # -1 and -2 must be boxed as HWND (pointer-sized), not passed
+        # as Python ints — that's the sentinel-truncation trap.
+        HWND_TOPMOST    = wintypes.HWND(-1)
+        HWND_NOTOPMOST  = wintypes.HWND(-2)
+
+        hwnd = wintypes.HWND(int(self.winId()))
+        flag = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+
+        ok = user32.SetWindowPos(
+            hwnd, flag, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        if not ok:
+            err = ctypes.get_last_error()
+            logging.getLogger(__name__).warning(
+                "SetWindowPos(topmost=%s) failed: GetLastError=%d hwnd=%d",
+                enabled, err, int(self.winId()),
             )
-        except Exception:
-            pass
 
     # ── Undo / Redo ────────────────────────────────────────
 
@@ -575,6 +845,8 @@ class MainWindow(QMainWindow):
             'speed': self.sld_speed.value(),
             'stretch_h': self.spn_stretch_h.value(),
             'stretch_v': self.spn_stretch_v.value(),
+            'brightness': self.sld_brightness.value(),
+            'exposure': self.sld_exposure.value(),
             'locked': self.btn_lock_crop.isChecked(),
             'keyframes': self.automation.get_keyframes(),
         }
@@ -615,6 +887,24 @@ class MainWindow(QMainWindow):
         self.spn_stretch_v.setValue(state['stretch_v'])
         self._updating_stretch = False
         self.player.surface.set_stretch(state['stretch_h'] / 100.0, state['stretch_v'] / 100.0)
+
+        # Color adjustments. self._restoring = True (set at the top of
+        # this method) blocks the handler from firing, so we can set
+        # values directly. The .get(..., 0) fallbacks keep this method
+        # compatible with older undo entries captured before color was
+        # added — they just treat the missing keys as "no change".
+        self.sld_brightness.blockSignals(True)
+        self.sld_exposure.blockSignals(True)
+        self.sld_brightness.setValue(state.get('brightness', 0))
+        self.sld_exposure.setValue(state.get('exposure', 0))
+        self.sld_brightness.blockSignals(False)
+        self.sld_exposure.blockSignals(False)
+        self.lbl_brightness.setText(f"{self.sld_brightness.value():+d}" if self.sld_brightness.value() else "0")
+        self.lbl_exposure.setText(f"{self.sld_exposure.value():+d}" if self.sld_exposure.value() else "0")
+        self.player.surface.set_color_adjust(
+            self.sld_brightness.value() * self._BRIGHTNESS_SCALE,
+            self.sld_exposure.value() * self._EXPOSURE_SCALE,
+        )
 
         self.btn_lock_crop.setChecked(state['locked'])
 
@@ -866,6 +1156,51 @@ class MainWindow(QMainWindow):
         self._updating_stretch = False
         self.player.surface.set_stretch(1.0, 1.0)
 
+    # ── Color (brightness / exposure) ─────────────────────────
+
+    # Slider↔filter mapping. Sliders are -100..100 (integer, with 0 as
+    # "no change") which is the right feel for a drag UI. Internally we
+    # store normalized floats on the VideoItem so the ffmpeg filter args
+    # come out clean without us scattering /200 divisions everywhere.
+    #   Brightness: slider [-100, 100] → eq.brightness [-0.5, 0.5]
+    #   Exposure:   slider [-100, 100] → exposure.exposure [-3.0, 3.0] stops
+    _BRIGHTNESS_SCALE = 0.005  # 100 slider units → 0.5 eq range
+    _EXPOSURE_SCALE = 0.03     # 100 slider units → 3.0 stops
+
+    def _on_brightness_changed(self, value: int):
+        if self._restoring:
+            return
+        self._push_undo()
+        self.lbl_brightness.setText(f"{value:+d}" if value else "0")
+        self.player.surface.set_color_adjust(
+            brightness=value * self._BRIGHTNESS_SCALE,
+            exposure=self.sld_exposure.value() * self._EXPOSURE_SCALE,
+        )
+
+    def _on_exposure_changed(self, value: int):
+        if self._restoring:
+            return
+        self._push_undo()
+        self.lbl_exposure.setText(f"{value:+d}" if value else "0")
+        self.player.surface.set_color_adjust(
+            brightness=self.sld_brightness.value() * self._BRIGHTNESS_SCALE,
+            exposure=value * self._EXPOSURE_SCALE,
+        )
+
+    def _reset_color(self):
+        self._push_undo()
+        # Block signals so we don't push two undo entries — this is
+        # conceptually one "reset color" action.
+        self.sld_brightness.blockSignals(True)
+        self.sld_exposure.blockSignals(True)
+        self.sld_brightness.setValue(0)
+        self.sld_exposure.setValue(0)
+        self.sld_brightness.blockSignals(False)
+        self.sld_exposure.blockSignals(False)
+        self.lbl_brightness.setText("0")
+        self.lbl_exposure.setText("0")
+        self.player.surface.set_color_adjust(brightness=0.0, exposure=0.0)
+
     # ── Export ────────────────────────────────────────────────
 
     def _export(self):
@@ -895,6 +1230,10 @@ class MainWindow(QMainWindow):
         crop_h -= crop_h % 2
 
         if crop_w < 2 or crop_h < 2:
+            if self._batch_queue is not None:
+                # Batch mode: record failure, skip this clip, continue.
+                self._on_export_done(False)
+                return
             QMessageBox.warning(self, "Invalid Crop",
                                 "Crop width and height must be at least 2.")
             return
@@ -908,13 +1247,18 @@ class MainWindow(QMainWindow):
         speed = self.sld_speed.value() / 100.0
         stretch_h = self.spn_stretch_h.value() / 100.0
         stretch_v = self.spn_stretch_v.value() / 100.0
+        brightness = self.sld_brightness.value() * self._BRIGHTNESS_SCALE
+        exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
 
         suffix = self._settings.get("output_suffix", "_edited")
         self._last_output = get_output_path(self._video_path, suffix)
         if self._settings["output_dir"]:
             self._last_output = str(Path(self._settings["output_dir"]) / Path(self._last_output).name)
 
-        if Path(self._last_output).exists():
+        if Path(self._last_output).exists() and self._batch_queue is None:
+            # Batch exports auto-overwrite — the whole point is "walk away
+            # and let it finish", and stopping for a dialog on every clip
+            # would ruin that.
             reply = QMessageBox.question(self, "Overwrite File?",
                 f"Output file already exists:\n{Path(self._last_output).name}\n\nOverwrite?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -926,6 +1270,9 @@ class MainWindow(QMainWindow):
         trim_end_ms = int(trim_end * 1000)
 
         if (trim_end - trim_start) <= 0:
+            if self._batch_queue is not None:
+                self._on_export_done(False)
+                return
             QMessageBox.warning(self, "Invalid Trim",
                                 "Trim duration must be greater than zero.")
             return
@@ -933,6 +1280,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.btn_export.setEnabled(False)
+
+        # Source fps — needed for fps normalization in the automation
+        # filter_complex so slow/fast segments come out at a consistent
+        # rate.
+        current_item = self._queue[self._queue_index] if 0 <= self._queue_index < len(self._queue) else None
+        source_fps = current_item.fps if current_item else 0.0
 
         if keyframes:
             # Automated export: pre-render audio + segmented video
@@ -952,6 +1305,9 @@ class MainWindow(QMainWindow):
                 stretch_h=stretch_h,
                 stretch_v=stretch_v,
                 audio_mode=self._settings.get("audio_mode", "copy"),
+                source_fps=source_fps,
+                brightness=brightness,
+                exposure=exposure,
             ))
         else:
             # Simple export: single speed
@@ -969,6 +1325,8 @@ class MainWindow(QMainWindow):
                 stretch_h=stretch_h,
                 stretch_v=stretch_v,
                 audio_mode=self._settings.get("audio_mode", "copy"),
+                brightness=brightness,
+                exposure=exposure,
             )
             duration = (trim_end - trim_start) / speed
             self._worker = ExportWorker(cmd=cmd, duration=duration)
@@ -979,12 +1337,31 @@ class MainWindow(QMainWindow):
 
     def _on_export_done(self, success: bool):
         self.progress_bar.setVisible(False)
-        self.btn_export.setEnabled(True)
         error_msg = ""
         if self._worker is not None:
             error_msg = self._worker._error_msg
             self._worker.wait()
             self._worker = None
+
+        # Batch path: record the result, archive (silently), and advance
+        # to the next clip without any popup dialogs. The whole point of
+        # batch export is "walk away" — interrupting with a dialog for
+        # each clip would defeat the purpose.
+        if self._batch_queue is not None:
+            clip_name = Path(self._video_path).name if self._video_path else "(unknown)"
+            self._batch_results.append((clip_name, success))
+            if success:
+                self._archive_original_clip()
+            self._batch_index += 1
+            # Schedule the next clip on the next event loop tick so Qt
+            # finishes cleaning up the finished worker before we start
+            # the next one.
+            QTimer.singleShot(50, self._export_next_in_batch)
+            return
+
+        # Single-clip path: original behavior.
+        self.btn_export.setEnabled(True)
+        self.btn_export_all.setEnabled(True)
         if success:
             archive_status = self._archive_original_clip()
             QMessageBox.information(self, "Export Complete",
@@ -994,6 +1371,119 @@ class MainWindow(QMainWindow):
         else:
             msg = error_msg or "FFmpeg returned an error. Check the console for details."
             QMessageBox.warning(self, "Export Failed", msg)
+
+    # ── Batch export ──────────────────────────────────────────
+
+    def _is_edited(self, item: VideoItem) -> bool:
+        """A clip counts as 'edited' — and therefore ships in a batch
+        export — if any of its editable fields differs from the default
+        loaded state. Unedited clips (just dropped in, untouched) are
+        skipped so a batch doesn't pointlessly re-encode them.
+        """
+        if item.duration_ms == 0 or not item.probed:
+            return False  # never loaded, no way to know
+        if item.trim_start_ms > 0:
+            return True
+        if 0 < item.trim_end_ms < item.duration_ms:
+            return True
+        if item.speed != 1.0:
+            return True
+        if item.stretch_h != 1.0 or item.stretch_v != 1.0:
+            return True
+        if abs(item.brightness) > 1e-4 or abs(item.exposure) > 1e-4:
+            return True
+        if item.speed_keyframes:
+            return True
+        # Crop check — same "full frame after even-rounding" logic we
+        # use in _export so the two definitions stay in sync.
+        even_w = item.video_w - item.video_w % 2
+        even_h = item.video_h - item.video_h % 2
+        if item.crop_x != 0 or item.crop_y != 0:
+            return True
+        if 0 < item.crop_w < even_w or 0 < item.crop_h < even_h:
+            return True
+        return False
+
+    def _start_batch_export(self):
+        if self._worker is not None or self._batch_queue is not None:
+            return  # already exporting something
+
+        # Flush current UI state into the active VideoItem so its edit
+        # state is accurate before we scan.
+        if 0 <= self._queue_index < len(self._queue):
+            self._save_current_state()
+
+        edited = [i for i, item in enumerate(self._queue) if self._is_edited(item)]
+        if not edited:
+            QMessageBox.information(
+                self, "Nothing to Export",
+                "No clips in the queue have been edited. Trim, crop, or "
+                "change the speed of a clip first, then try Export All.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Export All",
+            f"Export {len(edited)} of {len(self._queue)} clip(s)?\n\n"
+            "Unedited clips will be skipped. The editor will cycle through "
+            "each edited clip and export it. You can walk away.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._batch_queue = edited
+        self._batch_index = 0
+        self._batch_results = []
+        self._batch_return_to = self._queue_index
+        self.btn_export.setEnabled(False)
+        self.btn_export_all.setEnabled(False)
+        self._export_next_in_batch()
+
+    def _export_next_in_batch(self):
+        if self._batch_queue is None:
+            return
+
+        if self._batch_index >= len(self._batch_queue):
+            # Done — show summary and clean up
+            results = self._batch_results
+            self._batch_queue = None
+            self._batch_results = []
+            self.btn_export.setEnabled(True)
+            self.btn_export_all.setEnabled(True)
+            self.progress_bar.setFormat("%p%")  # reset label
+            self.progress_bar.setVisible(False)
+
+            # Return to the clip the user was viewing before the batch
+            if 0 <= self._batch_return_to < len(self._queue):
+                self._navigate_to(self._batch_return_to)
+
+            ok_count = sum(1 for _, ok in results if ok)
+            fail_count = len(results) - ok_count
+            if fail_count == 0:
+                QMessageBox.information(
+                    self, "Batch Export Complete",
+                    f"Exported {ok_count} clip(s) successfully.",
+                )
+            else:
+                failed = "\n".join(f"  {name}" for name, ok in results if not ok)
+                QMessageBox.warning(
+                    self, "Batch Export Finished With Errors",
+                    f"Succeeded: {ok_count}\nFailed: {fail_count}\n\n"
+                    f"Failed clips:\n{failed}\n\n"
+                    "See config/export_error.log for ffmpeg details.",
+                )
+            return
+
+        # Navigate to the next clip, then kick off its export. The UI's
+        # progress bar label advertises the batch position.
+        queue_idx = self._batch_queue[self._batch_index]
+        self._navigate_to(queue_idx)
+        total = len(self._batch_queue)
+        current = self._batch_index + 1
+        clip_name = Path(self._queue[queue_idx].path).name
+        self.progress_bar.setFormat(f"[{current}/{total}] {clip_name} — %p%")
+        self._export()
 
     def _archive_original_clip(self) -> str:
         """Move the just-exported source clip into the archive folder.

@@ -3,6 +3,7 @@ import os
 import ctypes
 import logging
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QIcon
 
 os.environ["QT_LOGGING_RULES"] = "qt.multimedia.*=false"
 
@@ -30,6 +31,17 @@ def main():
     if _is_already_running():
         sys.exit(0)
 
+    # Register an explicit AppUserModelID so Windows treats us as our own
+    # app (not as "Python"). Without this, the custom icon set via
+    # app.setWindowIcon() is ignored in the taskbar — Windows groups the
+    # window under the generic Python interpreter icon instead.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "trust.VideoEditor.1"
+        )
+    except (AttributeError, OSError):
+        pass
+
     # Log to file so errors are visible even under pythonw (no console)
     from src.core.paths import get_config_dir
     logging.basicConfig(
@@ -40,6 +52,15 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Custom icon for taskbar / title bar / Alt-Tab. The file is generated
+    # by tools/generate_icon.py. Setting it on the QApplication covers all
+    # windows the app creates (MainWindow, dialogs, message boxes).
+    from src.core.paths import get_base_dir
+    icon_path = get_base_dir() / "assets" / "icon.ico"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+
     window = MainWindow()
     window.show()
     rc = app.exec()
