@@ -195,13 +195,23 @@ class SettingsDialog(QDialog):
         self.chk_on_top.setChecked(self.settings.get("stay_on_top", False))
         wg.addWidget(self.chk_on_top)
 
-        self.chk_normalize = QCheckBox("Normalize audio on export (EBU R128, -14 LUFS)")
+        norm_row = QHBoxLayout()
+        self.chk_normalize = QCheckBox("Normalize audio on export")
         self.chk_normalize.setChecked(self.settings.get("normalize_audio", False))
         self.chk_normalize.setToolTip(
             "Applies loudness normalization to all exports globally. "
             "Can also be toggled per-clip in the Adjustments panel."
         )
-        wg.addWidget(self.chk_normalize)
+        norm_row.addWidget(self.chk_normalize)
+        self.spn_norm_lufs = QDoubleSpinBox()
+        self.spn_norm_lufs.setRange(-50.0, 0.0)
+        self.spn_norm_lufs.setValue(self.settings.get("normalize_lufs", -14.0))
+        self.spn_norm_lufs.setSingleStep(1.0)
+        self.spn_norm_lufs.setDecimals(1)
+        self.spn_norm_lufs.setSuffix(" LUFS")
+        self.spn_norm_lufs.setFixedWidth(100)
+        norm_row.addWidget(self.spn_norm_lufs)
+        wg.addLayout(norm_row)
 
         layout.addWidget(workflow_group)
 
@@ -270,6 +280,7 @@ class SettingsDialog(QDialog):
             "theme": self.cmb_theme.currentText(),
             "stay_on_top": self.chk_on_top.isChecked(),
             "normalize_audio": self.chk_normalize.isChecked(),
+            "normalize_lufs": self.spn_norm_lufs.value(),
             "ui_scale": self.sld_scale.value(),
             "keybinds": self.keybind_editor.get_bindings(),
         }

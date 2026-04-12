@@ -129,6 +129,12 @@ class MainWindow(QMainWindow):
         if geo_str:
             try:
                 self.restoreGeometry(QByteArray(base64.b64decode(geo_str)))
+                # Ensure window is on a visible screen (handles monitor disconnect)
+                center = self.frameGeometry().center()
+                if not any(s.geometry().contains(center) for s in QApplication.screens()):
+                    primary = QApplication.primaryScreen()
+                    if primary:
+                        self.move(primary.availableGeometry().topLeft())
             except Exception:
                 pass
 
@@ -376,15 +382,27 @@ class MainWindow(QMainWindow):
         adj_group = QGroupBox("Adjustments")
         ag = QVBoxLayout(adj_group)
 
+        norm_row = QHBoxLayout()
         self.btn_normalize = QPushButton("Normalize Audio")
         self.btn_normalize.setCheckable(True)
         self.btn_normalize.setEnabled(False)
-        self.btn_normalize.setToolTip(
-            "EBU R128 loudness normalization (-14 LUFS). "
-            "Analyzes and normalizes audio on export."
-        )
+        self.btn_normalize.setToolTip("EBU R128 loudness normalization on export")
         self.btn_normalize.toggled.connect(self._on_normalize_toggled)
-        ag.addWidget(self.btn_normalize)
+        norm_row.addWidget(self.btn_normalize)
+
+        self.spn_lufs = QDoubleSpinBox()
+        self.spn_lufs.setRange(-50.0, 0.0)
+        self.spn_lufs.setValue(self._settings.get("normalize_lufs", -14.0))
+        self.spn_lufs.setSingleStep(1.0)
+        self.spn_lufs.setDecimals(1)
+        self.spn_lufs.setSuffix(" LUFS")
+        self.spn_lufs.setFixedWidth(100)
+        self.spn_lufs.setToolTip(
+            "Target loudness: -14 = YouTube/Spotify, -16 = Apple, -23 = broadcast"
+        )
+        self.spn_lufs.valueChanged.connect(self._on_lufs_changed)
+        norm_row.addWidget(self.spn_lufs)
+        ag.addLayout(norm_row)
 
         self.btn_toggle_adj = QPushButton("Brightness / Exposure \u25B6")
         self.btn_toggle_adj.setCheckable(True)
@@ -977,6 +995,7 @@ class MainWindow(QMainWindow):
             "stay_on_top": False,
             "preview_volume": 100,
             "normalize_audio": False,
+            "normalize_lufs": -14.0,
             "ui_scale": 90,
             "keybinds": {},
         }
@@ -1005,9 +1024,12 @@ class MainWindow(QMainWindow):
         return defaults
 
     def _save_settings(self):
-        tmp = self._settings_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(self._settings, indent=2))
-        tmp.replace(self._settings_path)
+        try:
+            tmp = self._settings_path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(self._settings, indent=2))
+            tmp.replace(self._settings_path)
+        except OSError:
+            pass  # read-only dir, full disk, locked file — silent, non-fatal
 
     def _on_preview_volume_changed(self, value: int):
         """Persist preview volume when the user releases the slider.
@@ -1033,6 +1055,7 @@ class MainWindow(QMainWindow):
             # Reload keybind manager from updated settings
             self._keybind_manager = KeybindManager(self._settings.get("keybinds"))
             self._sync_menu_shortcuts()
+            self.spn_lufs.setValue(self._settings.get("normalize_lufs", -14.0))
             new_theme = self._settings.get("theme", DEFAULT_THEME)
             new_scale = self._settings.get("ui_scale", 90) / 100.0
             if new_theme != prev_theme or new_scale != prev_scale:
@@ -1485,6 +1508,7 @@ class MainWindow(QMainWindow):
     def _on_brightness_changed(self, value: int):
         if self._restoring:
             return
+        self.player.surface._stepping = False  # discard baked preview frame
         self._push_undo()
         self.lbl_brightness.setText(f"{value:+d}" if value else "0")
         self.player.surface.set_color_adjust(
@@ -1495,6 +1519,7 @@ class MainWindow(QMainWindow):
     def _on_exposure_changed(self, value: int):
         if self._restoring:
             return
+        self.player.surface._stepping = False  # discard baked preview frame
         self._push_undo()
         self.lbl_exposure.setText(f"{value:+d}" if value else "0")
         self.player.surface.set_color_adjust(
@@ -1582,6 +1607,12 @@ class MainWindow(QMainWindow):
         # runs next time it's enabled and exported.
         if not checked:
             item.normalize_data = None
+
+    def _on_lufs_changed(self, _value: float):
+        """LUFS target changed — invalidate cached analysis for current clip."""
+        if not (0 <= self._queue_index < len(self._queue)):
+            return
+        self._queue[self._queue_index].normalize_data = None
 
     def _sync_normalize_button(self):
         if 0 <= self._queue_index < len(self._queue):
@@ -1747,6 +1778,7 @@ class MainWindow(QMainWindow):
         # but it's a prerequisite for the export command. The cached
         # result is reused on re-exports of the same clip.
         normalize_data = None
+        target_lufs = self.spn_lufs.value()
         should_normalize = (
             (current_item and current_item.audio_normalize)
             or self._settings.get("normalize_audio", False)
@@ -1762,6 +1794,7 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
                 result = loudnorm_analyze(
                     self._video_path, trim_start, trim_end - trim_start,
+                    target_lufs=target_lufs,
                 )
                 # Cache result: dict with data on success, {} on failure
                 current_item.normalize_data = result if result else {}
@@ -1790,6 +1823,7 @@ class MainWindow(QMainWindow):
                 brightness=brightness,
                 exposure=exposure,
                 normalize_data=normalize_data,
+                target_lufs=target_lufs,
             ))
         else:
             # Simple export: single speed
@@ -1810,6 +1844,7 @@ class MainWindow(QMainWindow):
                 brightness=brightness,
                 exposure=exposure,
                 normalize_data=normalize_data,
+                target_lufs=target_lufs,
             )
             duration = (trim_end - trim_start) / speed
             self._worker = ExportWorker(cmd=cmd, duration=duration)
@@ -1954,9 +1989,16 @@ class MainWindow(QMainWindow):
         # progress bar label advertises the batch position.
         queue_idx = self._batch_queue[self._batch_index]
         self._navigate_to(queue_idx)
+        # If navigation failed (file deleted, probe error), skip this clip
+        if self._queue_index != queue_idx:
+            clip_name = Path(self._queue[queue_idx].path).name if queue_idx < len(self._queue) else "(removed)"
+            self._batch_results.append((clip_name, False))
+            self._batch_index += 1
+            QTimer.singleShot(50, self._export_next_in_batch)
+            return
         total = len(self._batch_queue)
         current = self._batch_index + 1
-        clip_name = Path(self._queue[queue_idx].path).name
+        clip_name = Path(self._queue[queue_idx].path).name.replace('%', '%%')
         self.progress_bar.setFormat(f"[{current}/{total}] {clip_name} — %p%")
         self._export()
 

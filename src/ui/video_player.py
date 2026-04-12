@@ -479,6 +479,7 @@ class VideoPlayer(QWidget):
     def _on_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            self.surface._stepping = False  # allow live frames to render again
             if self._pitched_active and self._pitched.ready:
                 # Delay by one tick so MainWindow._on_playback_state can
                 # correct the position first (for frame-step → play sync).

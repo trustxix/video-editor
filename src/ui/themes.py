@@ -64,7 +64,8 @@ DEFAULT_THEME = "Dark"
 def _build_qss(c: dict[str, str], scale: float = 1.0) -> str:
     # Scale helper — rounds to int for pixel values, 1 decimal for pt
     def px(base: int) -> int:
-        return max(1, round(base * scale))
+        v = round(base * scale)
+        return max(1, v) if base >= 0 else min(-1, v)
     def pt(base: float) -> str:
         return f"{base * scale:.1f}"
 

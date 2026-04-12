@@ -5,32 +5,38 @@ from pathlib import Path
 from src.core.paths import get_ffmpeg, get_ffprobe
 
 
-def _nvenc_encode_args(codec: str, crf: int) -> list[str]:
-    """Build the NVENC encoder arguments as a flat list.
+_nvenc_available: dict[str, bool] = {}  # cached per-encoder probe results
 
-    Two critical details here that were wrong in the earlier code:
 
-    1. **Rate control mode must be set explicitly.** `-cq N` on its own
-       is interpreted under NVENC's default rate control (VBR with a
-       ~2 Mbps target), which is catastrophically low for 1080p / 120fps
-       content and produces heavy pixelation. The correct invocation is
-       `-rc vbr -b:v 0 -cq N`, which says "VBR mode, no bitrate cap,
-       target constant quality N" — so `-cq` actually controls quality.
+def _has_nvenc(encoder: str) -> bool:
+    """Probe whether an NVENC encoder is available (cached)."""
+    if encoder not in _nvenc_available:
+        try:
+            result = subprocess.run(
+                [get_ffmpeg(), '-hide_banner', '-encoders'],
+                capture_output=True, text=True, startupinfo=_hide_window(),
+                timeout=10,
+            )
+            _nvenc_available[encoder] = encoder in (result.stdout or "")
+        except Exception:
+            _nvenc_available[encoder] = False
+    return _nvenc_available[encoder]
 
-    2. **Preset p1 is the lowest-quality preset**, not the default. NVENC
-       presets go p1 (fastest/worst) → p7 (slowest/best). For final
-       exports we want quality, not maximum speed — the difference
-       between p1 and p5 on your RTX 5070 Ti is negligible in wall
-       time but very visible on screen. p5 is a good "slow" default.
-    """
-    encoder = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
-    return [
-        "-c:v", encoder,
-        "-preset", "p5",      # slow preset — much better quality than p1, still plenty fast on modern NVENC
-        "-rc", "vbr",         # rate control: variable bitrate
-        "-b:v", "0",          # no bitrate cap — let -cq drive the rate
-        "-cq", str(crf),      # quality target (lower = higher quality; 17 ≈ visually lossless)
-    ]
+
+def _encode_args(codec: str, crf: int) -> list[str]:
+    """Build encoder arguments — NVENC if available, software fallback otherwise."""
+    nvenc = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
+    if _has_nvenc(nvenc):
+        return [
+            "-c:v", nvenc,
+            "-preset", "p5",
+            "-rc", "vbr",
+            "-b:v", "0",
+            "-cq", str(crf),
+        ]
+    # Software fallback — works on any machine
+    sw = "libx265" if codec == "h265" else "libx264"
+    return ["-c:v", sw, "-preset", "medium", "-crf", str(crf)]
 
 
 def _build_speed_audio_filter(speed: float) -> str:
@@ -76,12 +82,15 @@ def _build_color_filters(brightness: float, exposure: float) -> list[str]:
 
 
 def loudnorm_analyze(input_path: str, trim_start: float = 0,
-                     trim_duration: float = 0) -> dict | None:
+                     trim_duration: float = 0,
+                     target_lufs: float = -14.0) -> dict | None:
     """First pass of EBU R128 loudness normalization.
 
-    Returns a dict with measured_I, measured_TP, measured_LRA, measured_thresh
-    for the second pass, or None on failure. Target: -14 LUFS (YouTube/Spotify).
+    Returns a dict with measured values for the second pass, or None on
+    failure. `target_lufs` sets the integrated loudness target (e.g. -14
+    for YouTube/Spotify, -23 for broadcast).
     """
+    tp = min(-1.0, target_lufs + 2)  # true peak ceiling, always above target
     cmd = [get_ffmpeg(), '-hide_banner']
     if trim_start > 0:
         cmd += ['-ss', f'{trim_start:.3f}']
@@ -89,7 +98,7 @@ def loudnorm_analyze(input_path: str, trim_start: float = 0,
         cmd += ['-t', f'{trim_duration:.3f}']
     cmd += [
         '-i', input_path,
-        '-af', 'loudnorm=I=-14:TP=-1:LRA=11:print_format=json',
+        '-af', f'loudnorm=I={target_lufs:.1f}:TP={tp:.1f}:LRA=11:print_format=json',
         '-f', 'null', '-',
     ]
     try:
@@ -126,10 +135,11 @@ def loudnorm_analyze(input_path: str, trim_start: float = 0,
         return None
 
 
-def loudnorm_filter(measured: dict) -> str:
+def loudnorm_filter(measured: dict, target_lufs: float = -14.0) -> str:
     """Build the second-pass loudnorm filter string from first-pass measurements."""
+    tp = min(-1.0, target_lufs + 2)
     return (
-        f"loudnorm=I=-14:TP=-1:LRA=11"
+        f"loudnorm=I={target_lufs:.1f}:TP={tp:.1f}:LRA=11"
         f":measured_I={measured['input_i']}"
         f":measured_TP={measured['input_tp']}"
         f":measured_LRA={measured['input_lra']}"
@@ -157,6 +167,7 @@ def build_command(
     brightness: float = 0.0,
     exposure: float = 0.0,
     normalize_data: dict | None = None,
+    target_lufs: float = -14.0,
 ) -> list[str]:
     cmd = [get_ffmpeg(), "-y"]
 
@@ -188,7 +199,7 @@ def build_command(
 
     if vfilters:
         cmd += ["-vf", ",".join(vfilters)]
-        cmd += _nvenc_encode_args(codec, crf)
+        cmd += _encode_args(codec, crf)
     else:
         # No video modifications — stream copy (zero quality loss)
         cmd += ["-c:v", "copy"]
@@ -196,7 +207,7 @@ def build_command(
     # ── Audio ─────────────────────────────────────────────────
     # Precedence: mute > speed change (forces re-encode with pitch shift) > reencode > copy
     # Normalization is chained after any speed filter when present.
-    norm_filter = loudnorm_filter(normalize_data) if normalize_data else ""
+    norm_filter = loudnorm_filter(normalize_data, target_lufs) if normalize_data else ""
     if audio_mode == "mute":
         cmd += ["-an"]
     elif speed != 1.0:
@@ -337,6 +348,7 @@ def export_with_automation(
     brightness: float = 0.0,
     exposure: float = 0.0,
     normalize_data: dict | None = None,
+    target_lufs: float = -14.0,
     progress_callback=None,
     process_callback=None,
 ) -> bool:
@@ -447,7 +459,7 @@ def export_with_automation(
             "-filter_complex", filter_complex,
             "-map", final_map,
         ]
-        cmd += _nvenc_encode_args(codec, crf)
+        cmd += _encode_args(codec, crf)
         cmd += ["-an", video_out]
 
         ok = run_export(
@@ -468,11 +480,11 @@ def export_with_automation(
             # normalization — speed automation changes the loudness.
             wav_norm = None
             if normalize_data:
-                wav_norm = loudnorm_analyze(audio_wav)
+                wav_norm = loudnorm_analyze(audio_wav, target_lufs=target_lufs)
             cmd = [ffmpeg, "-y", "-i", video_out, "-i", audio_wav,
                    "-c:v", "copy"]
             if wav_norm:
-                cmd += ["-af", loudnorm_filter(wav_norm)]
+                cmd += ["-af", loudnorm_filter(wav_norm, target_lufs)]
             cmd += ["-c:a", "aac", "-b:a", "320k",
                     "-map", "0:v:0", "-map", "1:a:0", output_path]
             proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,

@@ -293,6 +293,8 @@ class AutomationLane(QWidget):
                 self.update()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        self._dragging_idx = -1
+        self._drag_lock_speed = None
         if event.button() != Qt.MouseButton.LeftButton:
             return
         x, y = event.pos().x(), event.pos().y()
