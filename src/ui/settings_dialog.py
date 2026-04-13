@@ -7,6 +7,7 @@ from PyQt6.QtCore import Qt
 from src.ui.widgets import ClickSlider
 
 from src.core.presets import ASPECT_PRESETS
+from src.core.auto_presets import get_quality_presets as _get_auto_presets
 from src.ui.themes import THEMES, DEFAULT_THEME
 from src.ui.keybind_editor import KeybindEditor
 
@@ -16,6 +17,9 @@ QUALITY_PRESETS = {
     "Medium (CRF 23)": 23,
     "Low (CRF 28)": 28,
 }
+
+# Auto-optimized presets from FFmpeg AutoResearch (empty if optimizer hasn't run)
+AUTO_PRESETS: dict[str, dict] = _get_auto_presets()
 
 AUDIO_MODES = {
     "Copy Original": "copy",
@@ -72,12 +76,22 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel("Quality:"))
         self.cmb_quality = QComboBox()
+        # Built-in presets
         self.cmb_quality.addItems(QUALITY_PRESETS.keys())
+        # Auto-optimized presets (from FFmpeg AutoResearch, if available)
+        if AUTO_PRESETS:
+            self.cmb_quality.insertSeparator(self.cmb_quality.count())
+            self.cmb_quality.addItems(AUTO_PRESETS.keys())
         current_crf = self.settings.get("crf", 17)
-        for name, crf in QUALITY_PRESETS.items():
-            if crf == current_crf:
-                self.cmb_quality.setCurrentText(name)
-                break
+        current_auto = self.settings.get("auto_preset_name", "")
+        if current_auto and current_auto in AUTO_PRESETS:
+            self.cmb_quality.setCurrentText(current_auto)
+        else:
+            for name, crf in QUALITY_PRESETS.items():
+                if crf == current_crf:
+                    self.cmb_quality.setCurrentText(name)
+                    break
+        self.cmb_quality.currentTextChanged.connect(self._on_quality_changed)
         row.addWidget(self.cmb_quality, stretch=1)
         vg.addLayout(row)
 
@@ -248,6 +262,18 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return tab
 
+    def _on_quality_changed(self, text: str):
+        """When an auto-preset is selected, override the codec dropdown to match."""
+        if text in AUTO_PRESETS:
+            preset = AUTO_PRESETS[text]
+            codec = preset.get("codec", "h264")
+            self.cmb_codec.setCurrentText("H.264" if codec == "h264" else "H.265")
+            self.cmb_codec.setEnabled(False)
+            self.cmb_codec.setToolTip("Codec set by auto-optimized preset")
+        else:
+            self.cmb_codec.setEnabled(True)
+            self.cmb_codec.setToolTip("")
+
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Choose Output Folder")
         if folder:
@@ -260,7 +286,13 @@ class SettingsDialog(QDialog):
 
     def get_settings(self) -> dict:
         codec = "h264" if self.cmb_codec.currentText() == "H.264" else "h265"
-        crf = QUALITY_PRESETS[self.cmb_quality.currentText()]
+        quality_name = self.cmb_quality.currentText()
+        auto_preset = AUTO_PRESETS.get(quality_name)
+        if auto_preset:
+            crf = auto_preset.get("crf", 23)
+            codec = auto_preset.get("codec", codec)
+        else:
+            crf = QUALITY_PRESETS.get(quality_name, 17)
         audio_mode = AUDIO_MODES[self.cmb_audio.currentText()]
         output_dir = self.txt_output.text().strip()
         suffix = self.txt_suffix.text().strip() or "_edited"
@@ -283,4 +315,6 @@ class SettingsDialog(QDialog):
             "normalize_lufs": self.spn_norm_lufs.value(),
             "ui_scale": self.sld_scale.value(),
             "keybinds": self.keybind_editor.get_bindings(),
+            "auto_preset_name": quality_name if auto_preset else "",
+            "auto_preset": auto_preset,
         }

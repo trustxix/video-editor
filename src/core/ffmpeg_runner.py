@@ -23,8 +23,12 @@ def _has_nvenc(encoder: str) -> bool:
     return _nvenc_available[encoder]
 
 
-def _encode_args(codec: str, crf: int) -> list[str]:
-    """Build encoder arguments — NVENC if available, software fallback otherwise."""
+def _encode_args(codec: str, crf: int, auto_preset: dict | None = None) -> list[str]:
+    """Build encoder arguments — auto-preset > NVENC > software fallback."""
+    # Auto-optimized preset from FFmpeg AutoResearch takes priority
+    if auto_preset:
+        from src.core.auto_presets import get_encode_args
+        return get_encode_args(auto_preset)
     nvenc = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
     if _has_nvenc(nvenc):
         return [
@@ -168,6 +172,7 @@ def build_command(
     exposure: float = 0.0,
     normalize_data: dict | None = None,
     target_lufs: float = -14.0,
+    auto_preset: dict | None = None,
 ) -> list[str]:
     cmd = [get_ffmpeg(), "-y"]
 
@@ -199,7 +204,7 @@ def build_command(
 
     if vfilters:
         cmd += ["-vf", ",".join(vfilters)]
-        cmd += _encode_args(codec, crf)
+        cmd += _encode_args(codec, crf, auto_preset)
     else:
         # No video modifications — stream copy (zero quality loss)
         cmd += ["-c:v", "copy"]
@@ -351,6 +356,7 @@ def export_with_automation(
     target_lufs: float = -14.0,
     progress_callback=None,
     process_callback=None,
+    auto_preset: dict | None = None,
 ) -> bool:
     """Export with speed automation (pure GPU pipeline, no interpolation).
 
@@ -459,7 +465,7 @@ def export_with_automation(
             "-filter_complex", filter_complex,
             "-map", final_map,
         ]
-        cmd += _encode_args(codec, crf)
+        cmd += _encode_args(codec, crf, auto_preset)
         cmd += ["-an", video_out]
 
         ok = run_export(

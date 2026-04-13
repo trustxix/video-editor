@@ -1875,6 +1875,7 @@ class MainWindow(QMainWindow):
                 exposure=exposure,
                 normalize_data=normalize_data,
                 target_lufs=target_lufs,
+                auto_preset=self._settings.get("auto_preset"),
             ))
         else:
             # Simple export: single speed
@@ -1896,6 +1897,7 @@ class MainWindow(QMainWindow):
                 exposure=exposure,
                 normalize_data=normalize_data,
                 target_lufs=target_lufs,
+                auto_preset=self._settings.get("auto_preset"),
             )
             duration = (trim_end - trim_start) / speed
             self._worker = ExportWorker(cmd=cmd, duration=duration)
