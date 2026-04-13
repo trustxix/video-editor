@@ -6,8 +6,10 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QPushButton, QFileDialog,
     QProgressBar, QMessageBox, QApplication, QLineEdit, QSlider,
+    QStackedWidget,
 )
 from src.ui.widgets import ClickSlider
+from src.ui.player_mode import PlayerMode
 from PyQt6.QtCore import Qt, QByteArray, QEvent, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer
@@ -175,6 +177,10 @@ class MainWindow(QMainWindow):
         self._menu_actions["undo"] = em.addAction("&Undo", self._undo)
         self._menu_actions["redo"] = em.addAction("&Redo", self._redo)
 
+        vm = menu.addMenu("&View")
+        self._act_mode_editor = vm.addAction("&Editor", lambda: self._switch_mode("editor"))
+        self._act_mode_player = vm.addAction("&Player", lambda: self._switch_mode("player"))
+
         self._sync_menu_shortcuts()
 
     def _build_action_handlers(self):
@@ -196,6 +202,8 @@ class MainWindow(QMainWindow):
             "undo":                self._undo,
             "redo":                self._redo,
             "settings":            self._open_settings,
+            "mode_editor":         lambda: self._switch_mode("editor"),
+            "mode_player":         lambda: self._switch_mode("player"),
             "quit":                self.close,
         }
 
@@ -208,7 +216,22 @@ class MainWindow(QMainWindow):
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._stack = QStackedWidget()
+        outer.addWidget(self._stack)
+
+        # ── Editor page ───────────────────────────────────────
+        editor_page = QWidget()
+        root = QVBoxLayout(editor_page)
+        self._stack.addWidget(editor_page)
+
+        # ── Player page ───────────────────────────────────────
+        self.player_mode = PlayerMode()
+        self.player_mode.send_to_editor.connect(self._on_send_to_editor)
+        self.player_mode.set_volume(self._settings.get("preview_volume", 100))
+        self._stack.addWidget(self.player_mode)
 
         # ── Queue navigation bar ──────────────────────────────
         nav = QHBoxLayout()
@@ -849,6 +872,7 @@ class MainWindow(QMainWindow):
                 self._worker.terminate()
                 self._worker.wait()
         self.player.release()
+        self.player_mode.release()
         super().closeEvent(event)
 
     # ── Unified keybind dispatch ─────────────────────────────
@@ -876,9 +900,13 @@ class MainWindow(QMainWindow):
             focused = QApplication.instance().focusWidget()
             if isinstance(focused, (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
                 return super().eventFilter(obj, event)
-            # Let arrow keys through to selection-aware widgets that have
-            # an active selection — they handle their own keyPressEvent.
-            if isinstance(focused, (AutomationLane, RangeSlider)):
+            # Let arrow/delete keys through to selection-aware widgets that
+            # have an active selection. Space always stays with the keybind
+            # system so play/pause works regardless of what's selected.
+            key = event.key()
+            _PASSTHROUGH_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                                 Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Delete)
+            if key in _PASSTHROUGH_KEYS and isinstance(focused, (AutomationLane, RangeSlider)):
                 if hasattr(focused, '_selected_idx') and focused._selected_idx >= 0:
                     return super().eventFilter(obj, event)
                 if hasattr(focused, '_selected') and focused._selected is not None:
@@ -980,6 +1008,29 @@ class MainWindow(QMainWindow):
             self.player.player.setPosition(self._stepped_pos)
             self._stepped_pos = None
             self.player.surface._stepping = False
+
+    # ── Mode switching ─────────────────────────────────────────
+
+    def _switch_mode(self, mode: str):
+        """Switch between 'editor' and 'player' modes."""
+        if mode == "player":
+            # Pause the editor's player before switching
+            if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.player.pause()
+            self._stack.setCurrentIndex(1)
+        else:
+            # Pause the player mode's player before switching
+            if self.player_mode.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player_mode.player.pause()
+            self._stack.setCurrentIndex(0)
+
+    def _on_send_to_editor(self, paths: list[str]):
+        """Receive files from the player mode and load them in the editor."""
+        # Pause the player mode
+        if self.player_mode.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player_mode.player.pause()
+        self._switch_mode("editor")
+        self._add_to_queue(paths)
 
     # ── Settings ──────────────────────────────────────────────
 

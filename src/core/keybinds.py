@@ -103,6 +103,8 @@ _def("clear_queue",         "Clear Queue",         "File",     ["Ctrl+Shift+W"])
 _def("undo",                "Undo",                "Edit",     ["Ctrl+Z"])
 _def("redo",                "Redo",                "Edit",     ["Ctrl+Y"])
 _def("settings",            "Settings",            "App",      [])
+_def("mode_editor",         "Switch to Editor",    "App",      ["F5"])
+_def("mode_player",         "Switch to Player",    "App",      ["F6"])
 _def("quit",                "Quit",                "App",      ["Ctrl+Q"])
 
 
