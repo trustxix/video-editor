@@ -14,24 +14,30 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTreeView, QListView,
     QPushButton, QLabel, QStyle, QAbstractItemView, QMenu, QFileDialog,
-    QMessageBox, QApplication,
+    QMessageBox, QApplication, QInputDialog, QComboBox,
 )
 from PyQt6.QtCore import (
     Qt, QUrl, QDir, QSortFilterProxyModel, QModelIndex, pyqtSignal, QTimer,
 )
 from PyQt6.QtGui import (
-    QFileSystemModel, QKeySequence, QPainter, QAction,
+    QFileSystemModel, QPainter, QColor, QFont,
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 
 from src.ui.widgets import ClickSlider
+from src.core.ffmpeg_runner import probe_video, _probe_cache
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
 
 
 class _PlayerSurface(QWidget):
-    """Minimal video surface — just renders QVideoSink frames. No crop,
-    no stretch, no color overlay, no pan. Clean playback."""
+    """Video surface with OSD overlay. Renders QVideoSink frames with
+    letterbox scaling, plus a fade-out on-screen display for status text."""
+
+    clicked = pyqtSignal()        # single click (after double-click timeout)
+    double_clicked = pyqtSignal()
+    mouse_moved = pyqtSignal()    # any mouse movement (for fullscreen auto-hide)
+    wheel_scrolled = pyqtSignal(int)  # delta in 120ths (positive = up)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,6 +46,52 @@ class _PlayerSurface(QWidget):
         self._image = None
         self.setMinimumSize(320, 180)
         self.setStyleSheet("background: black;")
+
+        self.setMouseTracking(True)
+
+        # Aspect ratio override: None=original, or (w, h) ratio
+        self._aspect_override: tuple[int, int] | None = None
+
+        # OSD state
+        self._osd_text = ""
+        self._osd_opacity = 0.0
+        self._osd_duration = 1500
+        self._osd_timer = QTimer(self)
+        self._osd_timer.setInterval(50)
+        self._osd_timer.timeout.connect(self._osd_tick)
+
+        # Click detection (single vs double)
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(QApplication.doubleClickInterval())
+        self._click_timer.timeout.connect(self.clicked.emit)
+
+    def show_osd(self, text: str, duration_ms: int | None = None):
+        """Show OSD text that fades out after duration."""
+        self._osd_text = text
+        self._osd_opacity = 1.0
+        dur = duration_ms if duration_ms is not None else self._osd_duration
+        # Calculate fade step: fade over the last 400ms of the duration
+        self._osd_fade_start = max(0, dur - 400)
+        self._osd_elapsed = 0
+        self._osd_total = dur
+        self._osd_timer.start()
+        self.update()
+
+    def set_osd_duration(self, ms: int):
+        self._osd_duration = ms
+
+    def _osd_tick(self):
+        self._osd_elapsed += 50
+        if self._osd_elapsed >= self._osd_total:
+            self._osd_timer.stop()
+            self._osd_text = ""
+            self._osd_opacity = 0.0
+        elif self._osd_elapsed >= self._osd_fade_start:
+            # Fade out over the last 400ms
+            remaining = self._osd_total - self._osd_elapsed
+            self._osd_opacity = max(0.0, remaining / 400.0)
+        self.update()
 
     def _on_frame(self, frame: QVideoFrame):
         self._image = frame.toImage()
@@ -50,19 +102,128 @@ class _PlayerSurface(QWidget):
         p.fillRect(self.rect(), Qt.GlobalColor.black)
         if self._image and not self._image.isNull():
             iw, ih = self._image.width(), self._image.height()
-            scale = min(self.width() / iw, self.height() / ih)
-            w, h = int(iw * scale), int(ih * scale)
+            if self._aspect_override:
+                # Force aspect ratio: compute virtual dimensions
+                aw, ah = self._aspect_override
+                # Scale image to fill the override aspect
+                target_ratio = aw / ah
+                image_ratio = iw / ih
+                if image_ratio > target_ratio:
+                    # Wider than target — crop sides (visually: letterbox top/bottom)
+                    vh = ih
+                    vw = int(ih * target_ratio)
+                else:
+                    vw = iw
+                    vh = int(iw / target_ratio)
+                scale = min(self.width() / vw, self.height() / vh)
+                w, h = int(vw * scale), int(vh * scale)
+            else:
+                scale = min(self.width() / iw, self.height() / ih)
+                w, h = int(iw * scale), int(ih * scale)
             x = (self.width() - w) // 2
             y = (self.height() - h) // 2
-            p.drawImage(x, y, self._image.scaled(
-                w, h, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            ))
+            if self._aspect_override:
+                # Stretch to fill the computed rect (ignores original aspect)
+                p.drawImage(x, y, self._image.scaled(
+                    w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+            else:
+                p.drawImage(x, y, self._image.scaled(
+                    w, h, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+
+        # OSD overlay
+        if self._osd_text and self._osd_opacity > 0:
+            p.save()
+            p.setOpacity(self._osd_opacity)
+            font = QFont("sans-serif", 16)
+            font.setBold(True)
+            p.setFont(font)
+            fm = p.fontMetrics()
+            text_w = fm.horizontalAdvance(self._osd_text)
+            text_h = fm.height()
+            pad = 10
+            ox, oy = 20, 20
+            p.fillRect(ox, oy, text_w + pad * 2, text_h + pad * 2,
+                        QColor(0, 0, 0, 180))
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(ox + pad, oy + pad + fm.ascent(), self._osd_text)
+            p.restore()
+
         p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Start single-click timer; double-click cancels it
+            self._click_timer.start()
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._click_timer.stop()
+            self.double_clicked.emit()
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.mouse_moved.emit()
+        super().mouseMoveEvent(event)
+
+    def wheelEvent(self, event):
+        self.wheel_scrolled.emit(event.angleDelta().y())
+        event.accept()
 
 
 class _VideoFilter(QSortFilterProxyModel):
     """Proxy that shows only directories and video files in the file list."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._extensions = set(VIDEO_EXTENSIONS)
+        self._search_text = ""
+
+    def set_extensions(self, ext_str: str):
+        """Update extensions from comma-separated string like '.mp4,.mkv'."""
+        self._extensions = {
+            e.strip().lower() for e in ext_str.split(",") if e.strip()
+        }
+        self.invalidateFilter()
+
+    def set_search_text(self, text: str):
+        self._search_text = text.lower()
+        self.invalidateFilter()
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        """Add tooltip with duration/resolution for video files (cache-only, non-blocking)."""
+        if role == Qt.ItemDataRole.ToolTipRole:
+            source_idx = self.mapToSource(index)
+            model = self.sourceModel()
+            if model and not model.isDir(source_idx):
+                path = model.filePath(source_idx)
+                if path:
+                    # Only use cached probe data — never block UI for tooltips
+                    import os as _os
+                    try:
+                        mtime = _os.path.getmtime(path)
+                    except OSError:
+                        return super().data(index, role)
+                    info = _probe_cache.get((path, mtime))
+                    if info:
+                        parts = []
+                        if info["width"] and info["height"]:
+                            parts.append(f"{info['width']}x{info['height']}")
+                        if info["duration"]:
+                            m = int(info["duration"] // 60)
+                            s = info["duration"] - m * 60
+                            parts.append(f"{m}:{s:05.2f}")
+                        if info["video_codec"]:
+                            parts.append(info["video_codec"])
+                        sz = info.get("file_size", 0)
+                        if sz:
+                            parts.append(f"{sz / (1024*1024):.1f} MB")
+                        return " | ".join(parts) if parts else None
+        return super().data(index, role)
 
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:
         model = self.sourceModel()
@@ -70,26 +231,49 @@ class _VideoFilter(QSortFilterProxyModel):
         if model.isDir(idx):
             return True
         name = model.fileName(idx).lower()
-        return any(name.endswith(ext) for ext in VIDEO_EXTENSIONS)
+        if not any(name.endswith(ext) for ext in self._extensions):
+            return False
+        if self._search_text and self._search_text not in name:
+            return False
+        return True
 
 
 class PlayerMode(QWidget):
     """Full video player with directory browser, playlist, file management."""
 
     send_to_editor = pyqtSignal(list)  # list of file paths to load in editor
+    fullscreen_changed = pyqtSignal(bool)  # emitted when fullscreen toggles
+    title_changed = pyqtSignal(str)  # emitted with filename on video load
+    volume_changed = pyqtSignal(int)  # emitted on volume slider release
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_path: str | None = None
         self._playlist: list[str] = []
         self._playlist_index: int = -1
+        self._fullscreen = False
+        self._pre_mute_volume = 100
+        self._current_speed = 1.0
+        self._pre_fs_tree_vis = True
+        self._pre_fs_list_vis = True
+        self._loop_mode = 0  # 0=off, 1=single, 2=playlist
+        self._shuffle = False
+        self._loop_a_ms: int | None = None
+        self._loop_b_ms: int | None = None
+        self._recent_dirs: list[str] = []  # populated from settings
+        # Settings refs (set by main_window after construction)
+        self._settings: dict = {}
         self._setup_ui()
         self._setup_player()
         self._connect_signals()
 
-        # Start in the user's home directory
-        home = str(Path.home())
-        self._navigate_to_dir(home)
+        # Fullscreen auto-hide timers
+        self._fs_controls_timer = QTimer(self)
+        self._fs_controls_timer.setSingleShot(True)
+        self._fs_controls_timer.timeout.connect(self._fs_hide_controls)
+        self._fs_cursor_timer = QTimer(self)
+        self._fs_cursor_timer.setSingleShot(True)
+        self._fs_cursor_timer.timeout.connect(self._fs_hide_cursor)
 
     # ── UI setup ──────────────────────────────────────────────
 
@@ -97,7 +281,7 @@ class PlayerMode(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter = splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # ── Left: directory tree ──────────────────────────────
         self._dir_model = QFileSystemModel()
@@ -120,31 +304,51 @@ class PlayerMode(QWidget):
         cv.setContentsMargins(0, 0, 0, 0)
 
         self.surface = _PlayerSurface()
+        self.surface.setAcceptDrops(True)
+        self.surface.dragEnterEvent = self._surface_drag_enter
+        self.surface.dropEvent = self._surface_drop
         cv.addWidget(self.surface, stretch=1)
 
-        # Controls bar
-        controls = QHBoxLayout()
+        # Controls bar (wrapped in QWidget for fullscreen hide)
+        self._controls_widget = QWidget()
+        controls = QHBoxLayout(self._controls_widget)
+        controls.setContentsMargins(0, 0, 0, 0)
 
         self.btn_play = QPushButton()
         self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.btn_play.setFixedSize(36, 36)
         controls.addWidget(self.btn_play)
 
+        self.lbl_playlist_pos = QLabel("")
+        self.lbl_playlist_pos.setStyleSheet(
+            "font-family: monospace; font-size: 8pt; color: #888; padding: 0 4px;")
+        controls.addWidget(self.lbl_playlist_pos)
+
         self.lbl_time = QLabel("00:00 / 00:00")
         self.lbl_time.setStyleSheet("font-family: monospace;")
         controls.addWidget(self.lbl_time)
 
-        # Seek bar
+        # Speed label
+        self.lbl_speed = QLabel("")
+        self.lbl_speed.setStyleSheet(
+            "font-family: monospace; font-size: 9pt; color: #aaa; padding: 0 4px;")
+        self.lbl_speed.setFixedWidth(40)
+        self.lbl_speed.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        controls.addWidget(self.lbl_speed)
+
+        # Seek bar (with hover timestamp tooltip)
         self.seek_slider = ClickSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 1000)
+        self.seek_slider.setMouseTracking(True)
+        self.seek_slider.installEventFilter(self)
         controls.addWidget(self.seek_slider, stretch=1)
 
         # Volume
-        vol_icon = QLabel()
-        vol_icon.setPixmap(
+        self._vol_icon = QLabel()
+        self._vol_icon.setPixmap(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume).pixmap(16, 16)
         )
-        controls.addWidget(vol_icon)
+        controls.addWidget(self._vol_icon)
         self.vol_slider = ClickSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(100)
@@ -156,10 +360,12 @@ class PlayerMode(QWidget):
         """)
         controls.addWidget(self.vol_slider)
 
-        cv.addLayout(controls)
+        cv.addWidget(self._controls_widget)
 
-        # Nav bar
-        nav = QHBoxLayout()
+        # Nav bar (wrapped in QWidget for fullscreen hide)
+        self._nav_widget = QWidget()
+        nav = QHBoxLayout(self._nav_widget)
+        nav.setContentsMargins(0, 0, 0, 0)
 
         self.btn_prev = QPushButton("\u25C0 Prev")
         self.btn_prev.setFixedWidth(70)
@@ -180,7 +386,16 @@ class PlayerMode(QWidget):
         self.btn_send.setEnabled(False)
         nav.addWidget(self.btn_send)
 
-        cv.addLayout(nav)
+        nav.addSpacing(6)
+        self._audio_track_combo = QComboBox()
+        self._audio_track_combo.setFixedWidth(90)
+        self._audio_track_combo.setVisible(False)
+        self._audio_track_combo.setToolTip("Audio track")
+        self._audio_track_combo.currentIndexChanged.connect(
+            self._on_audio_track_changed)
+        nav.addWidget(self._audio_track_combo)
+
+        cv.addWidget(self._nav_widget)
 
         # File info bar
         self.lbl_info = QLabel("")
@@ -193,6 +408,34 @@ class PlayerMode(QWidget):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
+
+        # Breadcrumb path bar
+        self._breadcrumb = QLabel("")
+        self._breadcrumb.setStyleSheet(
+            "font-size: 8pt; color: #888; padding: 2px 4px;")
+        self._breadcrumb.setWordWrap(True)
+        self._breadcrumb.setMaximumHeight(36)
+        rv.addWidget(self._breadcrumb)
+
+        # Search bar
+        from PyQt6.QtWidgets import QLineEdit as _QLE
+        self._file_search = _QLE()
+        self._file_search.setPlaceholderText("Filter files...")
+        self._file_search.setClearButtonEnabled(True)
+        rv.addWidget(self._file_search)
+
+        # Sort combo
+        sort_row = QHBoxLayout()
+        sort_row.setContentsMargins(4, 0, 4, 0)
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(["Name", "Date", "Size"])
+        self._sort_combo.setFixedHeight(24)
+        sort_row.addWidget(self._sort_combo, stretch=1)
+        self._btn_refresh = QPushButton("\u21bb")
+        self._btn_refresh.setFixedSize(24, 24)
+        self._btn_refresh.setToolTip("Refresh file list")
+        sort_row.addWidget(self._btn_refresh)
+        rv.addLayout(sort_row)
 
         self._file_model = QFileSystemModel()
         self._file_model.setRootPath("")
@@ -236,6 +479,12 @@ class PlayerMode(QWidget):
         self._file_list.doubleClicked.connect(self._on_file_double_clicked)
         self._file_list.customContextMenuRequested.connect(self._on_file_context_menu)
 
+        # Surface click/double-click (configurable behavior)
+        self.surface.clicked.connect(self._on_surface_click)
+        self.surface.double_clicked.connect(self._on_surface_double_click)
+        self.surface.mouse_moved.connect(self._on_surface_mouse_move)
+        self.surface.wheel_scrolled.connect(self._on_surface_wheel)
+
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_prev.clicked.connect(self._go_prev)
         self.btn_next.clicked.connect(self._go_next)
@@ -244,10 +493,16 @@ class PlayerMode(QWidget):
         self.seek_slider.sliderPressed.connect(lambda: setattr(self, '_seeking', True))
         self.seek_slider.sliderReleased.connect(self._on_seek_released)
         self.seek_slider.valueChanged.connect(self._on_seek_changed)
-        self.vol_slider.valueChanged.connect(
-            lambda v: self.audio.setVolume(v / 100.0)
-        )
+        self.vol_slider.valueChanged.connect(self._on_vol_slider_changed)
+        self.vol_slider.sliderReleased.connect(
+            lambda: self.volume_changed.emit(self.vol_slider.value()))
 
+        self._file_search.textChanged.connect(self._file_proxy.set_search_text)
+        self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
+        self._btn_refresh.clicked.connect(self.refresh_file_list)
+
+        self.player.bufferProgressChanged.connect(self._on_buffer_progress)
+        self.player.tracksChanged.connect(self._on_tracks_changed)
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
         self.player.playbackStateChanged.connect(self._on_state_changed)
@@ -262,6 +517,16 @@ class PlayerMode(QWidget):
         self._file_list.setRootIndex(proxy_idx)
         self._rebuild_playlist(path)
 
+        # Update breadcrumb
+        self._breadcrumb.setText(path.replace("/", " > ").replace("\\", " > "))
+
+        # Track recent directories (max 10, most recent first)
+        if path in self._recent_dirs:
+            self._recent_dirs.remove(path)
+        self._recent_dirs.insert(0, path)
+        self._recent_dirs = self._recent_dirs[:10]
+        self._settings["player_recent_dirs"] = list(self._recent_dirs)
+
         # Expand the dir tree to this path
         dir_idx = self._dir_model.index(path)
         self._dir_tree.setCurrentIndex(dir_idx)
@@ -275,11 +540,15 @@ class PlayerMode(QWidget):
     def _rebuild_playlist(self, directory: str):
         """Scan the directory for video files and build the playlist."""
         p = Path(directory)
-        self._playlist = sorted(
-            [str(f) for f in p.iterdir()
-             if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS],
-            key=lambda x: x.lower(),
-        )
+        exts = self._file_proxy._extensions
+        try:
+            self._playlist = sorted(
+                [str(f).replace("\\", "/") for f in p.iterdir()
+                 if f.is_file() and f.suffix.lower() in exts],
+                key=lambda x: x.lower(),
+            )
+        except OSError:
+            self._playlist = []
         count = len(self._playlist)
         self.lbl_file_count.setText(f"{count} video{'s' if count != 1 else ''}")
         # Update playlist index if current file is in this directory
@@ -293,6 +562,81 @@ class PlayerMode(QWidget):
         path = self._dir_model.filePath(index)
         if path:
             self._navigate_to_dir(path)
+
+    def eventFilter(self, obj, event):
+        """Handle seek slider tooltip and wheel events."""
+        if obj is self.seek_slider:
+            if event.type() == event.Type.MouseMove:
+                if self._duration_ms > 0:
+                    from PyQt6.QtWidgets import QToolTip
+                    from PyQt6.QtCore import QPoint
+                    w = self.seek_slider.width()
+                    x = event.position().x()
+                    ratio = max(0.0, min(1.0, x / w))
+                    ms = int(ratio * self._duration_ms)
+                    QToolTip.showText(
+                        self.seek_slider.mapToGlobal(QPoint(int(x), -25)),
+                        self._fmt(ms), self.seek_slider)
+            elif event.type() == event.Type.Wheel and self._duration_ms > 0:
+                # Intercept wheel on seek bar — seek by configured step
+                delta = event.angleDelta().y()
+                steps = delta // 120
+                if steps:
+                    step_s = self._settings.get("player_seek_step", 5)
+                    self.seek_relative(steps * step_s * 1000)
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ── Surface click behavior ────────────────────────────────
+
+    def _on_surface_click(self):
+        action = self._settings.get("player_click", "play_pause")
+        if action == "play_pause":
+            self._toggle_play()
+
+    def _on_surface_double_click(self):
+        action = self._settings.get("player_double_click", "fullscreen")
+        if action == "fullscreen":
+            self.toggle_fullscreen()
+        elif action == "play_pause":
+            self._toggle_play()
+
+    def _on_vol_slider_changed(self, v: int):
+        self.audio.setVolume(v / 100.0)
+        self._update_mute_icon()
+
+    def _on_surface_wheel(self, delta: int):
+        action = self._settings.get("player_wheel", "seek")
+        steps = delta // 120
+        if action == "seek":
+            step_s = self._settings.get("player_seek_step", 5)
+            self.seek_relative(steps * step_s * 1000)
+        elif action == "volume":
+            self.adjust_volume(steps * 5)
+
+    def _on_sort_changed(self, text: str):
+        col = {"Name": 0, "Date": 3, "Size": 1}.get(text, 0)
+        self._file_model.sort(col, Qt.SortOrder.AscendingOrder)
+
+    def _surface_drag_enter(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = Path(url.toLocalFile()).suffix.lower()
+                    if ext in self._file_proxy._extensions:
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def _surface_drop(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                ext = Path(path).suffix.lower()
+                if ext in self._file_proxy._extensions:
+                    self._load_video(path)
+                    return
 
     # ── File list interaction ─────────────────────────────────
 
@@ -325,9 +669,31 @@ class PlayerMode(QWidget):
             )
             menu.addSeparator()
 
+        menu.addAction("Rename...", lambda: self._rename_file(path))
+        menu.addAction("Move to...", lambda: self._move_file(path))
+        menu.addAction("Copy Path", lambda: self._copy_file_path(path))
+        menu.addAction("Open in Default App", lambda: self._open_in_default(path))
         menu.addAction("Show in Explorer", lambda: self._show_in_explorer(path))
         menu.addSeparator()
         menu.addAction("Delete File", lambda: self._delete_file(path))
+
+        # Playlist reorder
+        if path in self._playlist:
+            pidx = self._playlist.index(path)
+            if pidx > 0:
+                menu.addAction("Move Up in Playlist", lambda: self._playlist_move(pidx, -1))
+            if pidx < len(self._playlist) - 1:
+                menu.addAction("Move Down in Playlist", lambda: self._playlist_move(pidx, 1))
+
+        # Batch actions for multi-selection
+        if len(selected) > 1:
+            menu.addSeparator()
+            menu.addAction(
+                f"Delete {len(selected)} files",
+                lambda: self._batch_delete(selected))
+            menu.addAction(
+                f"Move {len(selected)} files to...",
+                lambda: self._batch_move(selected))
 
         menu.exec(self._file_list.viewport().mapToGlobal(pos))
 
@@ -343,7 +709,8 @@ class PlayerMode(QWidget):
     def _show_in_explorer(self, path: str):
         import subprocess
         if Path(path).exists():
-            subprocess.Popen(['explorer', '/select,', path])
+            subprocess.Popen(['explorer', '/select,', path],
+                             creationflags=subprocess.CREATE_NO_WINDOW)
 
     def _delete_file(self, path: str):
         name = Path(path).name
@@ -370,14 +737,253 @@ class PlayerMode(QWidget):
         parent_dir = str(Path(path).parent)
         self._rebuild_playlist(parent_dir)
 
+    def _rename_file(self, path: str):
+        p = Path(path)
+        stem = p.stem
+        new_name, ok = QInputDialog.getText(
+            self, "Rename File", "New name:", text=stem,
+        )
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        # Sanitize: remove path separators and reserved Windows characters
+        for ch in r'\/:*?"<>|':
+            new_name = new_name.replace(ch, "")
+        if not new_name:
+            return
+        # Keep original extension
+        new_path = p.parent / (new_name + p.suffix)
+        if new_path.exists():
+            QMessageBox.warning(self, "Rename Failed",
+                                f"A file named '{new_path.name}' already exists.")
+            return
+        # Release player if this is the current file (Windows file handle)
+        was_playing = self._current_path == path
+        if was_playing:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            QApplication.processEvents()
+        try:
+            p.rename(new_path)
+        except OSError as e:
+            QMessageBox.warning(self, "Rename Failed", str(e))
+            # Reload if we released
+            if was_playing:
+                self._load_video(path)
+            return
+        # Rebuild playlist and reload if it was playing
+        parent_dir = str(p.parent)
+        self._rebuild_playlist(parent_dir)
+        if was_playing:
+            self._load_video(str(new_path).replace("\\", "/"))
+
+    def _move_file(self, path: str):
+        dest = QFileDialog.getExistingDirectory(self, "Move to...")
+        if not dest:
+            return
+        src = Path(path)
+        dst = Path(dest) / src.name
+        if dst.exists():
+            QMessageBox.warning(self, "Move Failed",
+                                f"'{src.name}' already exists in destination.")
+            return
+        was_playing = self._current_path == path
+        if was_playing:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            QApplication.processEvents()
+        try:
+            import shutil
+            shutil.move(str(src), str(dst))
+        except OSError as e:
+            QMessageBox.warning(self, "Move Failed", str(e))
+            if was_playing:
+                self._load_video(path)
+            return
+        parent_dir = str(src.parent)
+        self._rebuild_playlist(parent_dir)
+        if was_playing:
+            self._current_path = None
+            self._update_info()
+
+    def _copy_file_path(self, path: str):
+        QApplication.clipboard().setText(path)
+        self._show_osd("Path copied")
+
+    def _open_in_default(self, path: str):
+        if Path(path).exists():
+            import os as _os
+            _os.startfile(path)
+
+    def _batch_delete(self, paths: list[str]):
+        reply = QMessageBox.question(
+            self, "Delete Files",
+            f"Permanently delete {len(paths)} files?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if self._current_path in paths:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            QApplication.processEvents()
+            self._current_path = None
+            self._update_info()
+        failed = 0
+        for p in paths:
+            try:
+                Path(p).unlink()
+            except OSError:
+                failed += 1
+        parent = str(Path(paths[0]).parent)
+        self._rebuild_playlist(parent)
+        if failed:
+            QMessageBox.warning(self, "Delete",
+                                f"Failed to delete {failed} file(s).")
+
+    def _batch_move(self, paths: list[str]):
+        dest = QFileDialog.getExistingDirectory(self, "Move files to...")
+        if not dest:
+            return
+        if self._current_path in paths:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            QApplication.processEvents()
+            self._current_path = None
+            self._update_info()
+        import shutil
+        failed = 0
+        for p in paths:
+            try:
+                src = Path(p)
+                dst = Path(dest) / src.name
+                if not dst.exists():
+                    shutil.move(str(src), str(dst))
+                else:
+                    failed += 1
+            except OSError:
+                failed += 1
+        parent = str(Path(paths[0]).parent)
+        self._rebuild_playlist(parent)
+        if failed:
+            QMessageBox.warning(self, "Move",
+                                f"Failed to move {failed} file(s).")
+
+    def _playlist_move(self, idx: int, direction: int):
+        """Swap playlist entry at idx with idx+direction."""
+        new_idx = idx + direction
+        if 0 <= new_idx < len(self._playlist):
+            self._playlist[idx], self._playlist[new_idx] = (
+                self._playlist[new_idx], self._playlist[idx])
+            if self._playlist_index == idx:
+                self._playlist_index = new_idx
+            elif self._playlist_index == new_idx:
+                self._playlist_index = idx
+            self._update_nav()
+
+    # ── Fullscreen ────────────────────────────────────────────
+
+    def toggle_fullscreen(self):
+        """Toggle fullscreen mode — hides side panels and controls."""
+        self._fullscreen = not self._fullscreen
+        if self._fullscreen:
+            # Save panel state before hiding (preserves compact mode)
+            self._pre_fs_tree_vis = self._splitter.widget(0).isVisible()
+            self._pre_fs_list_vis = self._splitter.widget(2).isVisible()
+            self._splitter.widget(0).setVisible(False)
+            self._splitter.widget(2).setVisible(False)
+        else:
+            # Restore pre-fullscreen panel state
+            self._splitter.widget(0).setVisible(self._pre_fs_tree_vis)
+            self._splitter.widget(2).setVisible(self._pre_fs_list_vis)
+        if self._fullscreen:
+            # Start with controls hidden; mouse move will show them
+            self._controls_widget.setVisible(False)
+            self._nav_widget.setVisible(False)
+            self.lbl_info.setVisible(False)
+            self._fs_start_autohide()
+        else:
+            # Exiting fullscreen — show everything, stop timers
+            self._fs_controls_timer.stop()
+            self._fs_cursor_timer.stop()
+            self._controls_widget.setVisible(True)
+            self._nav_widget.setVisible(True)
+            self.lbl_info.setVisible(True)
+            self.surface.setCursor(Qt.CursorShape.ArrowCursor)
+        self.fullscreen_changed.emit(self._fullscreen)
+
+    @property
+    def is_fullscreen(self) -> bool:
+        return self._fullscreen
+
+    # ── Fullscreen auto-hide ──────────────────────────────────
+
+    def _fs_start_autohide(self):
+        """Start the fullscreen auto-hide timers."""
+        if self._settings.get("player_controls_autohide", True):
+            self._fs_controls_timer.setInterval(
+                self._settings.get("player_controls_autohide_delay", 3000))
+            self._fs_controls_timer.start()
+        if self._settings.get("player_cursor_hide", True):
+            self._fs_cursor_timer.setInterval(
+                self._settings.get("player_cursor_hide_delay", 3000))
+            self._fs_cursor_timer.start()
+
+    def _fs_hide_controls(self):
+        """Timer fired — hide controls in fullscreen (skip if cursor on controls)."""
+        if not self._fullscreen:
+            return
+        # Don't hide if cursor is over controls or nav bar
+        from PyQt6.QtGui import QCursor
+        gpos = QCursor.pos()
+        for w in (self._controls_widget, self._nav_widget):
+            if w.isVisible() and w.rect().contains(w.mapFromGlobal(gpos)):
+                self._fs_controls_timer.start()  # restart timer
+                return
+        self._controls_widget.setVisible(False)
+        self._nav_widget.setVisible(False)
+        self.lbl_info.setVisible(False)
+
+    def _fs_hide_cursor(self):
+        """Timer fired — hide cursor in fullscreen."""
+        if self._fullscreen:
+            self.surface.setCursor(Qt.CursorShape.BlankCursor)
+
+    def _on_surface_mouse_move(self):
+        """Mouse moved on surface — show controls and restart timers."""
+        if not self._fullscreen:
+            return
+        # Show controls
+        if self._settings.get("player_controls_autohide", True):
+            self._controls_widget.setVisible(True)
+            self._nav_widget.setVisible(True)
+            self.lbl_info.setVisible(True)
+            self._fs_controls_timer.start()
+        # Restore cursor
+        if self._settings.get("player_cursor_hide", True):
+            self.surface.setCursor(Qt.CursorShape.ArrowCursor)
+            self._fs_cursor_timer.start()
+
+    def get_current_directory(self) -> str:
+        """Return the directory currently displayed in the file list."""
+        return self._file_model.rootPath() or ""
+
     # ── Video playback ────────────────────────────────────────
 
     def _load_video(self, path: str):
+        # Save position of previous file
+        self._save_position()
         self.player.stop()
         self.player.setSource(QUrl())
         self._current_path = path
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
+
+        # Reset speed and A-B loop for new file
+        self._current_speed = 1.0
+        self.player.setPlaybackRate(1.0)
+        self._update_speed_label()
+        self._loop_a_ms = self._loop_b_ms = None
 
         # Update playlist index
         if path in self._playlist:
@@ -386,9 +992,19 @@ class PlayerMode(QWidget):
         self.btn_send.setEnabled(True)
         self._update_nav()
         self._update_info()
+        self.title_changed.emit(Path(path).name)
+
+        # Resume saved position (guard against rapid file switching)
+        if self._settings.get("player_remember_positions", False):
+            positions = self._settings.get("player_positions", {})
+            saved_ms = positions.get(path, 0)
+            if saved_ms > 0:
+                QTimer.singleShot(200, lambda p=path, ms=saved_ms: (
+                    self.player.setPosition(ms) if self._current_path == p else None
+                ))
 
         # Navigate dir tree + file list to this file's directory
-        parent = str(Path(path).parent)
+        parent = str(Path(path).parent).replace("\\", "/")
         if self._file_model.rootPath() != parent:
             self._navigate_to_dir(parent)
 
@@ -424,6 +1040,10 @@ class PlayerMode(QWidget):
                 self.seek_slider.setValue(int(pos_ms / self._duration_ms * 1000))
             self.seek_slider.blockSignals(False)
         self.lbl_time.setText(f"{self._fmt(pos_ms)} / {self._fmt(self._duration_ms)}")
+        # A-B loop
+        if (self._loop_a_ms is not None and self._loop_b_ms is not None
+                and pos_ms >= self._loop_b_ms):
+            self.player.setPosition(self._loop_a_ms)
 
     def _on_duration_changed(self, dur_ms: int):
         self._duration_ms = dur_ms
@@ -434,11 +1054,58 @@ class PlayerMode(QWidget):
         else:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
 
+    def _on_buffer_progress(self, progress: float):
+        """Show buffering status in seek bar tooltip (mostly for network streams)."""
+        if progress < 1.0:
+            self.seek_slider.setToolTip(f"Buffering: {int(progress * 100)}%")
+        else:
+            self.seek_slider.setToolTip("")
+
+    def _on_tracks_changed(self):
+        """Update audio track combo when tracks are detected."""
+        audio_tracks = self.player.audioTracks()
+        self._audio_track_combo.blockSignals(True)
+        self._audio_track_combo.clear()
+        if len(audio_tracks) > 1:
+            for i, track in enumerate(audio_tracks):
+                lang = track.stringValue(track.Key.Language) or ""
+                title = track.stringValue(track.Key.Title) or ""
+                label = title or lang or f"Track {i + 1}"
+                self._audio_track_combo.addItem(label)
+            self._audio_track_combo.setVisible(True)
+        else:
+            self._audio_track_combo.setVisible(False)
+        self._audio_track_combo.blockSignals(False)
+
+    def _on_audio_track_changed(self, index: int):
+        if index >= 0:
+            self.player.setActiveAudioTrack(index)
+
     def _on_media_status(self, status):
-        # Auto-advance to next video when current one finishes
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+        if status != QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        if self._loop_mode == 1:
+            # Single loop — replay current
+            self.player.setPosition(0)
+            self.player.play()
+        elif self._loop_mode == 2:
+            # Playlist loop — next, wrap to start
             if self._playlist_index < len(self._playlist) - 1:
                 self._go_next()
+            elif self._playlist:
+                self._playlist_index = 0
+                self._load_video(self._playlist[0])
+        else:
+            # Off — auto-advance if setting enabled, don't wrap
+            if self._settings.get("player_auto_advance", True):
+                if self._shuffle and len(self._playlist) > 1:
+                    import random
+                    choices = [i for i in range(len(self._playlist))
+                               if i != self._playlist_index]
+                    self._playlist_index = random.choice(choices)
+                    self._load_video(self._playlist[self._playlist_index])
+                elif self._playlist_index < len(self._playlist) - 1:
+                    self._go_next()
 
     def _on_seek_changed(self, value: int):
         if self._seeking and self._duration_ms > 0:
@@ -464,26 +1131,309 @@ class PlayerMode(QWidget):
                 self.lbl_filename.setText(
                     f"{self._playlist_index + 1} of {count}  \u2014  {name}"
                 )
+                self.lbl_playlist_pos.setText(
+                    f"{self._playlist_index + 1}/{count}")
             else:
                 self.lbl_filename.setText(name)
+                self.lbl_playlist_pos.setText("")
         else:
             self.lbl_filename.setText("Double-click a video to play")
+            self.lbl_playlist_pos.setText("")
 
     def _update_info(self):
         if not self._current_path:
             self.lbl_info.setText("")
             return
-        p = Path(self._current_path)
-        parts = [p.name]
+        info = probe_video(self._current_path)
+        if info:
+            parts = []
+            if info["width"] and info["height"]:
+                parts.append(f"{info['width']}x{info['height']}")
+            if info["fps"]:
+                parts.append(f"{info['fps']:.0f}fps")
+            if info["video_codec"]:
+                parts.append(info["video_codec"].upper())
+            if info["audio_codec"]:
+                parts.append(info["audio_codec"].upper())
+            if info["duration"]:
+                parts.append(self._fmt(int(info["duration"] * 1000)))
+            size = info.get("file_size", 0)
+            if size:
+                parts.append(f"{size / (1024 * 1024):.1f} MB")
+            self.lbl_info.setText("  \u2502  ".join(parts))
+        else:
+            # Fallback: just filename + size
+            p = Path(self._current_path)
+            parts = [p.name]
+            try:
+                parts.append(f"{p.stat().st_size / (1024 * 1024):.1f} MB")
+            except OSError:
+                pass
+            self.lbl_info.setText("  \u2502  ".join(parts))
+
+    # ── Playback control methods (called by keybind handlers) ───
+
+    def _show_osd(self, text: str):
+        """Show OSD if enabled in settings."""
+        if self._settings.get("player_osd", True):
+            self.surface.show_osd(text)
+
+    def seek_relative(self, delta_ms: int):
+        """Seek forward/backward by delta_ms."""
+        if self._duration_ms <= 0:
+            return
+        pos = max(0, min(self._duration_ms, self.player.position() + delta_ms))
+        self.player.setPosition(pos)
+        self._show_osd(self._fmt(pos))
+
+    def adjust_volume(self, delta: int):
+        """Adjust volume by delta (e.g. +5 or -5)."""
+        new_val = max(0, min(100, self.vol_slider.value() + delta))
+        self.vol_slider.setValue(new_val)
+        self.audio.setVolume(new_val / 100.0)
+        self._update_mute_icon()
+        self._show_osd(f"Volume: {new_val}%")
+        self.volume_changed.emit(new_val)
+
+    def toggle_mute(self):
+        """Toggle mute — store/restore previous volume."""
+        if self.vol_slider.value() > 0:
+            self._pre_mute_volume = self.vol_slider.value()
+            self.vol_slider.setValue(0)
+            self.audio.setVolume(0.0)
+            self._show_osd("Muted")
+        else:
+            self.vol_slider.setValue(self._pre_mute_volume)
+            self.audio.setVolume(self._pre_mute_volume / 100.0)
+            self._show_osd(f"Volume: {self._pre_mute_volume}%")
+        self._update_mute_icon()
+        self.volume_changed.emit(self.vol_slider.value())
+
+    def adjust_speed(self, delta: float):
+        """Adjust playback speed by delta (e.g. +0.25)."""
+        current = self.player.playbackRate()
+        new_rate = max(0.25, min(4.0, round(current + delta, 2)))
+        self.player.setPlaybackRate(new_rate)
+        self._current_speed = new_rate
+        self._update_speed_label()
+        self._show_osd(f"Speed: {new_rate:.2f}x")
+
+    def reset_speed(self):
+        """Reset playback speed to 1.0x."""
+        self.player.setPlaybackRate(1.0)
+        self._current_speed = 1.0
+        self._update_speed_label()
+        self._show_osd("Speed: 1.00x")
+
+    def frame_step(self, direction: int):
+        """Step one frame forward (1) or backward (-1)."""
+        if not self._current_path or self._duration_ms <= 0:
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        # Use probed fps (already cached from _update_info), fallback 30
+        fps = 30.0
+        info = probe_video(self._current_path)
+        if info and info["fps"] > 0:
+            fps = info["fps"]
+        frame_ms = max(1, int(round(1000 / fps)))
+        pos = max(0, min(self._duration_ms,
+                         self.player.position() + direction * frame_ms))
+        self.player.setPosition(pos)
+        self._show_osd(self._fmt(pos))
+
+    def _update_speed_label(self):
+        if self._current_speed == 1.0:
+            self.lbl_speed.setText("")
+        else:
+            self.lbl_speed.setText(f"{self._current_speed:.2f}x")
+
+    def _update_mute_icon(self):
+        if self.vol_slider.value() == 0:
+            self._vol_icon.setPixmap(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MediaVolumeMuted).pixmap(16, 16))
+        else:
+            self._vol_icon.setPixmap(
+                self.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MediaVolume).pixmap(16, 16))
+
+    def jump_to_start(self):
+        """Jump to beginning of file."""
+        self.player.setPosition(0)
+        self._show_osd("Start")
+
+    def jump_to_end(self):
+        """Jump to near-end of file."""
+        if self._duration_ms > 0:
+            self.player.setPosition(max(0, self._duration_ms - 100))
+            self._show_osd("End")
+
+    def goto_timestamp(self):
+        """Open dialog to jump to a specific timestamp."""
+        if self._duration_ms <= 0:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Go to Timestamp",
+            "Enter time (mm:ss, hh:mm:ss, or seconds):",
+        )
+        if not ok or not text.strip():
+            return
+        ms = self._parse_timestamp(text.strip())
+        if ms is not None:
+            ms = max(0, min(self._duration_ms, ms))
+            self.player.setPosition(ms)
+            self._show_osd(self._fmt(ms))
+
+    @staticmethod
+    def _parse_timestamp(text: str) -> int | None:
+        """Parse mm:ss, hh:mm:ss, or raw seconds → milliseconds."""
         try:
-            size_mb = p.stat().st_size / (1024 * 1024)
-            parts.append(f"{size_mb:.1f} MB")
-        except OSError:
+            # Try raw seconds first
+            if ":" not in text:
+                return int(float(text) * 1000)
+            parts = text.split(":")
+            if len(parts) == 2:
+                m, s = int(parts[0]), float(parts[1])
+                return int((m * 60 + s) * 1000)
+            elif len(parts) == 3:
+                h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                return int((h * 3600 + m * 60 + s) * 1000)
+        except (ValueError, IndexError):
             pass
-        self.lbl_info.setText("  \u2502  ".join(parts))
+        return None
+
+    def cycle_loop_mode(self):
+        """Cycle through loop modes: off → single → playlist → off."""
+        self._loop_mode = (self._loop_mode + 1) % 3
+        names = ["Loop: Off", "Loop: Single", "Loop: Playlist"]
+        self._show_osd(names[self._loop_mode])
+
+    def ab_mark(self):
+        """Cycle A-B loop: set A → set B → clear."""
+        if self._loop_a_ms is None:
+            self._loop_a_ms = self.player.position()
+            self._show_osd(f"A: {self._fmt(self._loop_a_ms)}")
+        elif self._loop_b_ms is None:
+            self._loop_b_ms = self.player.position()
+            if self._loop_b_ms <= self._loop_a_ms:
+                # Invalid range — clear
+                self._loop_a_ms = self._loop_b_ms = None
+                self._show_osd("A-B cleared")
+            else:
+                self._show_osd(
+                    f"A-B: {self._fmt(self._loop_a_ms)} → {self._fmt(self._loop_b_ms)}")
+        else:
+            self._loop_a_ms = self._loop_b_ms = None
+            self._show_osd("A-B cleared")
+
+    def toggle_shuffle(self):
+        """Toggle shuffle mode."""
+        self._shuffle = not self._shuffle
+        self._show_osd(f"Shuffle: {'On' if self._shuffle else 'Off'}")
+
+    _ASPECT_CYCLE = [
+        (None, "Original"),
+        ((16, 9), "16:9"),
+        ((4, 3), "4:3"),
+        ((21, 9), "21:9"),
+        ((1, 1), "1:1"),
+    ]
+
+    def cycle_aspect(self):
+        """Cycle through aspect ratio overrides."""
+        current = self.surface._aspect_override
+        # Find current in cycle list, advance to next
+        current_idx = 0
+        for i, (ar, _) in enumerate(self._ASPECT_CYCLE):
+            if ar == current:
+                current_idx = i
+                break
+        idx = (current_idx + 1) % len(self._ASPECT_CYCLE)
+        ar, name = self._ASPECT_CYCLE[idx]
+        self.surface._aspect_override = ar
+        self.surface.update()
+        self._show_osd(f"Aspect: {name}")
+
+    def get_video_size(self) -> tuple[int, int] | None:
+        """Return native video dimensions, or None."""
+        if self.surface._image and not self.surface._image.isNull():
+            return self.surface._image.width(), self.surface._image.height()
+        return None
+
+    def toggle_compact(self):
+        """Compact mode — hide side panels but keep controls (windowed)."""
+        if self._fullscreen:
+            return  # Already in fullscreen, don't mix modes
+        tree_vis = self._splitter.widget(0).isVisible()
+        self._splitter.widget(0).setVisible(not tree_vis)
+        self._splitter.widget(2).setVisible(not tree_vis)
+        self._show_osd("Compact" if tree_vis else "Normal")
+
+    def take_screenshot(self):
+        """Capture current frame as PNG to clipboard and file."""
+        if not self._current_path:
+            return
+        if self.surface._image and not self.surface._image.isNull():
+            QApplication.clipboard().setImage(self.surface._image)
+            # Also save to file next to the video
+            p = Path(self._current_path)
+            pos_s = self.player.position() / 1000.0
+            out = p.parent / f"{p.stem}_screenshot_{pos_s:.1f}s.png"
+            self.surface._image.save(str(out), "PNG")
+            self._show_osd(f"Screenshot saved")
+
+    def copy_path(self):
+        """Copy current file path to clipboard."""
+        if self._current_path:
+            QApplication.clipboard().setText(self._current_path)
+            self._show_osd("Path copied")
+
+    def open_external(self):
+        """Open current file in default system application."""
+        if self._current_path and Path(self._current_path).exists():
+            import os as _os
+            _os.startfile(self._current_path)
+
+    def open_folder_dialog(self):
+        """Open folder picker and navigate to it."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Open Folder",
+            self._file_model.rootPath() or str(Path.home()))
+        if folder:
+            self._navigate_to_dir(folder)
+
+    def get_recent_dirs(self) -> list[str]:
+        """Return recent directories list."""
+        return list(self._recent_dirs)
+
+    def refresh_file_list(self):
+        """Refresh the current directory's file list."""
+        path = self._file_model.rootPath()
+        if path:
+            self._rebuild_playlist(path)
+            self._show_osd("Refreshed")
+
+    def _save_position(self):
+        """Save current playback position for resume."""
+        if (not self._current_path
+                or not self._settings.get("player_remember_positions", False)):
+            return
+        pos = self.player.position()
+        positions = self._settings.setdefault("player_positions", {})
+        if pos > 1000 and self._duration_ms > 0 and pos < self._duration_ms - 1000:
+            positions[self._current_path] = pos
+        else:
+            positions.pop(self._current_path, None)
+        # LRU cap at 100 entries
+        if len(positions) > 100:
+            keys = list(positions.keys())
+            for k in keys[:len(keys) - 100]:
+                del positions[k]
 
     def release(self):
         """Release the player resources — called on app shutdown."""
+        self._save_position()
         self.player.stop()
         self.player.setSource(QUrl())
 
@@ -493,6 +1443,7 @@ class PlayerMode(QWidget):
         self.vol_slider.setValue(max(0, min(100, value)))
         self.vol_slider.blockSignals(False)
         self.audio.setVolume(value / 100.0)
+        self._update_mute_icon()
 
     def navigate_to(self, path: str):
         """Navigate to a specific directory — used by external callers."""

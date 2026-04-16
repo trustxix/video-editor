@@ -1,13 +1,14 @@
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QPushButton, QLineEdit, QFileDialog, QGroupBox, QDialogButtonBox,
-    QDoubleSpinBox, QTabWidget, QWidget,
+    QDoubleSpinBox, QSpinBox, QTabWidget, QWidget,
 )
 from PyQt6.QtCore import Qt
 from src.ui.widgets import ClickSlider
 
 from src.core.presets import ASPECT_PRESETS
 from src.core.auto_presets import get_quality_presets as _get_auto_presets
+from src.core.keybinds import ACTION_DEFS, PLAYER_ACTION_DEFS
 from src.ui.themes import THEMES, DEFAULT_THEME
 from src.ui.keybind_editor import KeybindEditor
 
@@ -42,9 +43,15 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_general_tab(), "General")
+        tabs.addTab(self._build_player_tab(), "Player")
 
-        self.keybind_editor = KeybindEditor(self.settings.get("keybinds"))
-        tabs.addTab(self.keybind_editor, "Shortcuts")
+        self.editor_keybind_editor = KeybindEditor(
+            ACTION_DEFS, self.settings.get("editor_keybinds"))
+        tabs.addTab(self.editor_keybind_editor, "Editor Shortcuts")
+
+        self.player_keybind_editor = KeybindEditor(
+            PLAYER_ACTION_DEFS, self.settings.get("player_keybinds"))
+        tabs.addTab(self.player_keybind_editor, "Player Shortcuts")
 
         layout.addWidget(tabs)
 
@@ -76,24 +83,28 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel("Quality:"))
         self.cmb_quality = QComboBox()
-        # Built-in presets
-        self.cmb_quality.addItems(QUALITY_PRESETS.keys())
-        # Auto-optimized presets (from FFmpeg AutoResearch, if available)
-        if AUTO_PRESETS:
-            self.cmb_quality.insertSeparator(self.cmb_quality.count())
-            self.cmb_quality.addItems(AUTO_PRESETS.keys())
-        current_crf = self.settings.get("crf", 17)
-        current_auto = self.settings.get("auto_preset_name", "")
-        if current_auto and current_auto in AUTO_PRESETS:
-            self.cmb_quality.setCurrentText(current_auto)
-        else:
-            for name, crf in QUALITY_PRESETS.items():
-                if crf == current_crf:
-                    self.cmb_quality.setCurrentText(name)
-                    break
         self.cmb_quality.currentTextChanged.connect(self._on_quality_changed)
         row.addWidget(self.cmb_quality, stretch=1)
         vg.addLayout(row)
+
+        # Experimental presets toggle (only visible when auto-presets exist)
+        if AUTO_PRESETS:
+            self.chk_experimental = QCheckBox(
+                "Show experimental presets (AutoResearch)"
+            )
+            self.chk_experimental.setToolTip(
+                "Reveal auto-optimized presets from FFmpeg parameter sweep.\n"
+                "These are still being refined."
+            )
+            self.chk_experimental.setChecked(
+                self.settings.get("experimental_presets", False)
+            )
+            self.chk_experimental.toggled.connect(self._rebuild_quality_combo)
+            vg.addWidget(self.chk_experimental)
+        else:
+            self.chk_experimental = None
+
+        self._rebuild_quality_combo()
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Audio:"))
@@ -262,6 +273,228 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return tab
 
+    def _build_player_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # ── Click / Mouse Behavior ────────────────────────────
+        mouse_group = QGroupBox("Mouse Behavior")
+        mg = QVBoxLayout(mouse_group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Single click on video:"))
+        self.cmb_player_click = QComboBox()
+        self.cmb_player_click.addItems(["Play/Pause", "Disabled"])
+        current = self.settings.get("player_click", "play_pause")
+        self.cmb_player_click.setCurrentText(
+            "Play/Pause" if current == "play_pause" else "Disabled")
+        row.addWidget(self.cmb_player_click, stretch=1)
+        mg.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Double click on video:"))
+        self.cmb_player_dblclick = QComboBox()
+        self.cmb_player_dblclick.addItems(["Fullscreen", "Play/Pause", "Disabled"])
+        current = self.settings.get("player_double_click", "fullscreen")
+        idx = {"fullscreen": 0, "play_pause": 1, "disabled": 2}.get(current, 0)
+        self.cmb_player_dblclick.setCurrentIndex(idx)
+        row.addWidget(self.cmb_player_dblclick, stretch=1)
+        mg.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Mouse wheel on video:"))
+        self.cmb_player_wheel = QComboBox()
+        self.cmb_player_wheel.addItems(["Seek", "Volume", "Disabled"])
+        current = self.settings.get("player_wheel", "seek")
+        idx = {"seek": 0, "volume": 1, "disabled": 2}.get(current, 0)
+        self.cmb_player_wheel.setCurrentIndex(idx)
+        row.addWidget(self.cmb_player_wheel, stretch=1)
+        mg.addLayout(row)
+
+        layout.addWidget(mouse_group)
+
+        # ── Seeking ───────────────────────────────────────────
+        seek_group = QGroupBox("Seeking")
+        sg = QVBoxLayout(seek_group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Small seek step:"))
+        self.spn_seek_step = QSpinBox()
+        self.spn_seek_step.setRange(1, 60)
+        self.spn_seek_step.setValue(self.settings.get("player_seek_step", 5))
+        self.spn_seek_step.setSuffix(" sec")
+        row.addWidget(self.spn_seek_step)
+        row.addSpacing(20)
+        row.addWidget(QLabel("Large seek step:"))
+        self.spn_seek_step_large = QSpinBox()
+        self.spn_seek_step_large.setRange(1, 120)
+        self.spn_seek_step_large.setValue(
+            self.settings.get("player_seek_step_large", 30))
+        self.spn_seek_step_large.setSuffix(" sec")
+        row.addWidget(self.spn_seek_step_large)
+        row.addStretch()
+        sg.addLayout(row)
+
+        layout.addWidget(seek_group)
+
+        # ── Playback ─────────────────────────────────────────
+        play_group = QGroupBox("Playback")
+        pg = QVBoxLayout(play_group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Volume:"))
+        self.spn_player_volume = QSpinBox()
+        self.spn_player_volume.setRange(0, 100)
+        self.spn_player_volume.setValue(
+            self.settings.get("player_volume", 100))
+        self.spn_player_volume.setSuffix("%")
+        self.spn_player_volume.setToolTip("Player volume (also saved when adjusted during playback)")
+        row.addWidget(self.spn_player_volume)
+        row.addStretch()
+        pg.addLayout(row)
+
+        self.chk_player_advance = QCheckBox("Auto-advance to next file")
+        self.chk_player_advance.setChecked(
+            self.settings.get("player_auto_advance", True))
+        pg.addWidget(self.chk_player_advance)
+
+        self.chk_remember_pos = QCheckBox("Remember playback position per file")
+        self.chk_remember_pos.setChecked(
+            self.settings.get("player_remember_positions", False))
+        pg.addWidget(self.chk_remember_pos)
+
+        layout.addWidget(play_group)
+
+        # ── Fullscreen ────────────────────────────────────────
+        fs_group = QGroupBox("Fullscreen")
+        fg = QVBoxLayout(fs_group)
+
+        row = QHBoxLayout()
+        self.chk_cursor_hide = QCheckBox("Auto-hide cursor after")
+        self.chk_cursor_hide.setChecked(
+            self.settings.get("player_cursor_hide", True))
+        row.addWidget(self.chk_cursor_hide)
+        self.spn_cursor_delay = QSpinBox()
+        self.spn_cursor_delay.setRange(500, 10000)
+        self.spn_cursor_delay.setSingleStep(500)
+        self.spn_cursor_delay.setValue(
+            self.settings.get("player_cursor_hide_delay", 3000))
+        self.spn_cursor_delay.setSuffix(" ms")
+        row.addWidget(self.spn_cursor_delay)
+        row.addStretch()
+        fg.addLayout(row)
+
+        row = QHBoxLayout()
+        self.chk_controls_autohide = QCheckBox("Auto-hide controls after")
+        self.chk_controls_autohide.setChecked(
+            self.settings.get("player_controls_autohide", True))
+        row.addWidget(self.chk_controls_autohide)
+        self.spn_controls_delay = QSpinBox()
+        self.spn_controls_delay.setRange(500, 10000)
+        self.spn_controls_delay.setSingleStep(500)
+        self.spn_controls_delay.setValue(
+            self.settings.get("player_controls_autohide_delay", 3000))
+        self.spn_controls_delay.setSuffix(" ms")
+        row.addWidget(self.spn_controls_delay)
+        row.addStretch()
+        fg.addLayout(row)
+
+        layout.addWidget(fs_group)
+
+        # ── OSD ───────────────────────────────────────────────
+        osd_group = QGroupBox("On-Screen Display")
+        og = QHBoxLayout(osd_group)
+        self.chk_osd = QCheckBox("Show OSD notifications")
+        self.chk_osd.setChecked(self.settings.get("player_osd", True))
+        og.addWidget(self.chk_osd)
+        og.addWidget(QLabel("Duration:"))
+        self.spn_osd_dur = QSpinBox()
+        self.spn_osd_dur.setRange(500, 5000)
+        self.spn_osd_dur.setSingleStep(250)
+        self.spn_osd_dur.setValue(self.settings.get("player_osd_duration", 1500))
+        self.spn_osd_dur.setSuffix(" ms")
+        og.addWidget(self.spn_osd_dur)
+        og.addStretch()
+        layout.addWidget(osd_group)
+
+        # ── Start Directory ───────────────────────────────────
+        dir_group = QGroupBox("Start Directory")
+        dg = QVBoxLayout(dir_group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("On startup:"))
+        self.cmb_start_dir = QComboBox()
+        self.cmb_start_dir.addItems(["Last opened", "Specific path", "Home"])
+        mode = self.settings.get("player_start_dir_mode", "last")
+        idx = {"last": 0, "specific": 1, "home": 2}.get(mode, 0)
+        self.cmb_start_dir.setCurrentIndex(idx)
+        row.addWidget(self.cmb_start_dir, stretch=1)
+        dg.addLayout(row)
+
+        row = QHBoxLayout()
+        self.txt_start_dir = QLineEdit(
+            self.settings.get("player_start_dir_path", ""))
+        self.txt_start_dir.setPlaceholderText("Path for 'Specific path' mode")
+        row.addWidget(self.txt_start_dir)
+        btn = QPushButton("Browse...")
+        btn.clicked.connect(self._browse_start_dir)
+        row.addWidget(btn)
+        dg.addLayout(row)
+
+        layout.addWidget(dir_group)
+
+        # ── File Extensions ───────────────────────────────────
+        ext_group = QGroupBox("Video File Extensions")
+        eg = QHBoxLayout(ext_group)
+        self.txt_extensions = QLineEdit(
+            self.settings.get("player_extensions",
+                              ".mp4,.mkv,.avi,.mov,.webm,.flv,.wmv"))
+        self.txt_extensions.setToolTip(
+            "Comma-separated list of extensions (include the dot)")
+        eg.addWidget(self.txt_extensions)
+        layout.addWidget(ext_group)
+
+        layout.addStretch()
+        return tab
+
+    def _browse_start_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose Start Directory")
+        if folder:
+            self.txt_start_dir.setText(folder)
+            self.cmb_start_dir.setCurrentIndex(1)  # Switch to "Specific path"
+
+    def _rebuild_quality_combo(self):
+        """Populate quality dropdown, optionally including experimental presets."""
+        prev = self.cmb_quality.currentText()
+        self.cmb_quality.blockSignals(True)
+        self.cmb_quality.clear()
+
+        self.cmb_quality.addItems(QUALITY_PRESETS.keys())
+
+        show_exp = (
+            self.chk_experimental is not None
+            and self.chk_experimental.isChecked()
+        )
+        if show_exp and AUTO_PRESETS:
+            self.cmb_quality.insertSeparator(self.cmb_quality.count())
+            self.cmb_quality.addItems(AUTO_PRESETS.keys())
+
+        # Restore selection
+        current_auto = self.settings.get("auto_preset_name", "")
+        if show_exp and current_auto and current_auto in AUTO_PRESETS:
+            self.cmb_quality.setCurrentText(current_auto)
+        elif prev in QUALITY_PRESETS:
+            self.cmb_quality.setCurrentText(prev)
+        else:
+            current_crf = self.settings.get("crf", 17)
+            for name, crf in QUALITY_PRESETS.items():
+                if crf == current_crf:
+                    self.cmb_quality.setCurrentText(name)
+                    break
+
+        self.cmb_quality.blockSignals(False)
+        self._on_quality_changed(self.cmb_quality.currentText())
+
     def _on_quality_changed(self, text: str):
         """When an auto-preset is selected, override the codec dropdown to match."""
         if text in AUTO_PRESETS:
@@ -297,6 +530,14 @@ class SettingsDialog(QDialog):
         output_dir = self.txt_output.text().strip()
         suffix = self.txt_suffix.text().strip() or "_edited"
         archive_dir = self.txt_archive_dir.text().strip()
+
+        # Player click/wheel behavior
+        click_map = {"Play/Pause": "play_pause", "Disabled": "disabled"}
+        dblclick_map = {"Fullscreen": "fullscreen", "Play/Pause": "play_pause",
+                        "Disabled": "disabled"}
+        wheel_map = {"Seek": "seek", "Volume": "volume", "Disabled": "disabled"}
+        start_map = {0: "last", 1: "specific", 2: "home"}
+
         return {
             "codec": codec,
             "crf": crf,
@@ -314,7 +555,35 @@ class SettingsDialog(QDialog):
             "normalize_audio": self.chk_normalize.isChecked(),
             "normalize_lufs": self.spn_norm_lufs.value(),
             "ui_scale": self.sld_scale.value(),
-            "keybinds": self.keybind_editor.get_bindings(),
+            "editor_keybinds": self.editor_keybind_editor.get_bindings(),
+            "player_keybinds": self.player_keybind_editor.get_bindings(),
             "auto_preset_name": quality_name if auto_preset else "",
             "auto_preset": auto_preset,
+            "experimental_presets": (
+                self.chk_experimental.isChecked()
+                if self.chk_experimental is not None
+                else False
+            ),
+            # Player settings
+            "player_click": click_map.get(
+                self.cmb_player_click.currentText(), "play_pause"),
+            "player_double_click": dblclick_map.get(
+                self.cmb_player_dblclick.currentText(), "fullscreen"),
+            "player_wheel": wheel_map.get(
+                self.cmb_player_wheel.currentText(), "seek"),
+            "player_seek_step": self.spn_seek_step.value(),
+            "player_seek_step_large": self.spn_seek_step_large.value(),
+            "player_volume": self.spn_player_volume.value(),
+            "player_auto_advance": self.chk_player_advance.isChecked(),
+            "player_remember_positions": self.chk_remember_pos.isChecked(),
+            "player_cursor_hide": self.chk_cursor_hide.isChecked(),
+            "player_cursor_hide_delay": self.spn_cursor_delay.value(),
+            "player_controls_autohide": self.chk_controls_autohide.isChecked(),
+            "player_controls_autohide_delay": self.spn_controls_delay.value(),
+            "player_osd": self.chk_osd.isChecked(),
+            "player_osd_duration": self.spn_osd_dur.value(),
+            "player_start_dir_mode": start_map.get(
+                self.cmb_start_dir.currentIndex(), "last"),
+            "player_start_dir_path": self.txt_start_dir.text().strip(),
+            "player_extensions": self.txt_extensions.text().strip(),
         }

@@ -18,7 +18,7 @@ from src.core.paths import get_config_dir
 from src.core.video_item import VideoItem
 from src.core.archive import archive_original
 from src.core.keybinds import (
-    ACTION_DEFS, KeybindManager,
+    ACTION_DEFS, PLAYER_ACTION_DEFS, KeybindManager,
     keybind_from_key_event, keybind_from_mouse_event,
 )
 from src.ui.video_player import VideoPlayer, VideoSurface
@@ -115,11 +115,15 @@ class MainWindow(QMainWindow):
         self._export_cancelled = False
         self._stepped_pos: int | None = None  # accurate position during frame stepping
 
-        self._keybind_manager = KeybindManager(self._settings.get("keybinds"))
+        self._editor_keybind_manager = KeybindManager(
+            ACTION_DEFS, self._settings.get("editor_keybinds"))
+        self._player_keybind_manager = KeybindManager(
+            PLAYER_ACTION_DEFS, self._settings.get("player_keybinds"))
 
         self._setup_ui()
         self._setup_menu()
         self._build_action_handlers()
+        self._build_player_action_handlers()
 
         # Status bar — persistent clip info (resolution, fps, duration)
         self._status_label = QLabel("Drop a video file to begin")
@@ -180,6 +184,8 @@ class MainWindow(QMainWindow):
         vm = menu.addMenu("&View")
         self._act_mode_editor = vm.addAction("&Editor", lambda: self._switch_mode("editor"))
         self._act_mode_player = vm.addAction("&Player", lambda: self._switch_mode("player"))
+        vm.addSeparator()
+        self._menu_actions["fullscreen"] = vm.addAction("&Fullscreen", self._toggle_fullscreen)
 
         self._sync_menu_shortcuts()
 
@@ -204,13 +210,56 @@ class MainWindow(QMainWindow):
             "settings":            self._open_settings,
             "mode_editor":         lambda: self._switch_mode("editor"),
             "mode_player":         lambda: self._switch_mode("player"),
+            "fullscreen":          self._toggle_fullscreen,
             "quit":                self.close,
+        }
+
+    def _build_player_action_handlers(self):
+        """Map player action IDs to callables on self.player_mode."""
+        s = self._settings
+        self._player_action_handlers: dict[str, callable] = {
+            "p_play_pause":      lambda: self.player_mode._toggle_play(),
+            "p_seek_fwd":        lambda: self.player_mode.seek_relative(
+                                     s.get("player_seek_step", 5) * 1000),
+            "p_seek_back":       lambda: self.player_mode.seek_relative(
+                                     -s.get("player_seek_step", 5) * 1000),
+            "p_seek_fwd_large":  lambda: self.player_mode.seek_relative(
+                                     s.get("player_seek_step_large", 30) * 1000),
+            "p_seek_back_large": lambda: self.player_mode.seek_relative(
+                                     -s.get("player_seek_step_large", 30) * 1000),
+            "p_frame_fwd":       lambda: self.player_mode.frame_step(1),
+            "p_frame_back":      lambda: self.player_mode.frame_step(-1),
+            "p_speed_up":        lambda: self.player_mode.adjust_speed(0.25),
+            "p_speed_down":      lambda: self.player_mode.adjust_speed(-0.25),
+            "p_speed_reset":     lambda: self.player_mode.reset_speed(),
+            "p_volume_up":       lambda: self.player_mode.adjust_volume(5),
+            "p_volume_down":     lambda: self.player_mode.adjust_volume(-5),
+            "p_mute":            lambda: self.player_mode.toggle_mute(),
+            "p_next_file":       lambda: self.player_mode._go_next(),
+            "p_prev_file":       lambda: self.player_mode._go_prev(),
+            "p_jump_start":      lambda: self.player_mode.jump_to_start(),
+            "p_jump_end":        lambda: self.player_mode.jump_to_end(),
+            "p_goto_time":       lambda: self.player_mode.goto_timestamp(),
+            "p_loop_cycle":      lambda: self.player_mode.cycle_loop_mode(),
+            "p_ab_mark":         lambda: self.player_mode.ab_mark(),
+            "p_shuffle":         lambda: self.player_mode.toggle_shuffle(),
+            "p_screenshot":      lambda: self.player_mode.take_screenshot(),
+            "p_copy_path":       lambda: self.player_mode.copy_path(),
+            "p_open_external":   lambda: self.player_mode.open_external(),
+            "p_open_folder":     lambda: self.player_mode.open_folder_dialog(),
+            "p_refresh":         lambda: self.player_mode.refresh_file_list(),
+            "p_aspect_cycle":    lambda: self.player_mode.cycle_aspect(),
+            "p_compact":         lambda: self.player_mode.toggle_compact(),
+            "p_fit_window":      self._fit_window_to_video,
+            "p_fullscreen":      self._toggle_fullscreen,
+            "p_mode_editor":     lambda: self._switch_mode("editor"),
+            "p_quit":            self.close,
         }
 
     def _sync_menu_shortcuts(self):
         """Update menu shortcut display labels from the keybind manager."""
         for aid, action in self._menu_actions.items():
-            display = self._keybind_manager.get_menu_shortcut(aid)
+            display = self._editor_keybind_manager.get_menu_shortcut(aid)
             action.setShortcut(QKeySequence(display) if display else QKeySequence())
 
     def _setup_ui(self):
@@ -229,8 +278,32 @@ class MainWindow(QMainWindow):
 
         # ── Player page ───────────────────────────────────────
         self.player_mode = PlayerMode()
+        self.player_mode._settings = self._settings
         self.player_mode.send_to_editor.connect(self._on_send_to_editor)
-        self.player_mode.set_volume(self._settings.get("preview_volume", 100))
+        self.player_mode.fullscreen_changed.connect(self._on_fullscreen_changed)
+        self.player_mode.title_changed.connect(self._on_player_title_changed)
+        self.player_mode.volume_changed.connect(self._on_player_volume_changed)
+        self.player_mode.set_volume(self._settings.get("player_volume", 100))
+        # Set OSD duration and extensions from settings
+        self.player_mode.surface.set_osd_duration(
+            self._settings.get("player_osd_duration", 1500))
+        ext_str = self._settings.get("player_extensions", "")
+        if ext_str:
+            self.player_mode._file_proxy.set_extensions(ext_str)
+        self.player_mode._recent_dirs = list(
+            self._settings.get("player_recent_dirs", []))
+        # Determine start directory based on setting
+        start_mode = self._settings.get("player_start_dir_mode", "last")
+        if start_mode == "specific":
+            start_dir = self._settings.get("player_start_dir_path", "")
+        elif start_mode == "home":
+            start_dir = str(Path.home())
+        else:  # "last"
+            start_dir = self._settings.get("player_last_dir", "")
+        if start_dir and Path(start_dir).is_dir():
+            self.player_mode.navigate_to(start_dir)
+        else:
+            self.player_mode.navigate_to(str(Path.home()))
         self._stack.addWidget(self.player_mode)
 
         # ── Queue navigation bar ──────────────────────────────
@@ -846,11 +919,12 @@ class MainWindow(QMainWindow):
         self.btn_clear_queue.setEnabled(count >= 1)
 
     def closeEvent(self, event):
-        # Persist window geometry so the next launch restores position/size.
+        # Persist window geometry and player directory
         import base64 as _b64
         try:
             self._settings["window_geometry"] = _b64.b64encode(
                 bytes(self.saveGeometry())).decode()
+            self._settings["player_last_dir"] = self.player_mode.get_current_directory()
             self._save_settings()
         except Exception:
             pass
@@ -896,6 +970,10 @@ class MainWindow(QMainWindow):
         is_repeat = False
 
         if etype == QEvent.Type.KeyPress:
+            # Escape exits fullscreen before anything else
+            if event.key() == Qt.Key.Key_Escape and self.player_mode.is_fullscreen:
+                self.player_mode.toggle_fullscreen()
+                return True
             # Skip when focus is on a text-entry widget
             focused = QApplication.instance().focusWidget()
             if isinstance(focused, (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
@@ -927,7 +1005,17 @@ class MainWindow(QMainWindow):
         if kb is None:
             return super().eventFilter(obj, event)
 
-        action_ids = self._keybind_manager.lookup(kb)
+        # Mode-aware dispatch: editor (index 0) vs player (index 1)
+        if self._stack.currentIndex() == 1:
+            manager = self._player_keybind_manager
+            handlers = self._player_action_handlers
+            action_defs = PLAYER_ACTION_DEFS
+        else:
+            manager = self._editor_keybind_manager
+            handlers = self._action_handlers
+            action_defs = ACTION_DEFS
+
+        action_ids = manager.lookup(kb)
         if not action_ids:
             return super().eventFilter(obj, event)
 
@@ -935,9 +1023,9 @@ class MainWindow(QMainWindow):
         # suppressed — so the event never leaks to QAction shortcuts
         # (which don't respect our allow_repeat rules).
         for aid in action_ids:
-            if is_repeat and not ACTION_DEFS[aid].allow_repeat:
+            if is_repeat and not action_defs[aid].allow_repeat:
                 continue
-            handler = self._action_handlers.get(aid)
+            handler = handlers.get(aid)
             if handler:
                 handler()
 
@@ -1018,11 +1106,57 @@ class MainWindow(QMainWindow):
             if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self.player.player.pause()
             self._stack.setCurrentIndex(1)
+            # Update title for player mode
+            if self.player_mode._current_path:
+                self._on_player_title_changed(
+                    Path(self.player_mode._current_path).name)
         else:
             # Pause the player mode's player before switching
             if self.player_mode.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self.player_mode.player.pause()
             self._stack.setCurrentIndex(0)
+            # Restore editor title
+            self._update_nav()
+
+    def _toggle_fullscreen(self):
+        """Toggle fullscreen — only active in player mode."""
+        if self._stack.currentIndex() != 1:
+            # Switch to player mode first, then go fullscreen
+            self._switch_mode("player")
+        self.player_mode.toggle_fullscreen()
+
+    def _on_fullscreen_changed(self, is_fs: bool):
+        """Show/hide main window chrome for fullscreen."""
+        self.menuBar().setVisible(not is_fs)
+        if is_fs:
+            self.showFullScreen()
+        else:
+            self.showNormal()
+
+    def _fit_window_to_video(self):
+        """Resize window to match native video dimensions."""
+        size = self.player_mode.get_video_size()
+        if size:
+            vw, vh = size
+            # Add some padding for controls/chrome
+            self.resize(max(640, vw), max(480, vh + 100))
+
+    def _on_player_title_changed(self, filename: str):
+        """Update window title when a video is loaded in player mode."""
+        if self._stack.currentIndex() == 1:
+            self.setWindowTitle(f"Video Editor \u2014 {filename} \u2014 Player")
+
+    def _on_player_volume_changed(self, value: int):
+        """Persist player volume separately from editor volume (debounced)."""
+        self._settings["player_volume"] = max(0, min(100, value))
+        # Debounce: avoid hammering disk on held volume keys.
+        # Save after 500ms of no further changes.
+        if not hasattr(self, '_vol_save_timer'):
+            self._vol_save_timer = QTimer(self)
+            self._vol_save_timer.setSingleShot(True)
+            self._vol_save_timer.setInterval(500)
+            self._vol_save_timer.timeout.connect(self._save_settings)
+        self._vol_save_timer.start()
 
     def _on_send_to_editor(self, paths: list[str]):
         """Receive files from the player mode and load them in the editor."""
@@ -1048,10 +1182,35 @@ class MainWindow(QMainWindow):
             "normalize_audio": False,
             "normalize_lufs": -14.0,
             "ui_scale": 90,
-            "keybinds": {},
+            "editor_keybinds": {},
+            "player_keybinds": {},
+            "player_last_dir": "",
+            # Player settings
+            "player_click": "play_pause",
+            "player_double_click": "fullscreen",
+            "player_wheel": "seek",
+            "player_seek_step": 5,
+            "player_seek_step_large": 30,
+            "player_auto_advance": True,
+            "player_cursor_hide": True,
+            "player_cursor_hide_delay": 3000,
+            "player_controls_autohide": True,
+            "player_controls_autohide_delay": 3000,
+            "player_osd": True,
+            "player_osd_duration": 1500,
+            "player_start_dir_mode": "last",
+            "player_start_dir_path": "",
+            "player_remember_positions": False,
+            "player_extensions": ".mp4,.mkv,.avi,.mov,.webm,.flv,.wmv",
+            "player_volume": 100,
         }
         try:
             data = json.loads(self._settings_path.read_text())
+            # Migrate old "keybinds" key → "editor_keybinds"
+            if "keybinds" in data and "editor_keybinds" not in data:
+                data["editor_keybinds"] = data.pop("keybinds")
+            elif "keybinds" in data:
+                data.pop("keybinds", None)
             defaults.update(data)
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             pass
@@ -1072,15 +1231,36 @@ class MainWindow(QMainWindow):
             defaults["preview_volume"] = max(0, min(100, int(defaults["preview_volume"])))
         except (ValueError, TypeError):
             defaults["preview_volume"] = 100
+        # Validate player numeric settings — corrupt JSON must not crash
+        _player_int_keys = {
+            "player_seek_step": 5, "player_seek_step_large": 30,
+            "player_volume": 100,
+            "player_cursor_hide_delay": 3000,
+            "player_controls_autohide_delay": 3000,
+            "player_osd_duration": 1500,
+        }
+        for key, fallback in _player_int_keys.items():
+            try:
+                defaults[key] = int(defaults[key])
+            except (ValueError, TypeError):
+                defaults[key] = fallback
+        _player_bool_keys = [
+            "player_auto_advance", "player_cursor_hide",
+            "player_controls_autohide", "player_osd",
+            "player_remember_positions",
+        ]
+        for key in _player_bool_keys:
+            if not isinstance(defaults.get(key), bool):
+                defaults[key] = True if key != "player_remember_positions" else False
         return defaults
 
     def _save_settings(self):
         try:
             tmp = self._settings_path.with_suffix('.tmp')
-            tmp.write_text(json.dumps(self._settings, indent=2))
+            tmp.write_text(json.dumps(self._settings, indent=2, default=str))
             tmp.replace(self._settings_path)
-        except OSError:
-            pass  # read-only dir, full disk, locked file — silent, non-fatal
+        except (OSError, ValueError):
+            pass  # read-only dir, full disk, locked file, bad data — silent, non-fatal
 
     def _on_preview_volume_changed(self, value: int):
         """Persist preview volume when the user releases the slider.
@@ -1103,8 +1283,11 @@ class MainWindow(QMainWindow):
             # (window_geometry, preview_volume, etc.)
             self._settings.update(dlg.get_settings())
             self._save_settings()
-            # Reload keybind manager from updated settings
-            self._keybind_manager = KeybindManager(self._settings.get("keybinds"))
+            # Reload keybind managers from updated settings
+            self._editor_keybind_manager = KeybindManager(
+                ACTION_DEFS, self._settings.get("editor_keybinds"))
+            self._player_keybind_manager = KeybindManager(
+                PLAYER_ACTION_DEFS, self._settings.get("player_keybinds"))
             self._sync_menu_shortcuts()
             self.spn_lufs.setValue(self._settings.get("normalize_lufs", -14.0))
             new_theme = self._settings.get("theme", DEFAULT_THEME)
@@ -1114,6 +1297,14 @@ class MainWindow(QMainWindow):
                 self._apply_dark_title_bar(is_dark_theme(new_theme))
             if self._settings.get("stay_on_top", False) != prev_on_top:
                 self._apply_stay_on_top(self._settings["stay_on_top"])
+            # Re-apply player settings stored in child widget state
+            self.player_mode.surface.set_osd_duration(
+                self._settings.get("player_osd_duration", 1500))
+            ext_str = self._settings.get("player_extensions", "")
+            if ext_str:
+                self.player_mode._file_proxy.set_extensions(ext_str)
+            self.player_mode.set_volume(
+                self._settings.get("player_volume", 100))
 
     def _apply_stay_on_top(self, enabled: bool):
         """Toggle always-on-top via the native Win32 API.

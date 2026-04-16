@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 
 from src.core.keybinds import (
-    ACTION_DEFS, KeybindManager, format_binding,
+    ActionDef, KeybindManager, format_binding,
     keybind_from_key_event, keybind_from_mouse_event,
     MODIFIER_KEYS, _to_int,
 )
@@ -120,11 +120,18 @@ class KeybindCapture(QLineEdit):
 
 
 class KeybindEditor(QWidget):
-    """Full keybind editor: search bar, grouped action rows, reset button."""
+    """Full keybind editor: search bar, grouped action rows, reset button.
 
-    def __init__(self, bindings: dict[str, list[str]] | None = None, parent=None):
+    Parameters:
+        action_defs: The ActionDef registry to display (ACTION_DEFS or PLAYER_ACTION_DEFS).
+        bindings: Optional saved bindings dict to overlay on defaults.
+    """
+
+    def __init__(self, action_defs: dict[str, ActionDef],
+                 bindings: dict[str, list[str]] | None = None, parent=None):
         super().__init__(parent)
-        self._manager = KeybindManager(bindings)
+        self._action_defs = action_defs
+        self._manager = KeybindManager(action_defs, bindings)
         self._captures: dict[str, list[KeybindCapture]] = {}
         self._row_widgets: dict[str, QWidget] = {}
         self._category_labels: dict[str, QLabel] = {}
@@ -159,7 +166,7 @@ class KeybindEditor(QWidget):
         self._grid.setContentsMargins(0, 0, 0, 0)
 
         prev_cat = ""
-        for aid, adef in ACTION_DEFS.items():
+        for aid, adef in self._action_defs.items():
             if adef.category != prev_cat:
                 prev_cat = adef.category
                 lbl = QLabel(f"  {adef.category.upper()}")
@@ -232,7 +239,7 @@ class KeybindEditor(QWidget):
         self._captures[action_id].append(cap)
 
     def _reset_action(self, action_id: str):
-        defaults = ACTION_DEFS[action_id].default_bindings
+        defaults = self._action_defs[action_id].default_bindings
         self._manager.set_bindings(action_id, defaults)
         self._rebuild_row(action_id)
         self._update_conflicts()
@@ -251,13 +258,13 @@ class KeybindEditor(QWidget):
         old.setParent(None)
         old.deleteLater()
 
-        new = self._build_row(action_id, ACTION_DEFS[action_id])
+        new = self._build_row(action_id, self._action_defs[action_id])
         self._row_widgets[action_id] = new
         self._grid.insertWidget(idx, new)
 
     def _reset_all(self):
         self._manager.reset_to_defaults()
-        for aid in ACTION_DEFS:
+        for aid in self._action_defs:
             self._rebuild_row(aid)
         self._update_conflicts()
 
@@ -276,7 +283,7 @@ class KeybindEditor(QWidget):
                 b = cap.get_binding()
                 if b and len(bind_map.get(b, [])) > 1:
                     others = [
-                        ACTION_DEFS[a].display_name
+                        self._action_defs[a].display_name
                         for a in bind_map[b] if a != aid
                     ]
                     cap.set_conflict(
@@ -295,7 +302,7 @@ class KeybindEditor(QWidget):
                 match = True
             else:
                 # Match on action display name OR any of its binding strings
-                match = q in ACTION_DEFS[aid].display_name.lower()
+                match = q in self._action_defs[aid].display_name.lower()
                 if not match:
                     for cap in self._captures.get(aid, []):
                         if q in cap.get_binding().lower():
@@ -303,6 +310,6 @@ class KeybindEditor(QWidget):
                             break
             row.setVisible(match)
             if match:
-                visible_cats.add(ACTION_DEFS[aid].category)
+                visible_cats.add(self._action_defs[aid].category)
         for cat, lbl in self._category_labels.items():
             lbl.setVisible(cat in visible_cats)

@@ -105,7 +105,62 @@ _def("redo",                "Redo",                "Edit",     ["Ctrl+Y"])
 _def("settings",            "Settings",            "App",      [])
 _def("mode_editor",         "Switch to Editor",    "App",      ["F5"])
 _def("mode_player",         "Switch to Player",    "App",      ["F6"])
+_def("fullscreen",          "Toggle Fullscreen",   "App",      ["F11"])
 _def("quit",                "Quit",                "App",      ["Ctrl+Q"])
+
+
+# ── Player action definitions ───────────────────────────────────
+
+PLAYER_ACTION_DEFS: dict[str, ActionDef] = {}
+
+
+def _pdef(aid: str, name: str, cat: str, defaults: list[str], repeat: bool = False):
+    PLAYER_ACTION_DEFS[aid] = ActionDef(aid, name, cat, list(defaults), repeat)
+
+
+# Playback
+_pdef("p_play_pause",       "Play / Pause",         "Playback", ["Space", "MediaPlay"])
+_pdef("p_seek_fwd",         "Seek Forward",         "Playback", ["Right"],          repeat=True)
+_pdef("p_seek_back",        "Seek Backward",        "Playback", ["Left"],           repeat=True)
+_pdef("p_seek_fwd_large",   "Seek Forward (Large)", "Playback", ["Shift+Right"],    repeat=True)
+_pdef("p_seek_back_large",  "Seek Back (Large)",    "Playback", ["Shift+Left"],     repeat=True)
+_pdef("p_frame_fwd",        "Frame Step Forward",   "Playback", ["Period"],         repeat=True)
+_pdef("p_frame_back",       "Frame Step Backward",  "Playback", ["Comma"],          repeat=True)
+_pdef("p_speed_up",         "Speed Up",             "Playback", ["BracketRight"],   repeat=True)
+_pdef("p_speed_down",       "Speed Down",           "Playback", ["BracketLeft"],    repeat=True)
+_pdef("p_speed_reset",      "Reset Speed",          "Playback", ["Backspace"])
+
+# Volume
+_pdef("p_volume_up",        "Volume Up",            "Volume",   ["Up"],             repeat=True)
+_pdef("p_volume_down",      "Volume Down",          "Volume",   ["Down"],           repeat=True)
+_pdef("p_mute",             "Mute Toggle",          "Volume",   ["M"])
+
+# Navigation
+_pdef("p_next_file",        "Next File",            "Navigation", ["Ctrl+Right", "MediaNext"])
+_pdef("p_prev_file",        "Previous File",        "Navigation", ["Ctrl+Left", "MediaPrevious"])
+_pdef("p_jump_start",       "Jump to Start",        "Navigation", ["Home"])
+_pdef("p_jump_end",         "Jump to End",          "Navigation", ["End"])
+_pdef("p_goto_time",        "Go to Timestamp",      "Navigation", ["Ctrl+G"])
+
+# Loop
+_pdef("p_loop_cycle",       "Cycle Loop Mode",      "Loop",     ["Ctrl+L"])
+_pdef("p_ab_mark",          "A-B Loop Mark",        "Loop",     ["L"])
+_pdef("p_shuffle",          "Toggle Shuffle",       "Loop",     ["Ctrl+Shift+S"])
+
+# File
+_pdef("p_screenshot",       "Screenshot",           "File",     ["S"])
+_pdef("p_copy_path",        "Copy File Path",       "File",     ["Ctrl+C"])
+_pdef("p_open_external",    "Open in External App", "File",     ["Ctrl+Shift+O"])
+_pdef("p_open_folder",      "Open Folder",          "File",     ["Ctrl+O"])
+_pdef("p_refresh",          "Refresh File List",    "File",     ["F5"])
+
+# App
+_pdef("p_aspect_cycle",     "Cycle Aspect Ratio",   "App",      ["A"])
+_pdef("p_compact",          "Toggle Compact Mode",  "App",      ["Ctrl+M"])
+_pdef("p_fit_window",       "Fit Window to Video",  "App",      ["Ctrl+F"])
+_pdef("p_fullscreen",       "Toggle Fullscreen",    "App",      ["F11"])
+_pdef("p_mode_editor",      "Switch to Editor",     "App",      ["Escape"])
+_pdef("p_quit",             "Quit",                 "App",      ["Ctrl+Q"])
 
 
 # ── Parse / format ───────────────────────────────────────────────
@@ -166,14 +221,21 @@ def keybind_from_mouse_event(modifiers, button) -> Keybind:
 # ── Manager ──────────────────────────────────────────────────────
 
 class KeybindManager:
-    """Central keybind registry. Owns binding data and provides O(1) lookup."""
+    """Central keybind registry. Owns binding data and provides O(1) lookup.
 
-    def __init__(self, bindings: dict[str, list[str]] | None = None):
+    Parameters:
+        action_defs: The ActionDef registry to use (ACTION_DEFS or PLAYER_ACTION_DEFS).
+        bindings: Optional saved bindings dict to overlay on defaults.
+    """
+
+    def __init__(self, action_defs: dict[str, ActionDef],
+                 bindings: dict[str, list[str]] | None = None):
+        self._action_defs = action_defs
         self._bindings: dict[str, list[str]] = {
-            aid: list(adef.default_bindings) for aid, adef in ACTION_DEFS.items()
+            aid: list(adef.default_bindings) for aid, adef in action_defs.items()
         }
         if bindings:
-            for aid in ACTION_DEFS:
+            for aid in action_defs:
                 if aid in bindings and isinstance(bindings[aid], list):
                     self._bindings[aid] = [s for s in bindings[aid] if isinstance(s, str)]
         self._rebuild_lookup()
@@ -201,7 +263,8 @@ class KeybindManager:
 
     def reset_to_defaults(self):
         self._bindings = {
-            aid: list(adef.default_bindings) for aid, adef in ACTION_DEFS.items()
+            aid: list(adef.default_bindings)
+            for aid, adef in self._action_defs.items()
         }
         self._rebuild_lookup()
 

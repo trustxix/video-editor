@@ -23,6 +23,7 @@ class ClickSlider(QSlider):
             self.setValue(val)
             event.accept()
             self.setSliderDown(True)
+            self.sliderPressed.emit()
         else:
             super().mousePressEvent(event)
 
@@ -42,3 +43,10 @@ class ClickSlider(QSlider):
         super().mouseReleaseEvent(event)
         if event.button() == Qt.MouseButton.LeftButton and was_down:
             self.sliderReleased.emit()
+
+    def wheelEvent(self, event):
+        """Scroll wheel adjusts value by 5 per notch (120 degrees)."""
+        delta = event.angleDelta().y()
+        steps = delta // 120
+        self.setValue(self.value() + steps * 5)
+        event.accept()

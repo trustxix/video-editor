@@ -82,6 +82,7 @@ def get_encode_args(preset: dict) -> list[str]:
             "-rc", "vbr",
             "-b:v", "0",
             "-cq", str(crf),
+            "-maxrate", "200M",
         ]
     else:
         return [

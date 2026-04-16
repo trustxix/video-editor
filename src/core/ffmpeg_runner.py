@@ -1,3 +1,4 @@
+import os
 import subprocess
 import re
 from pathlib import Path
@@ -576,6 +577,82 @@ def get_video_fps(input_path: str) -> float:
         return num / den
     except ValueError:
         return 0.0
+
+
+_probe_cache: dict[tuple[str, float], dict] = {}
+
+
+def probe_video(input_path: str) -> dict | None:
+    """Probe video metadata with ffprobe. Returns dict with:
+    duration, width, height, fps, video_codec, audio_codec, bitrate, file_size.
+    Results are cached by (path, mtime)."""
+    import json as _json
+    try:
+        mtime = os.path.getmtime(input_path)
+    except OSError:
+        return None
+    key = (input_path, mtime)
+    if key in _probe_cache:
+        return _probe_cache[key]
+    try:
+        result = subprocess.run(
+            [get_ffprobe(), "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", input_path],
+            capture_output=True, text=True, startupinfo=_hide_window(),
+            timeout=3,
+        )
+        data = _json.loads(result.stdout)
+    except (subprocess.TimeoutExpired, _json.JSONDecodeError, OSError):
+        return None
+
+    info = {"duration": 0.0, "width": 0, "height": 0, "fps": 0.0,
+            "video_codec": "", "audio_codec": "", "bitrate": 0, "file_size": 0}
+
+    fmt = data.get("format", {})
+    try:
+        info["duration"] = float(fmt.get("duration", 0))
+    except (ValueError, TypeError):
+        pass
+    try:
+        info["bitrate"] = int(fmt.get("bit_rate", 0))
+    except (ValueError, TypeError):
+        pass
+    try:
+        info["file_size"] = int(fmt.get("size", 0))
+    except (ValueError, TypeError):
+        pass
+
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video" and not info["video_codec"]:
+            info["video_codec"] = s.get("codec_name", "")
+            try:
+                info["width"] = int(s.get("width", 0))
+                info["height"] = int(s.get("height", 0))
+            except (ValueError, TypeError):
+                pass
+            raw_fps = s.get("r_frame_rate", "0/1")
+            if "/" in raw_fps:
+                n, _, d = raw_fps.partition("/")
+                try:
+                    info["fps"] = float(n) / float(d) if float(d) else 0.0
+                except ValueError:
+                    pass
+            else:
+                try:
+                    info["fps"] = float(raw_fps)
+                except ValueError:
+                    pass
+        elif s.get("codec_type") == "audio" and not info["audio_codec"]:
+            info["audio_codec"] = s.get("codec_name", "")
+
+    _probe_cache[key] = info
+    # Cap cache at 500 entries to prevent unbounded memory growth
+    if len(_probe_cache) > 500:
+        # Remove oldest entries (first inserted)
+        excess = len(_probe_cache) - 500
+        for k in list(_probe_cache)[:excess]:
+            del _probe_cache[k]
+    return info
 
 
 def extract_frame(input_path: str, timestamp_s: float) -> bytes | None:
