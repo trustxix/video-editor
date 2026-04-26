@@ -1,7 +1,6 @@
 import sys
 import os
 import ctypes
-import logging
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 
@@ -20,9 +19,14 @@ os.close(_saved_stderr)
 
 def _is_already_running() -> bool:
     """Use a Windows named mutex for single-instance enforcement.
-    The OS automatically releases it when the process exits, even on crash."""
+    The OS automatically releases it when the process exits, even on crash.
+
+    The mutex name is salted with a per-installation id so a malicious local
+    process cannot pre-grab a predictable name to DoS the launcher."""
+    from src.core.paths import installation_id
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    kernel32.CreateMutexW(None, True, "Global\\VideoEditorSingleInstance")
+    mutex_name = f"Global\\VideoEditor_{installation_id()}"
+    kernel32.CreateMutexW(None, True, mutex_name)
     return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
 
 
@@ -42,13 +46,13 @@ def main():
     except (AttributeError, OSError):
         pass
 
-    # Log to file so errors are visible even under pythonw (no console)
+    # Log to file with rotation + path sanitization so errors are visible even
+    # under pythonw (no console) AND so logs users share in bug reports don't
+    # leak their Windows username or home directory.
     from src.core.paths import get_config_dir
-    logging.basicConfig(
-        filename=str(get_config_dir() / "editor.log"),
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-    )
+    from src.core import log_setup
+    log_setup.init(get_config_dir())
+    log_setup.log().info("Application starting")
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
