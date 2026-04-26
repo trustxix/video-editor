@@ -20,6 +20,13 @@ config/.installation_id
 # Crash dumps (generated at runtime, contain sanitized stack traces)
 config/crashes/
 
+# Claude Code session artifacts (auto-managed; should not be committed)
+.claude/
+
+# Stray installer test dirs (defense against bash $TEMP path mishandling)
+TestVideoEditor/
+VE_*/
+
 # IDE
 .vscode/
 .idea/
