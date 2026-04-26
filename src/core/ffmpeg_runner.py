@@ -2,26 +2,73 @@ import os
 import subprocess
 import re
 from pathlib import Path
+from typing import Callable, Optional
 
 from src.core.paths import get_ffmpeg, get_ffprobe
+from src.core.log_setup import log
 
 
-_nvenc_available: dict[str, bool] = {}  # cached per-encoder probe results
+# Per-encoder probe results: True = available, False = unavailable, value
+# is dropped if probe failed entirely (we re-probe next call).
+_nvenc_available: dict[str, bool] = {}
+# Reason for unavailability (human-readable), set on the first failed probe.
+_nvenc_reason: dict[str, str] = {}
 
 
 def _has_nvenc(encoder: str) -> bool:
-    """Probe whether an NVENC encoder is available (cached)."""
-    if encoder not in _nvenc_available:
-        try:
-            result = subprocess.run(
-                [get_ffmpeg(), '-hide_banner', '-encoders'],
-                capture_output=True, text=True, startupinfo=_hide_window(),
-                timeout=10,
-            )
-            _nvenc_available[encoder] = encoder in (result.stdout or "")
-        except Exception:
+    """Probe whether an NVENC encoder is available (cached).
+
+    Caches BOTH the result and (on failure) a human-readable reason
+    accessible via get_encoder_status(). Caching the reason means we don't
+    silently downgrade to software encoding without an explanation."""
+    if encoder in _nvenc_available:
+        return _nvenc_available[encoder]
+    try:
+        result = subprocess.run(
+            [get_ffmpeg(), '-hide_banner', '-encoders'],
+            capture_output=True, text=True, startupinfo=_hide_window(),
+            timeout=10,
+        )
+        if result.returncode != 0:
             _nvenc_available[encoder] = False
-    return _nvenc_available[encoder]
+            _nvenc_reason[encoder] = f"ffmpeg -encoders exited {result.returncode}"
+            log().warning(f"NVENC probe failed for {encoder}: {_nvenc_reason[encoder]}")
+            return False
+        if encoder in (result.stdout or ""):
+            _nvenc_available[encoder] = True
+            return True
+        _nvenc_available[encoder] = False
+        _nvenc_reason[encoder] = f"{encoder} not listed in ffmpeg -encoders (no NVIDIA GPU?)"
+        log().info(f"NVENC unavailable: {_nvenc_reason[encoder]}")
+        return False
+    except subprocess.TimeoutExpired:
+        _nvenc_available[encoder] = False
+        _nvenc_reason[encoder] = "ffmpeg encoder probe timed out (10s)"
+        log().warning(_nvenc_reason[encoder])
+        return False
+    except FileNotFoundError:
+        _nvenc_available[encoder] = False
+        _nvenc_reason[encoder] = "ffmpeg.exe not found"
+        log().error(_nvenc_reason[encoder])
+        return False
+    except OSError as e:
+        _nvenc_available[encoder] = False
+        _nvenc_reason[encoder] = f"ffmpeg launch failed: {e}"
+        log().error(_nvenc_reason[encoder])
+        return False
+
+
+def get_encoder_status() -> tuple[str, str]:
+    """Returns ('nvenc', '') if GPU encoding active, or ('software', reason) when
+    we've fallen back. Triggers a probe of h264_nvenc if not yet checked."""
+    # Use h264_nvenc as the canonical check (hevc_nvenc availability tracks it
+    # within driver versions). Prefer to report the first encoder we probed.
+    if not _nvenc_available:
+        _has_nvenc("h264_nvenc")
+    if any(_nvenc_available.values()):
+        return ("nvenc", "")
+    reason = _nvenc_reason.get("h264_nvenc") or next(iter(_nvenc_reason.values()), "unknown")
+    return ("software", reason)
 
 
 def _encode_args(codec: str, crf: int, auto_preset: dict | None = None) -> list[str]:
@@ -86,16 +133,43 @@ def _build_color_filters(brightness: float, exposure: float) -> list[str]:
 # unattended jobs.
 
 
+StatusCB = Optional[Callable[[str], None]]
+
+
+def _surface(status_cb: StatusCB, msg: str, level: str = "warning") -> None:
+    """Send a message to the status callback (UI) AND the rotating log."""
+    getattr(log(), level, log().warning)(msg)
+    if status_cb:
+        try:
+            status_cb(msg)
+        except Exception as cb_e:
+            log().error(f"status_cb raised: {cb_e}")
+
+
+def _safe_float(v, default: float, lo: float = -200.0, hi: float = 200.0) -> float:
+    """Coerce v to a bounded float. Used to defang FFmpeg loudnorm measurements
+    before they're interpolated into a filter string — prevents shell-style
+    injection through stderr-parsed JSON values."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if f != f or not (lo <= f <= hi):  # NaN or out-of-range
+        return default
+    return f
+
+
 def loudnorm_analyze(input_path: str, trim_start: float = 0,
                      trim_duration: float = 0,
-                     target_lufs: float = -14.0) -> dict | None:
+                     target_lufs: float = -14.0,
+                     status_cb: StatusCB = None) -> dict | None:
     """First pass of EBU R128 loudness normalization.
 
     Returns a dict with measured values for the second pass, or None on
-    failure. `target_lufs` sets the integrated loudness target (e.g. -14
-    for YouTube/Spotify, -23 for broadcast).
-    """
-    tp = min(-1.0, target_lufs + 2)  # true peak ceiling, always above target
+    failure. On failure, surfaces a human-readable message via `status_cb`
+    and logs to the rotating log so the user knows normalization was skipped
+    (instead of silently producing wrong loudness)."""
+    tp = min(-1.0, target_lufs + 2)
     cmd = [get_ffmpeg(), '-hide_banner']
     if trim_start > 0:
         cmd += ['-ss', f'{trim_start:.3f}']
@@ -111,45 +185,74 @@ def loudnorm_analyze(input_path: str, trim_start: float = 0,
             cmd, capture_output=True, text=True, encoding='utf-8',
             errors='replace', startupinfo=_hide_window(), timeout=120,
         )
-        # loudnorm JSON is in stderr after the standard log output
-        import json as _json
-        text = result.stderr
-        # Find the last JSON object in stderr with matched braces
-        brace = text.rfind('{')
-        if brace < 0:
-            return None
-        depth = 0
-        end = -1
-        for i in range(brace, len(text)):
-            if text[i] == '{':
-                depth += 1
-            elif text[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-        if end < 0:
-            return None
-        data = _json.loads(text[brace:end + 1])
-        # Validate required keys
-        for k in ('input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset'):
-            if k not in data:
-                return None
-        return data
-    except Exception:
+    except subprocess.TimeoutExpired:
+        _surface(status_cb, "Loudness analysis timed out (>2 min) — normalization skipped")
         return None
+    except FileNotFoundError:
+        _surface(status_cb, "ffmpeg.exe not found — loudness analysis skipped", "error")
+        return None
+    except OSError as e:
+        _surface(status_cb, f"ffmpeg failed to start for loudness analysis: {e}", "error")
+        return None
+
+    if result.returncode != 0:
+        _surface(status_cb,
+                 f"Loudness analysis failed (ffmpeg exit {result.returncode}) — normalization skipped")
+        return None
+
+    # loudnorm JSON is in stderr after the standard log output
+    import json as _json
+    text = result.stderr or ""
+    brace = text.rfind('{')
+    if brace < 0:
+        _surface(status_cb, "Loudness analysis: no JSON in ffmpeg output — normalization skipped")
+        return None
+    depth = 0
+    end = -1
+    for i in range(brace, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end < 0:
+        _surface(status_cb, "Loudness analysis: malformed JSON braces — normalization skipped")
+        return None
+    try:
+        data = _json.loads(text[brace:end + 1])
+    except _json.JSONDecodeError as e:
+        _surface(status_cb, f"Loudness analysis: invalid JSON ({e}) — normalization skipped")
+        return None
+
+    for k in ('input_i', 'input_tp', 'input_lra', 'input_thresh', 'target_offset'):
+        if k not in data:
+            _surface(status_cb,
+                     f"Loudness analysis: missing key {k!r} — normalization skipped")
+            return None
+    return data
 
 
 def loudnorm_filter(measured: dict, target_lufs: float = -14.0) -> str:
-    """Build the second-pass loudnorm filter string from first-pass measurements."""
+    """Build the second-pass loudnorm filter string from first-pass measurements.
+
+    All measurements are coerced through `_safe_float` with bounded ranges.
+    This blocks filter injection via crafted media that could cause ffmpeg
+    to emit malicious-looking JSON through its stderr output."""
     tp = min(-1.0, target_lufs + 2)
+    input_i = _safe_float(measured.get('input_i'), -16.0)
+    input_tp = _safe_float(measured.get('input_tp'), -2.0)
+    input_lra = _safe_float(measured.get('input_lra'), 7.0, lo=0.0, hi=50.0)
+    input_thresh = _safe_float(measured.get('input_thresh'), -26.0)
+    target_offset = _safe_float(measured.get('target_offset'), 0.0, lo=-99.0, hi=99.0)
     return (
         f"loudnorm=I={target_lufs:.1f}:TP={tp:.1f}:LRA=11"
-        f":measured_I={measured['input_i']}"
-        f":measured_TP={measured['input_tp']}"
-        f":measured_LRA={measured['input_lra']}"
-        f":measured_thresh={measured['input_thresh']}"
-        f":offset={measured['target_offset']}"
+        f":measured_I={input_i:.2f}"
+        f":measured_TP={input_tp:.2f}"
+        f":measured_LRA={input_lra:.2f}"
+        f":measured_thresh={input_thresh:.2f}"
+        f":offset={target_offset:.2f}"
         f":linear=true"
     )
 
@@ -241,12 +344,15 @@ def prerender_audio(
     base_speed: float,
     trim_start_ms: int,
     trim_end_ms: int,
+    status_cb: StatusCB = None,
 ) -> bool:
     """Pre-render audio with per-sample speed automation — identical to preview.
 
     Reads raw PCM extracted by FFmpeg, runs the same resampling loop as the
     live PitchedAudioPlayer, writes a WAV file.
-    """
+
+    Surfaces failures via status_cb + log so the user knows audio prerender
+    failed (instead of silently producing a video with no audio track)."""
     import array, wave
 
     from src.core.speed_curve import SpeedCurve
@@ -258,13 +364,29 @@ def prerender_audio(
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0
-    r = subprocess.run(
-        [get_ffmpeg(), '-i', pcm_path, '-vn',
-         '-f', 's16le', '-acodec', 'pcm_s16le',
-         '-ac', '2', '-ar', str(BASE_RATE), '-'],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=si,
-    )
+    try:
+        r = subprocess.run(
+            [get_ffmpeg(), '-i', pcm_path, '-vn',
+             '-f', 's16le', '-acodec', 'pcm_s16le',
+             '-ac', '2', '-ar', str(BASE_RATE), '-'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=si,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        _surface(status_cb, "Audio extract timed out (>5 min) — export will have no audio")
+        return False
+    except (FileNotFoundError, OSError) as e:
+        _surface(status_cb, f"ffmpeg failed for audio extract: {e} — export will have no audio", "error")
+        return False
+    if r.returncode != 0:
+        stderr_tail = (r.stderr or b"")[-200:].decode("utf-8", errors="replace") if r.stderr else ""
+        _surface(status_cb,
+                 f"Audio extract failed (ffmpeg exit {r.returncode}): {stderr_tail.strip()} — export will have no audio",
+                 "error")
+        return False
     if not r.stdout:
+        _surface(status_cb,
+                 "Audio extract produced no PCM data — export will have no audio")
         return False
     pcm = array.array('h')
     pcm.frombytes(r.stdout)

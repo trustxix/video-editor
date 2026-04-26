@@ -136,7 +136,7 @@ def test_build_speed_audio_filter_near_zero():
     assert "asetrate=4" in f or "asetrate=1" in f
 
 
-# ─── loudnorm_filter injection guard (Phase 1.9 — placeholder) ────────────
+# ─── loudnorm_filter injection guard (Phase 1.9) ──────────────────────────
 
 def test_loudnorm_filter_with_normal_measurements():
     """Sanity check: normal numeric measurements produce a valid filter string."""
@@ -149,4 +149,76 @@ def test_loudnorm_filter_with_normal_measurements():
     }
     f = loudnorm_filter(measured, target_lufs=-16.0)
     assert "loudnorm=" in f
-    assert "measured_I=-20.0" in f
+    assert "measured_I=-20.00" in f
+
+
+def test_loudnorm_filter_rejects_filter_injection_payload():
+    """Adversarial JSON values from ffmpeg stderr must not flow into the filter."""
+    malicious = {
+        "input_i": "-20;amovie=/etc/passwd[a]",
+        "input_tp": "-2",
+        "input_lra": "7",
+        "input_thresh": "-26",
+        "target_offset": "0",
+    }
+    f = loudnorm_filter(malicious, target_lufs=-16.0)
+    assert "amovie" not in f
+    assert "passwd" not in f
+    assert "/etc" not in f
+    # Should still produce a syntactically valid filter using the default
+    assert "loudnorm=" in f
+
+
+def test_loudnorm_filter_rejects_nan_and_extreme_values():
+    measured = {
+        "input_i": "nan",
+        "input_tp": "1e308",
+        "input_lra": "-999",
+        "input_thresh": "inf",
+        "target_offset": "abc",
+    }
+    f = loudnorm_filter(measured, target_lufs=-16.0)
+    # All defaults applied
+    assert "measured_I=-16.00" in f
+    assert "measured_TP=-2.00" in f
+
+
+# ─── Loudnorm + prerender status callback (Phase 1.3) ─────────────────────
+
+def test_loudnorm_analyze_calls_status_cb_on_missing_file():
+    from src.core.ffmpeg_runner import loudnorm_analyze
+    captured: list[str] = []
+    result = loudnorm_analyze(
+        "C:/no-such-file-xyz123.mp4",
+        status_cb=captured.append,
+    )
+    assert result is None
+    assert captured, "status_cb should have been called on failure"
+    assert any("loud" in m.lower() or "skip" in m.lower() or "ffmpeg" in m.lower() for m in captured)
+
+
+# ─── NVENC encoder status (Phase 1.4) ─────────────────────────────────────
+
+def test_get_encoder_status_returns_tuple(monkeypatch):
+    """Whether NVENC is detected or not, get_encoder_status returns (label, reason)."""
+    from src.core import ffmpeg_runner
+    encoder, reason = ffmpeg_runner.get_encoder_status()
+    assert encoder in ("nvenc", "software")
+    assert isinstance(reason, str)
+    if encoder == "software":
+        assert reason  # non-empty when fallback active
+
+
+def test_encoder_status_reports_reason_on_ffmpeg_missing(monkeypatch):
+    from src.core import ffmpeg_runner
+    # Reset cache for this test
+    ffmpeg_runner._nvenc_available.clear()
+    ffmpeg_runner._nvenc_reason.clear()
+
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg not found")
+
+    monkeypatch.setattr(ffmpeg_runner.subprocess, "run", fake_run)
+    encoder, reason = ffmpeg_runner.get_encoder_status()
+    assert encoder == "software"
+    assert "ffmpeg" in reason.lower()
