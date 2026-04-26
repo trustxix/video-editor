@@ -55,12 +55,7 @@ def test_export_with_trim(fixture_video, tmp_path):
 
 
 def test_export_with_crop(fixture_video, tmp_path):
-    """Crop 160x160 → output exactly 160x160.
-
-    Use 160x160 not 100x100 because NVENC has a hardware minimum frame size
-    (~145x49 for h264_nvenc). The smaller crop succeeds with libx264 but
-    fails on NVIDIA boxes with 'Frame Dimension less than the minimum
-    supported value'. See ffmpeg_runner._encode_args TODO."""
+    """Crop 160x160 → output exactly 160x160."""
     from src.core.ffmpeg_runner import build_command, run_export
     out = tmp_path / "out_crop.mp4"
     cmd = build_command(str(fixture_video), str(out),
@@ -71,6 +66,24 @@ def test_export_with_crop(fixture_video, tmp_path):
     assert vstream is not None
     assert vstream["width"] == 160
     assert vstream["height"] == 160
+
+
+def test_export_with_tiny_crop_falls_back_to_software(fixture_video, tmp_path):
+    """100×100 crop must produce a real, non-zero file. Before the dim-aware
+    fallback this test would silently fail on NVIDIA boxes (NVENC writes 0
+    bytes for sub-145×49 frames and ffmpeg returns InitializeEncoder error);
+    the software fallback in _encode_args now keeps the export healthy."""
+    from src.core.ffmpeg_runner import build_command, run_export
+    out = tmp_path / "out_tiny.mp4"
+    cmd = build_command(str(fixture_video), str(out),
+                        crop_x=10, crop_y=10, crop_w=100, crop_h=100)
+    rc = run_export(cmd, duration=5.0)
+    assert rc, "tiny-crop export reported failure (NVENC fallback regressed?)"
+    assert out.exists() and out.stat().st_size > 0
+    vstream = _video_stream(_ffprobe(out))
+    assert vstream is not None
+    assert vstream["width"] == 100
+    assert vstream["height"] == 100
 
 
 def test_export_with_speed_2x(fixture_video, tmp_path):

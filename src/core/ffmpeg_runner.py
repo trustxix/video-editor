@@ -71,13 +71,88 @@ def get_encoder_status() -> tuple[str, str]:
     return ("software", reason)
 
 
-def _encode_args(codec: str, crf: int, auto_preset: dict | None = None) -> list[str]:
-    """Build encoder arguments — auto-preset > NVENC > software fallback."""
+# NVENC hardware-minimum frame sizes (Turing+ generation).
+# h264_nvenc width minimum is documented at 145 px on Turing+ NVIDIA Developer
+# Forums; the empirical height limit is ~49 px. hevc_nvenc has a higher
+# minimum; we use 256×144 to also cover NVENC HEVC's smallest stable profile.
+# Below these dims the encoder accepts the frame but silently produces a
+# 0-byte output and ffmpeg returns an error — fall back to software here.
+NVENC_MIN_DIMS: dict[str, tuple[int, int]] = {
+    "h264_nvenc": (145, 49),
+    "hevc_nvenc": (256, 144),
+}
+
+
+def _below_nvenc_minimum(encoder: str, output_w: int | None, output_h: int | None) -> bool:
+    """True when an NVENC encoder would silently fail at the given output dim."""
+    if output_w is None or output_h is None:
+        return False
+    if "nvenc" not in encoder:
+        return False
+    min_w, min_h = NVENC_MIN_DIMS.get(encoder, (0, 0))
+    return output_w < min_w or output_h < min_h
+
+
+def _software_encode_args(codec: str, crf: int) -> list[str]:
+    sw = "libx265" if codec == "h265" else "libx264"
+    return ["-c:v", sw, "-preset", "medium", "-crf", str(crf)]
+
+
+def _effective_output_dims(
+    crop_w: int | None,
+    crop_h: int | None,
+    stretch_h: float = 1.0,
+    stretch_v: float = 1.0,
+) -> tuple[int | None, int | None]:
+    """Compute the effective post-filter output dimensions when knowable.
+
+    Returns (None, None) when the source dimension would be required (i.e.
+    no crop is applied), since callers don't generally probe the source
+    here. This matches the ``scale=trunc(iw*sh/2)*2`` filter used by
+    build_command — both the floor and the even-rounding apply post-stretch.
+    """
+    if crop_w is None or crop_h is None:
+        return (None, None)
+    eff_w = int(crop_w * stretch_h) // 2 * 2
+    eff_h = int(crop_h * stretch_v) // 2 * 2
+    return (max(eff_w, 0), max(eff_h, 0))
+
+
+def _encode_args(
+    codec: str,
+    crf: int,
+    auto_preset: dict | None = None,
+    output_w: int | None = None,
+    output_h: int | None = None,
+) -> list[str]:
+    """Build encoder arguments — auto-preset > NVENC > software fallback.
+
+    When ``output_w`` and ``output_h`` are supplied and below the NVENC hardware
+    minimum (see ``NVENC_MIN_DIMS``), forces software encoding regardless of
+    auto-preset or NVENC availability — without this the encoder writes a
+    0-byte file and the export silently fails. Callers without dim info pass
+    None/None and the historical probe-NVENC-or-software path is preserved.
+    """
+    # Determine which encoder we'd actually emit, so the dim check is
+    # consistent across the auto-preset and probe paths.
+    if auto_preset:
+        target_encoder = str(auto_preset.get("encoder", "libx264"))
+    else:
+        target_encoder = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
+
+    if _below_nvenc_minimum(target_encoder, output_w, output_h):
+        log().info(
+            f"Output {output_w}x{output_h} below {target_encoder} hardware "
+            f"minimum {NVENC_MIN_DIMS[target_encoder]}; using software encoder"
+        )
+        return _software_encode_args(codec, crf)
+
     # Auto-optimized preset from FFmpeg AutoResearch takes priority
     if auto_preset:
         from src.core.auto_presets import get_encode_args
         return get_encode_args(auto_preset)
-    nvenc = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
+
+    nvenc = target_encoder  # already h264_nvenc / hevc_nvenc here
     if _has_nvenc(nvenc):
         return [
             "-c:v", nvenc,
@@ -87,8 +162,7 @@ def _encode_args(codec: str, crf: int, auto_preset: dict | None = None) -> list[
             "-cq", str(crf),
         ]
     # Software fallback — works on any machine
-    sw = "libx265" if codec == "h265" else "libx264"
-    return ["-c:v", sw, "-preset", "medium", "-crf", str(crf)]
+    return _software_encode_args(codec, crf)
 
 
 def _build_speed_audio_filter(speed: float) -> str:
@@ -308,7 +382,13 @@ def build_command(
 
     if vfilters:
         cmd += ["-vf", ",".join(vfilters)]
-        cmd += _encode_args(codec, crf, auto_preset)
+        # Compute the effective output dimensions when known so _encode_args
+        # can detect NVENC's hardware minimum and fall back to software.
+        # Only the crop path supplies dims here — stretch-only without crop
+        # would need source dim, which build_command doesn't take, so we
+        # pass None and the original probe-then-NVENC behavior applies.
+        eff_w, eff_h = _effective_output_dims(crop_w, crop_h, stretch_h, stretch_v)
+        cmd += _encode_args(codec, crf, auto_preset, output_w=eff_w, output_h=eff_h)
     else:
         # No video modifications — stream copy (zero quality loss)
         cmd += ["-c:v", "copy"]
@@ -588,7 +668,11 @@ def export_with_automation(
             "-filter_complex", filter_complex,
             "-map", final_map,
         ]
-        cmd += _encode_args(codec, crf, auto_preset)
+        # Same hardware-min guard as build_command: when the effective output
+        # dim is below NVENC's threshold, software encode instead of silently
+        # producing 0-byte output.
+        eff_w, eff_h = _effective_output_dims(crop_w, crop_h, stretch_h, stretch_v)
+        cmd += _encode_args(codec, crf, auto_preset, output_w=eff_w, output_h=eff_h)
         cmd += ["-an", video_out]
 
         ok = run_export(

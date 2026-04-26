@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.ffmpeg_runner import (
     _build_speed_audio_filter,
+    _encode_args,
     _sanitize_suffix,
     build_command,
     get_output_path,
@@ -225,6 +226,127 @@ def test_encoder_status_reports_reason_on_ffmpeg_missing(monkeypatch):
     encoder, reason = ffmpeg_runner.get_encoder_status()
     assert encoder == "software"
     assert "ffmpeg" in reason.lower()
+
+
+# ─── NVENC hardware-minimum frame-size fallback ───────────────────────────
+# NVENC silently produces 0-byte output when frame dimensions are below the
+# hardware minimum. Per NVIDIA Video Codec SDK (Turing+), h264_nvenc requires
+# width ≥ 145 px; hevc_nvenc requires roughly double (≥ 256 wide × 144 tall)
+# to cover NVENC's HEVC profile minimum.
+# Source: NVIDIA Developer Forums "Minimum Width in Turing GPUs?" + the
+# project's empirical 100×100 / 145×49 testing during the 2026-04-26
+# mass-distribution-readiness pass.
+
+def test_encode_args_falls_back_to_software_below_h264_nvenc_min(monkeypatch):
+    """Output below h264_nvenc 145×49 minimum must use libx264 even when NVENC
+    is available — otherwise the encoder silently produces 0-byte output."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    args = _encode_args("h264", crf=17, output_w=100, output_h=100)
+    assert "h264_nvenc" not in args, f"Expected software fallback for 100×100, got {args}"
+    assert "libx264" in args
+
+
+def test_encode_args_falls_back_to_software_below_hevc_nvenc_min(monkeypatch):
+    """hevc_nvenc has a higher minimum than h264_nvenc (≥256×144). A 200×100
+    output must use libx265 when h265 is requested."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "hevc_nvenc", True)
+    args = _encode_args("h265", crf=20, output_w=200, output_h=100)
+    assert "hevc_nvenc" not in args, f"Expected software fallback for 200×100 hevc, got {args}"
+    assert "libx265" in args
+
+
+def test_encode_args_uses_nvenc_when_above_min_dim(monkeypatch):
+    """Sanity / regression guard: 1920×1080 with NVENC available must still use
+    h264_nvenc — the dim-aware fallback must not over-trigger."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    args = _encode_args("h264", crf=17, output_w=1920, output_h=1080)
+    assert "h264_nvenc" in args
+
+
+def test_encode_args_no_dim_hint_preserves_existing_behavior(monkeypatch):
+    """When the caller does not pass output dims, _encode_args falls through to
+    its original probe-NVENC-or-software logic — backward compatibility."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    # No output_w/output_h passed
+    args = _encode_args("h264", crf=17)
+    assert "h264_nvenc" in args
+
+
+def test_encode_args_auto_preset_with_small_dim_falls_back_to_software(monkeypatch):
+    """Auto-preset path also respects the hardware minimum: a small output with
+    an NVENC auto-preset still falls back to software."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    auto_preset = {
+        "codec": "h264",
+        "encoder": "h264_nvenc",
+        "encoder_preset": "p5",
+        "crf": 23,
+    }
+    args = _encode_args("h264", crf=17, auto_preset=auto_preset, output_w=100, output_h=100)
+    assert "h264_nvenc" not in args, f"Expected fallback for auto-preset NVENC + small dim, got {args}"
+    assert "libx264" in args
+
+
+def test_encode_args_auto_preset_software_unaffected_by_dim_check(monkeypatch):
+    """A software auto-preset (libx264) with a small output should pass through
+    unchanged — the dim check only redirects NVENC encoders."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    auto_preset = {
+        "codec": "h264",
+        "encoder": "libx264",
+        "encoder_preset": "slow",
+        "crf": 23,
+    }
+    args = _encode_args("h264", crf=17, auto_preset=auto_preset, output_w=100, output_h=100)
+    assert "libx264" in args
+    # The encoder_preset from the auto-preset should be preserved
+    assert "slow" in args
+
+
+def test_build_command_small_crop_uses_software_encoder(monkeypatch):
+    """End-to-end: build_command with a 100×100 crop must produce a libx264
+    argv even when NVENC is available — covers the user-visible bug path."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    cmd = build_command(
+        "in.mp4", "out.mp4",
+        crop_x=10, crop_y=10, crop_w=100, crop_h=100,
+        codec="h264", crf=17,
+    )
+    assert "libx264" in cmd, f"Expected libx264 for 100×100 crop, got: {cmd}"
+    assert "h264_nvenc" not in cmd
+
+
+def test_build_command_full_hd_crop_uses_nvenc(monkeypatch):
+    """Regression guard: a normal 1280×720 crop with NVENC available must still use NVENC."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    cmd = build_command(
+        "in.mp4", "out.mp4",
+        crop_x=0, crop_y=0, crop_w=1280, crop_h=720,
+        codec="h264", crf=17,
+    )
+    assert "h264_nvenc" in cmd
+
+
+def test_build_command_small_crop_with_stretch_uses_software(monkeypatch):
+    """A 200×200 crop stretched to 0.5×0.5 → 100×100 effective → must use software."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    cmd = build_command(
+        "in.mp4", "out.mp4",
+        crop_x=0, crop_y=0, crop_w=200, crop_h=200,
+        stretch_h=0.5, stretch_v=0.5,
+        codec="h264", crf=17,
+    )
+    assert "libx264" in cmd, f"Expected libx264 for 100×100 effective output, got: {cmd}"
+    assert "h264_nvenc" not in cmd
 
 
 # ─── Output path traversal guard (Phase 1.6) ──────────────────────────────
