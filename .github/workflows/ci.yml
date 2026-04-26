@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (windows-latest, Python 3.14)
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install FFmpeg (needed by E2E export tests)
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress --yes
+          ffmpeg -version
+
+      - name: Install pinned Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest tests/ -v --tb=short --ignore=tests/test_player_polish.py
+
+      - name: Compile-check standalone main.py + entry imports
+        run: |
+          python -m py_compile main.py
+          python -c "from src.core import ffmpeg_runner, log_setup, paths, auto_presets, speed_curve; print('imports OK')"
+
+  build_smoke:
+    name: Build smoke test (PyInstaller dry run)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run PyInstaller (no FFmpeg fetch — too slow for CI)
+        shell: cmd
+        run: |
+          pyinstaller ^
+            --name "Video Editor" ^
+            --windowed ^
+            --noconfirm ^
+            --clean ^
+            --contents-directory "lib" ^
+            --icon "assets\icon.ico" ^
+            --add-data "assets\icon.ico;assets" ^
+            --collect-submodules PyQt6 ^
+            --hidden-import PyQt6.QtMultimedia ^
+            --hidden-import PyQt6.QtMultimediaWidgets ^
+            main.py
+
+      - name: Verify build artifact
+        shell: pwsh
+        run: |
+          $exe = "dist\Video Editor\Video Editor.exe"
+          if (-not (Test-Path $exe)) { throw "Build artifact missing: $exe" }
+          $sz = [math]::Round((Get-ChildItem "dist\Video Editor" -Recurse | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "Bundle size: $sz MB (without FFmpeg)"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-editor-bundle-no-ffmpeg
+          path: dist/Video Editor/
+          retention-days: 7
