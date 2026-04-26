@@ -65,7 +65,23 @@ try {
 # Record SHA256 of what we got. BtbN does not publish per-asset hashes in the
 # release JSON, but the asset URL is HTTPS+TLS-pinned by github.com so the
 # integrity is bounded by GitHub's TLS chain. We log the hash for audit/debug.
-$sha = (Get-FileHash -Path $tempZip -Algorithm SHA256).Hash
+# Get-FileHash has shown up missing in some -NoProfile invocations; fall back
+# to a .NET hash so a stripped-down PS environment doesn't fail the build.
+$sha = $null
+try {
+    $sha = (Get-FileHash -Path $tempZip -Algorithm SHA256).Hash
+} catch {
+    Write-Host "[fetch_ffmpeg] Get-FileHash unavailable; using .NET SHA256 fallback"
+    try {
+        $stream = [System.IO.File]::OpenRead($tempZip)
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        $sha = -join ($hasher.ComputeHash($stream) | ForEach-Object { $_.ToString("X2") })
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        if ($hasher) { $hasher.Dispose() }
+    }
+}
+if (-not $sha) { $sha = "(unavailable)" }
 Write-Host "[fetch_ffmpeg] SHA256: $sha"
 
 # Extract
