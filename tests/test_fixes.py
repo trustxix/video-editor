@@ -108,8 +108,11 @@ cmd = build_command(
 )
 vf = cmd[cmd.index('-vf') + 1]
 test("Combined: all video filters", 'crop=' in vf and 'scale=' in vf and 'setpts=' in vf)
-test("Combined: h265 codec", 'libx265' in cmd)
-test("Combined: lossless CRF", cmd[cmd.index('-crf') + 1] == '0')
+# H.265: libx265 (software) OR hevc_nvenc (GPU). Either is acceptable.
+test("Combined: h265 codec", 'libx265' in cmd or 'hevc_nvenc' in cmd)
+# Lossless: software emits -crf 0; NVENC emits -cq 0. Either is acceptable.
+quality_flag = '-crf' if '-crf' in cmd else '-cq'
+test("Combined: lossless quality", cmd[cmd.index(quality_flag) + 1] == '0')
 test("Combined: speed overrides reencode audio", '-af' in cmd)
 
 # Audio speed filter edge cases
