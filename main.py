@@ -50,9 +50,14 @@ def main():
     # under pythonw (no console) AND so logs users share in bug reports don't
     # leak their Windows username or home directory.
     from src.core.paths import get_config_dir
-    from src.core import log_setup
+    from src.core import log_setup, crash_reporter, version
     log_setup.init(get_config_dir())
-    log_setup.log().info("Application starting")
+    log_setup.log().info(f"Application starting v{version.VERSION}")
+
+    # Capture uncaught exceptions to local sanitized JSON dumps. Without this
+    # users can crash without us ever knowing. With opt-in SENTRY_DSN env var
+    # (and sentry-sdk installed) crashes also go upstream.
+    crash_reporter.install_global_handler()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

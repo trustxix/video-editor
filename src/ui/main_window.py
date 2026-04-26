@@ -1211,6 +1211,9 @@ class MainWindow(QMainWindow):
                 data["editor_keybinds"] = data.pop("keybinds")
             elif "keybinds" in data:
                 data.pop("keybinds", None)
+            # Versioned settings migration (adds defaults for new release fields).
+            from src.core.settings_migration import migrate
+            data = migrate(data)
             defaults.update(data)
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             pass
@@ -1259,8 +1262,14 @@ class MainWindow(QMainWindow):
             tmp = self._settings_path.with_suffix('.tmp')
             tmp.write_text(json.dumps(self._settings, indent=2, default=str))
             tmp.replace(self._settings_path)
-        except (OSError, ValueError):
-            pass  # read-only dir, full disk, locked file, bad data — silent, non-fatal
+        except (OSError, ValueError) as e:
+            # Surface to log so we can see settings-save failures in bug reports
+            # instead of silently dropping every preference change.
+            try:
+                from src.core.log_setup import log
+                log().warning(f"Settings save failed: {e}")
+            except Exception:
+                pass  # last-resort — never raise from settings save
 
     def _on_preview_volume_changed(self, value: int):
         """Persist preview volume when the user releases the slider.
