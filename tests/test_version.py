@@ -73,8 +73,7 @@ def test_check_for_update_offline_returns_none(monkeypatch):
 
 
 def test_check_for_update_returns_dict_when_newer(monkeypatch):
-    """Mock a JSON response advertising a higher version."""
-    import io
+    """Mock a JSON response advertising a higher version on a real github.com URL."""
     import urllib.request
     from src.core import version as version_mod
 
@@ -87,14 +86,48 @@ def test_check_for_update_returns_dict_when_newer(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *args): pass
 
-    fake_body = '{"latest": "9.9.9", "url": "https://example.invalid/r", "notes": "test"}'
+    fake_body = ('{"latest": "9.9.9", '
+                 '"url": "https://github.com/trustxix/video-editor/releases/tag/v9.9.9", '
+                 '"notes": "test"}')
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda req, timeout: FakeResponse(fake_body))
 
     result = check_for_update(current="0.0.1")
     assert result is not None
     assert result["latest"] == "9.9.9"
-    assert result["url"] == "https://example.invalid/r"
+    assert result["url"] == "https://github.com/trustxix/video-editor/releases/tag/v9.9.9"
+
+
+def test_check_for_update_strips_non_github_url(monkeypatch):
+    """Defense-in-depth: even if the latest.json points the user at a non-GitHub
+    URL (compromised CDN or hijacked repo), check_for_update must blank the
+    url field so the UI can't open it."""
+    import urllib.request
+    from src.core import version as version_mod
+
+    monkeypatch.setattr(version_mod, "UPDATE_URL",
+                        "https://example.invalid/latest.json")
+
+    class FakeResponse:
+        def __init__(self, body): self.body = body
+        def read(self): return self.body.encode("utf-8")
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+
+    # Adversarial payload: phishing URL where 'github.com' looks legit
+    for bad_url in [
+        "https://evil.example.com/login",
+        "http://github.com/trustxix/video-editor/releases/tag/v9",  # plain http, not https
+        "https://github.com.evil.example.com/r",                    # subdomain trick
+        "javascript:alert(1)",
+        "",
+    ]:
+        fake_body = (f'{{"latest": "9.9.9", "url": "{bad_url}", "notes": ""}}')
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout: FakeResponse(fake_body))
+        result = check_for_update(current="0.0.1")
+        assert result is not None, f"Expected dict result for url={bad_url!r}"
+        assert result["url"] == "", f"Expected url to be blanked for {bad_url!r}, got {result['url']!r}"
 
 
 def test_check_for_update_returns_none_when_same_or_older(monkeypatch):

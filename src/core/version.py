@@ -74,9 +74,15 @@ def check_for_update(
         return None
     if parse_version(latest) <= parse_version(current):
         return None
+    # Validate the URL before surfacing it to the UI — defends against a
+    # compromised raw.githubusercontent.com response steering the user to
+    # a non-GitHub site. We allow only github.com release URLs since
+    # that's the only legitimate target the JSON should ever produce.
+    raw_url = str(data.get("url", ""))
+    safe_url = raw_url if raw_url.startswith("https://github.com/") else ""
     return {
         "latest": latest,
-        "url":    str(data.get("url", "")),
+        "url":    safe_url,
         "notes":  str(data.get("notes", "")),
     }
 

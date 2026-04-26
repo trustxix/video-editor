@@ -17,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.core.ffmpeg_runner import (
     _build_speed_audio_filter,
     _encode_args,
+    _rotate_log_if_full,
     _sanitize_suffix,
+    _write_export_error,
     build_command,
     get_output_path,
     get_video_duration,
@@ -347,6 +349,49 @@ def test_build_command_small_crop_with_stretch_uses_software(monkeypatch):
     )
     assert "libx264" in cmd, f"Expected libx264 for 100×100 effective output, got: {cmd}"
     assert "h264_nvenc" not in cmd
+
+
+# ─── export_error.log sanitization + rotation ─────────────────────────────
+
+def test_write_export_error_sanitizes_paths(tmp_path, monkeypatch):
+    """export_error.log entries must redact the user's home and username so
+    a shared log doesn't leak filesystem layout."""
+    from src.core import paths as paths_mod
+    monkeypatch.setattr(paths_mod, "get_config_dir", lambda: tmp_path)
+
+    fake_username = "fakeuser"
+    monkeypatch.setenv("USERNAME", fake_username)
+
+    cmd = [
+        "ffmpeg", "-i", f"C:\\Users\\{fake_username}\\videos\\private clip.mkv",
+        "-c:v", "libx264", "out.mp4",
+    ]
+    _write_export_error(cmd, returncode=1, stderr_tail=[
+        f"failed reading C:\\Users\\{fake_username}\\videos\\private clip.mkv\n",
+    ])
+
+    log_path = tmp_path / "export_error.log"
+    assert log_path.exists(), "log was not written — check monkeypatch target"
+    log_text = log_path.read_text(encoding="utf-8")
+    assert fake_username not in log_text, f"username leaked: {log_text!r}"
+
+
+def test_rotate_log_if_full_renames_when_over_cap(tmp_path):
+    """When the log exceeds the cap, the next write rotates to .1 backup."""
+    from src.core.ffmpeg_runner import _EXPORT_ERROR_LOG_MAX
+    log = tmp_path / "export_error.log"
+    log.write_bytes(b"X" * (_EXPORT_ERROR_LOG_MAX + 100))
+    _rotate_log_if_full(log)
+    assert not log.exists()
+    assert (tmp_path / "export_error.log.1").exists()
+
+
+def test_rotate_log_if_full_no_op_when_small(tmp_path):
+    log = tmp_path / "export_error.log"
+    log.write_text("small content")
+    _rotate_log_if_full(log)
+    assert log.exists()
+    assert not (tmp_path / "export_error.log.1").exists()
 
 
 # ─── Output path traversal guard (Phase 1.6) ──────────────────────────────

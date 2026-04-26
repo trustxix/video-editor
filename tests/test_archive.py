@@ -8,7 +8,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.core import archive as archive_mod
 from src.core.archive import (
+    _MAX_COLLISION_ATTEMPTS,
     _unique_destination,
     archive_original,
     detect_relative_path,
@@ -123,3 +125,27 @@ def test_archive_original_missing_source_raises(tmp_path):
     archive_root = tmp_path / "archive"
     with pytest.raises(FileNotFoundError):
         archive_original(src, archive_root)
+
+
+# ─── _unique_destination overflow guard ───────────────────────────────────
+
+def test_unique_destination_caps_iterations(tmp_path, monkeypatch):
+    """If exists() always returns True (e.g. permission-denied target),
+    _unique_destination must raise instead of spinning forever."""
+    # Patch Path.exists across all paths to always claim "exists".
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+    target = tmp_path / "stuck.mkv"
+    with pytest.raises(RuntimeError, match=str(_MAX_COLLISION_ATTEMPTS)):
+        _unique_destination(target)
+
+
+def test_unique_destination_finds_within_cap(tmp_path):
+    """Sanity: when only a few colliding names exist, the function returns
+    the next free name well under the cap."""
+    target = tmp_path / "real.mkv"
+    target.touch()
+    (tmp_path / "real (1).mkv").touch()
+    (tmp_path / "real (2).mkv").touch()
+    result = _unique_destination(target)
+    assert result == tmp_path / "real (3).mkv"
+    assert not result.exists()

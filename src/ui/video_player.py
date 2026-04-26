@@ -35,22 +35,27 @@ class PitchedAudioPlayer:
         self._gen = 0
         self._automation = None  # set to AutomationLane for per-sample speed lookup
         self._extract_proc: subprocess.Popen | None = None  # current ffmpeg PCM extraction
+        # Guards _pcm and _extract_proc against races between the daemon
+        # extract thread (writes _pcm and _extract_proc) and the main
+        # thread (reads them in play/_feed/release).
+        self._lock = threading.Lock()
 
     def extract_audio(self, video_path: str):
         self.stop()
         # Kill any in-progress extraction before starting a new one —
         # without this, rapid navigation spawns N concurrent ffmpeg
         # processes that keep decoding audio for clips already left behind.
-        if self._extract_proc is not None:
-            try:
-                if self._extract_proc.poll() is None:
-                    self._extract_proc.terminate()
-            except Exception:
-                pass
-            self._extract_proc = None
-        self._pcm = None
-        self._gen += 1
-        gen = self._gen
+        with self._lock:
+            if self._extract_proc is not None:
+                try:
+                    if self._extract_proc.poll() is None:
+                        self._extract_proc.terminate()
+                except Exception:
+                    pass
+                self._extract_proc = None
+            self._pcm = None
+            self._gen += 1
+            gen = self._gen
         threading.Thread(
             target=self._do_extract, args=(video_path, gen), daemon=True
         ).start()
@@ -68,12 +73,26 @@ class PitchedAudioPlayer:
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 startupinfo=si,
             )
-            self._extract_proc = proc
+            with self._lock:
+                # Avoid stomping a newer extraction's proc reference.
+                if gen == self._gen:
+                    self._extract_proc = proc
             stdout, _ = proc.communicate()
-            if gen == self._gen and stdout:
-                a = array.array('h')
-                a.frombytes(stdout)
-                self._pcm = a
+            if stdout:
+                # Drop a dangling odd byte rather than crashing on a
+                # truncated PCM stream. The audio plays through to within
+                # one sample frame of the actual end either way.
+                rem = len(stdout) % 2  # array('h') itemsize
+                if rem:
+                    stdout = stdout[:-rem]
+            if not stdout:
+                return
+            a = array.array('h')
+            a.frombytes(stdout)
+            with self._lock:
+                # Only publish if no newer extraction has already started.
+                if gen == self._gen:
+                    self._pcm = a
         except Exception:
             pass
 
@@ -109,15 +128,19 @@ class PitchedAudioPlayer:
         self._timer.start(15)
 
     def _feed(self):
-        if not self._io or not self._pcm or not self._sink:
+        # Snapshot _pcm under the lock so the daemon thread can't swap it
+        # mid-loop. The local `pcm` reference keeps the array alive even if
+        # `self._pcm` gets reassigned right after this read.
+        with self._lock:
+            pcm = self._pcm
+        if not self._io or not pcm or not self._sink:
             return
         free = self._sink.bytesFree()
         n = min(960, free // self._FRAME_BYTES)
         if n <= 0:
             return
-        total = len(self._pcm) // self._CHANNELS
+        total = len(pcm) // self._CHANNELS
         out = array.array('h')
-        pcm = self._pcm
         pos = self._pos
         auto = self._automation
         has_auto = auto is not None and auto.get_keyframes()
@@ -131,7 +154,10 @@ class PitchedAudioPlayer:
                 speed = self._speed
             idx = int(pos)
             frac = pos - idx
-            if idx >= total - 1:
+            # Strict bound: we read pcm[b], pcm[b+1], pcm[b+2], pcm[b+3]
+            # where b = idx*2, so idx must be <= total-2 for all four to
+            # be in range. Past that we emit silence and stop.
+            if idx > total - 2:
                 out.extend([0] * (n - i) * 2)
                 break
             b = idx * 2
@@ -150,27 +176,32 @@ class PitchedAudioPlayer:
             self._sink = None
         self._io = None
 
-    @property
-    def ready(self) -> bool:
-        return bool(self._pcm)
-
     def release(self):
         self.stop()
         # Kill any in-progress audio extraction so the ffmpeg child doesn't
-        # outlive pythonw as an orphan.
-        if self._extract_proc is not None:
+        # outlive pythonw as an orphan. Snapshot under the lock so the
+        # daemon thread can't reassign the proc field while we're tearing
+        # it down.
+        with self._lock:
+            proc = self._extract_proc
+            self._extract_proc = None
+            self._pcm = None
+            self._gen += 1
+        if proc is not None:
             try:
-                if self._extract_proc.poll() is None:
-                    self._extract_proc.terminate()
+                if proc.poll() is None:
+                    proc.terminate()
                     try:
-                        self._extract_proc.wait(timeout=1)
+                        proc.wait(timeout=1)
                     except subprocess.TimeoutExpired:
-                        self._extract_proc.kill()
+                        proc.kill()
             except Exception:
                 pass
-            self._extract_proc = None
-        self._pcm = None
-        self._gen += 1
+
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return bool(self._pcm)
 
 
 class VideoSurface(QWidget):

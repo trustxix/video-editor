@@ -469,7 +469,19 @@ def prerender_audio(
                  "Audio extract produced no PCM data — export will have no audio")
         return False
     pcm = array.array('h')
-    pcm.frombytes(r.stdout)
+    # frombytes raises ValueError if len(stdout) is not a multiple of the
+    # element size — happens with truncated/corrupted PCM streams. Drop the
+    # tail bytes and surface a warning instead of crashing the export.
+    raw = r.stdout
+    elem = pcm.itemsize  # 2 for 'h'
+    rem = len(raw) % elem
+    if rem:
+        _surface(status_cb,
+                 f"Audio PCM has {rem} dangling byte(s); trimming — export will have audio")
+        raw = raw[:-rem]
+    pcm.frombytes(raw)
+    # Each audio frame is 2 channels * 2 bytes/channel = 4 bytes per stereo frame.
+    # In array('h') terms that's 2 array elements per frame.
     total_frames = len(pcm) // 2
 
     # Resample with automation — same algorithm as PitchedAudioPlayer._feed
@@ -477,7 +489,12 @@ def prerender_audio(
     end_pos = float(trim_end_ms * BASE_RATE / 1000)
     out = array.array('h')
 
-    while pos < end_pos and int(pos) < total_frames - 1:
+    # Loop bound: idx must be <= total_frames-2 so pcm[b+2]/pcm[b+3] are
+    # in range — the inner accesses use indices b, b+1, b+2, b+3 where
+    # b = idx*2. With idx == total_frames-2, b+3 == 2*total_frames-1, the
+    # last valid array index. Without this strict bound, an exact landing
+    # at idx == total_frames-1 reads past the array.
+    while pos < end_pos and int(pos) <= total_frames - 2:
         time_ms = pos * 1000 / BASE_RATE
         speed = lane.get_speed_at(int(time_ms))
         idx = int(pos)
@@ -598,17 +615,20 @@ def export_with_automation(
             audio_ok = prerender_audio(input_path, audio_wav, keyframes, base_speed,
                                        trim_start_ms, trim_end_ms)
             if not audio_ok:
-                # Log to export_error.log so the user can see why audio
-                # is missing — logger alone goes nowhere under pythonw.
+                # Surface to export_error.log via the same sanitized + size-
+                # capped writer used by run_export, so the user can see why
+                # audio is missing (and so admin/multi-user log inspection
+                # doesn't reveal usernames).
                 try:
-                    import datetime
-                    from src.core.paths import get_config_dir
-                    log_path = get_config_dir() / "export_error.log"
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"{'=' * 72}\n")
-                        f.write(f"TIMESTAMP: {datetime.datetime.now().isoformat()}\n")
-                        f.write(f"WARNING: Audio pre-render failed for {input_path}\n")
-                        f.write("Export will continue with video only (no audio).\n\n")
+                    from src.core.log_setup import sanitize_path
+                    _write_export_error(
+                        ["(audio pre-render)", sanitize_path(input_path)],
+                        returncode=-1,
+                        stderr_tail=[
+                            "WARNING: Audio pre-render failed; export will "
+                            "continue with video only (no audio).\n"
+                        ],
+                    )
                 except Exception:
                     pass
 
@@ -700,8 +720,16 @@ def export_with_automation(
                 cmd += ["-af", loudnorm_filter(wav_norm, target_lufs)]
             cmd += ["-c:a", "aac", "-b:a", "320k",
                     "-map", "0:v:0", "-map", "1:a:0", output_path]
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, startupinfo=_hide_window())
+            # Cap the mux at 10 minutes — stream-copy + AAC re-encode of an
+            # already-rendered file is fast (a few seconds typically), and a
+            # hung ffmpeg here would otherwise block the export thread forever.
+            try:
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, startupinfo=_hide_window(),
+                    timeout=600)
+            except subprocess.TimeoutExpired:
+                log().error("Mux step timed out (>10 min) — export aborted")
+                return False
             if proc.returncode != 0:
                 return False
 
@@ -984,15 +1012,88 @@ def extract_thumbnail(input_path: str, timestamp_s: float,
     return None
 
 
+# Cap export_error.log size — without this, a user who batch-exports
+# hundreds of clips with intermittent failures grows the log indefinitely.
+# 1 MB main + 1 MB rotated backup = 2 MB worst case on disk.
+_EXPORT_ERROR_LOG_MAX = 1_000_000
+# Hard ceiling on a single export run. Even a 10-minute clip on slow
+# hardware finishes within ~30x its duration; a process that's still
+# running after this cap is hung and would block the export thread forever.
+_EXPORT_RUNTIME_HARD_CAP_S = 60 * 60 * 4  # 4 hours absolute max
+
+
+def _rotate_log_if_full(path) -> None:
+    """If `path` exceeds _EXPORT_ERROR_LOG_MAX, rename it to `<path>.1` and
+    let the next write start a fresh file. Single backup; older content is
+    discarded. Best-effort — failures here must never raise during an
+    error-logging path."""
+    try:
+        if path.exists() and path.stat().st_size >= _EXPORT_ERROR_LOG_MAX:
+            backup = path.with_suffix(path.suffix + ".1")
+            try:
+                if backup.exists():
+                    backup.unlink()
+            except OSError:
+                pass
+            try:
+                path.rename(backup)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _write_export_error(cmd: list[str], returncode: int, stderr_tail: list[str]) -> None:
+    """Append a single failure record to config/export_error.log.
+
+    Sanitizes every argv element through `sanitize_path` so the log can be
+    shared for debugging without leaking the user's username or directory
+    layout. Rotates the file at _EXPORT_ERROR_LOG_MAX bytes.
+    """
+    try:
+        import datetime
+        from src.core.paths import get_config_dir
+        from src.core.log_setup import sanitize_path
+
+        log_path = get_config_dir() / "export_error.log"
+        _rotate_log_if_full(log_path)
+
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("=" * 72 + "\n")
+            f.write(f"TIMESTAMP: {datetime.datetime.now().isoformat()}\n")
+            f.write(f"EXIT CODE: {returncode}\n")
+            f.write("COMMAND:\n")
+            for arg in cmd:
+                clean = sanitize_path(arg)
+                # Quote args containing spaces so the log can be
+                # copy-pasted into a shell for manual reproduction.
+                if " " in clean or "(" in clean or "[" in clean:
+                    f.write(f'  "{clean}"\n')
+                else:
+                    f.write(f"  {clean}\n")
+            f.write("STDERR TAIL:\n")
+            f.write(sanitize_path("".join(stderr_tail)))
+            f.write("\n")
+    except Exception:
+        pass
+
+
 def run_export(cmd: list[str], duration: float, progress_callback=None, process_callback=None) -> bool:
     """Run ffmpeg and report progress via callback(percent: float).
 
     If process_callback is provided, it receives the Popen object for
-    external cancellation. On non-zero exit, writes the full command
-    and stderr tail to config/export_error.log so the user (and us)
-    can actually see why ffmpeg failed — the UI's "FFmpeg returned an
-    error" dialog alone is useless without the underlying message.
+    external cancellation. A wall-clock watchdog guarantees the call
+    returns even if ffmpeg hangs (rare but observed on driver
+    crashes / pipe stalls): after `max(60s, duration*30, hard cap)` of
+    runtime the child process is terminated and run_export returns False.
+
+    On non-zero exit, writes a sanitized + size-capped failure record to
+    config/export_error.log so the user (and us) can see why ffmpeg
+    failed — the UI's "FFmpeg returned an error" dialog alone is useless
+    without the underlying message.
     """
+    import threading
+
     process = subprocess.Popen(
         cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
         universal_newlines=True, encoding="utf-8", errors="replace",
@@ -1001,6 +1102,31 @@ def run_export(cmd: list[str], duration: float, progress_callback=None, process_
     if process_callback:
         process_callback(process)
 
+    # Watchdog: terminates the child if export runs longer than
+    # max(60s, duration * 30, hard cap). 30x is generous (worst real-world
+    # ratio observed: ~25x for 4K HEVC software encode on slow CPU); the
+    # hard cap protects long jobs from a runaway driver.
+    wd_seconds = max(60.0, duration * 30.0)
+    wd_seconds = min(wd_seconds, _EXPORT_RUNTIME_HARD_CAP_S)
+    watchdog_fired = {"value": False}
+
+    def _kill_runaway():
+        watchdog_fired["value"] = True
+        try:
+            if process.poll() is None:
+                log().error(f"Export watchdog fired after {wd_seconds:.0f}s — killing ffmpeg")
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(wd_seconds, _kill_runaway)
+    watchdog.daemon = True
+    watchdog.start()
+
     time_pattern = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
 
     # Bounded stderr tail — we only need the tail for failure diagnosis,
@@ -1008,44 +1134,34 @@ def run_export(cmd: list[str], duration: float, progress_callback=None, process_
     stderr_tail: list[str] = []
     MAX_TAIL = 80
 
-    for line in process.stderr:
-        stderr_tail.append(line)
-        if len(stderr_tail) > MAX_TAIL:
-            stderr_tail.pop(0)
-        match = time_pattern.search(line)
-        if match and duration > 0 and progress_callback:
-            h, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
-            frac_str = match.group(4)
-            frac = int(frac_str) / (10 ** len(frac_str))
-            current = h * 3600 + m * 60 + s + frac
-            pct = min(current / duration * 100, 100.0)
-            progress_callback(pct)
+    try:
+        for line in process.stderr:
+            stderr_tail.append(line)
+            if len(stderr_tail) > MAX_TAIL:
+                stderr_tail.pop(0)
+            match = time_pattern.search(line)
+            if match and duration > 0 and progress_callback:
+                h, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                frac_str = match.group(4)
+                frac = int(frac_str) / (10 ** len(frac_str))
+                current = h * 3600 + m * 60 + s + frac
+                pct = min(current / duration * 100, 100.0)
+                progress_callback(pct)
 
-    process.wait()
+        process.wait()
+    finally:
+        watchdog.cancel()
+
+    if watchdog_fired["value"]:
+        # Treat watchdog kill as a failure with a synthetic stderr line so
+        # the user sees something meaningful in the error log.
+        stderr_tail.append(f"[watchdog] export aborted after {wd_seconds:.0f}s\n")
+        _write_export_error(cmd, process.returncode if process.returncode is not None else -1,
+                            stderr_tail)
+        return False
 
     if process.returncode != 0:
-        # Persist the failure so the user can report it or we can debug.
-        try:
-            import datetime
-            from src.core.paths import get_config_dir
-            log_path = get_config_dir() / "export_error.log"
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write("=" * 72 + "\n")
-                f.write(f"TIMESTAMP: {datetime.datetime.now().isoformat()}\n")
-                f.write(f"EXIT CODE: {process.returncode}\n")
-                f.write("COMMAND:\n")
-                for arg in cmd:
-                    # Quote args containing spaces so the log can be
-                    # copy-pasted into a shell for manual reproduction.
-                    if " " in arg or "(" in arg or "[" in arg:
-                        f.write(f'  "{arg}"\n')
-                    else:
-                        f.write(f"  {arg}\n")
-                f.write("STDERR TAIL:\n")
-                f.write("".join(stderr_tail))
-                f.write("\n")
-        except Exception:
-            pass
+        _write_export_error(cmd, process.returncode, stderr_tail)
         return False
 
     return True

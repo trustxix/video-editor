@@ -31,18 +31,29 @@ def detect_relative_path(file_path: Path) -> Path | None:
     return None
 
 
+_MAX_COLLISION_ATTEMPTS = 10000
+
+
 def _unique_destination(dest: Path) -> Path:
     """Append ' (N)' before the extension until the path doesn't exist.
-    Mirrors the collision policy in sort_clips.ps1 for consistency."""
+    Mirrors the collision policy in sort_clips.ps1 for consistency.
+
+    Raises RuntimeError if no unique name is found within
+    _MAX_COLLISION_ATTEMPTS — this prevents an infinite hang when the
+    target dir is permission-denied or has corrupted metadata that makes
+    every `exists()` return True.
+    """
     if not dest.exists():
         return dest
     stem, suffix = dest.stem, dest.suffix
-    n = 1
-    while True:
+    for n in range(1, _MAX_COLLISION_ATTEMPTS + 1):
         candidate = dest.with_name(f"{stem} ({n}){suffix}")
         if not candidate.exists():
             return candidate
-        n += 1
+    raise RuntimeError(
+        f"Could not find a unique name for {dest} after "
+        f"{_MAX_COLLISION_ATTEMPTS} attempts (target dir may be inaccessible)"
+    )
 
 
 def archive_original(
