@@ -1,0 +1,72 @@
+# Universal .claudeignore — safe for ALL project types
+# Only excludes things that are NEVER useful for Claude to read
+# Does NOT exclude project-specific items
+
+# Git internals (Claude uses git CLI, never needs raw objects)
+.git/
+
+# Package manager caches and dependencies
+node_modules/
+.npm/
+.yarn/
+.pnpm-store/
+bower_components/
+vendor/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.tox/
+.eggs/
+*.egg-info/
+
+# Build output (generated, not source)
+dist/
+build/
+out/
+target/
+*.min.js
+*.min.css
+*.bundle.js
+*.chunk.js
+
+# Source maps (generated, large)
+*.map
+*.js.map
+*.css.map
+
+# Test coverage output
+coverage/
+.nyc_output/
+htmlcov/
+
+# IDE/editor artifacts
+.idea/
+.vscode/settings.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Lock files (large, generated, not useful for understanding code)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+Pipfile.lock
+poetry.lock
+composer.lock
+Gemfile.lock
+Cargo.lock
+
+# OS artifacts
+$RECYCLE.BIN/
+System Volume Information/
