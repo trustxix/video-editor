@@ -9,6 +9,7 @@ widget alongside the editor. It manages its own QMediaPlayer instance
 so switching modes doesn't disrupt the editor's player state.
 """
 
+import math
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -20,11 +21,13 @@ from PyQt6.QtCore import (
     Qt, QUrl, QDir, QSortFilterProxyModel, QModelIndex, pyqtSignal, QTimer,
 )
 from PyQt6.QtGui import (
-    QFileSystemModel, QPainter, QColor, QFont,
+    QFileSystemModel, QPainter, QColor, QFont, QImage, QLinearGradient,
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 
-from src.ui.widgets import ClickSlider
+from src.ui.widgets import ClickSlider, CompactVolumeControl
+from src.ui.seek_bar import SeekBar
+from src.ui.thumbnail_worker import ThumbnailWorker, FirstFramePreloader
 from src.core.ffmpeg_runner import probe_video, _probe_cache
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
@@ -59,6 +62,18 @@ class _PlayerSurface(QWidget):
         self._osd_timer = QTimer(self)
         self._osd_timer.setInterval(50)
         self._osd_timer.timeout.connect(self._osd_tick)
+        self._osd_primary = False  # large center icon flash mode
+
+        # Loading spinner state
+        self._loading = False
+        self._spinner_angle = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(60)
+        self._spinner_timer.timeout.connect(self._spinner_tick)
+
+        # Title overlay (shown at top during fullscreen with controls)
+        self._title_text = ""
+        self._title_visible = False
 
         # Click detection (single vs double)
         self._click_timer = QTimer(self)
@@ -66,15 +81,21 @@ class _PlayerSurface(QWidget):
         self._click_timer.setInterval(QApplication.doubleClickInterval())
         self._click_timer.timeout.connect(self.clicked.emit)
 
-    def show_osd(self, text: str, duration_ms: int | None = None):
-        """Show OSD text that fades out after duration."""
+    OSD_FADE_IN_MS = 140
+    OSD_FADE_OUT_MS = 380
+
+    def show_osd(self, text: str, duration_ms: int | None = None,
+                 primary: bool = False):
+        """Show OSD text. Fades in over ~140ms, holds, fades out over
+        the last ~380ms of `duration_ms`. `primary=True` uses a large
+        centered chip (for play/pause/mute); otherwise corner toast."""
         self._osd_text = text
-        self._osd_opacity = 1.0
+        self._osd_primary = primary
+        self._osd_opacity = 0.0
         dur = duration_ms if duration_ms is not None else self._osd_duration
-        # Calculate fade step: fade over the last 400ms of the duration
-        self._osd_fade_start = max(0, dur - 400)
+        self._osd_total = max(self.OSD_FADE_IN_MS + self.OSD_FADE_OUT_MS, dur)
+        self._osd_fade_start = self._osd_total - self.OSD_FADE_OUT_MS
         self._osd_elapsed = 0
-        self._osd_total = dur
         self._osd_timer.start()
         self.update()
 
@@ -87,18 +108,64 @@ class _PlayerSurface(QWidget):
             self._osd_timer.stop()
             self._osd_text = ""
             self._osd_opacity = 0.0
+            self._osd_primary = False
+        elif self._osd_elapsed < self.OSD_FADE_IN_MS:
+            self._osd_opacity = self._osd_elapsed / self.OSD_FADE_IN_MS
         elif self._osd_elapsed >= self._osd_fade_start:
-            # Fade out over the last 400ms
             remaining = self._osd_total - self._osd_elapsed
-            self._osd_opacity = max(0.0, remaining / 400.0)
+            self._osd_opacity = max(0.0, remaining / self.OSD_FADE_OUT_MS)
+        else:
+            self._osd_opacity = 1.0
         self.update()
 
     def _on_frame(self, frame: QVideoFrame):
-        self._image = frame.toImage()
+        img = frame.toImage()
+        if img.isNull():
+            # Don't overwrite a placeholder/preload image with a null
+            # frame — QVideoSink emits these briefly between setSource
+            # calls, which would erase our preloaded first-frame.
+            return
+        self._image = img
+        self.update()
+
+    def set_placeholder_image(self, img: QImage | None) -> None:
+        """Paint a placeholder image (e.g. preloaded first frame) until
+        the next QVideoSink frame arrives. Pass None to clear."""
+        if img is None or img.isNull():
+            return
+        self._image = img
+        self.update()
+
+    def set_loading(self, state: bool) -> None:
+        """Show/hide the loading spinner overlay."""
+        if state == self._loading:
+            return
+        self._loading = state
+        if state:
+            self._spinner_timer.start()
+        else:
+            self._spinner_timer.stop()
+        self.update()
+
+    def _spinner_tick(self):
+        self._spinner_angle = (self._spinner_angle + 45) % 360
+        self.update()
+
+    def set_title(self, text: str) -> None:
+        if text != self._title_text:
+            self._title_text = text
+            if self._title_visible:
+                self.update()
+
+    def set_title_visible(self, visible: bool) -> None:
+        if visible == self._title_visible:
+            return
+        self._title_visible = visible
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), Qt.GlobalColor.black)
         if self._image and not self._image.isNull():
             iw, ih = self._image.width(), self._image.height()
@@ -134,25 +201,101 @@ class _PlayerSurface(QWidget):
                     Qt.TransformationMode.SmoothTransformation,
                 ))
 
+        # Loading spinner overlay
+        if self._loading:
+            self._draw_spinner(p)
+
+        # Title overlay (top fade with filename, fullscreen reveal)
+        if self._title_visible and self._title_text:
+            self._draw_title(p)
+
         # OSD overlay
         if self._osd_text and self._osd_opacity > 0:
-            p.save()
-            p.setOpacity(self._osd_opacity)
-            font = QFont("sans-serif", 16)
+            self._draw_osd(p)
+
+        p.end()
+
+    def _draw_spinner(self, p: QPainter) -> None:
+        # Subtle vignette so the spinner reads on bright frames
+        p.fillRect(self.rect(), QColor(0, 0, 0, 90))
+        cx, cy = self.width() // 2, self.height() // 2
+        radius = 22
+        dot_r = 4
+        lead = (self._spinner_angle // 45) % 8
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(8):
+            offset = (i - lead) % 8
+            opacity = max(0.18, 1.0 - offset * 0.11)
+            theta = math.radians(i * 45 - 90)
+            x = int(cx + radius * math.cos(theta))
+            y = int(cy + radius * math.sin(theta))
+            p.setBrush(QColor(255, 255, 255, int(opacity * 235)))
+            p.drawEllipse(QPoint(x, y), dot_r, dot_r)
+        # "Loading..." caption
+        p.setPen(QColor(220, 220, 220))
+        font = QFont("sans-serif", 10)
+        p.setFont(font)
+        fm = p.fontMetrics()
+        text = "Loading…"
+        tw = fm.horizontalAdvance(text)
+        p.drawText(cx - tw // 2, cy + radius + 24, text)
+
+    def _draw_title(self, p: QPainter) -> None:
+        # Top fade band with filename. Sized to ~56px tall.
+        h = 56
+        grad = QLinearGradient(0, 0, 0, h)
+        grad.setColorAt(0.0, QColor(0, 0, 0, 200))
+        grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.fillRect(0, 0, self.width(), h, grad)
+        font = QFont("sans-serif", 12)
+        font.setBold(True)
+        p.setFont(font)
+        p.setPen(QColor(245, 245, 245))
+        p.drawText(
+            16, 0, self.width() - 32, h,
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            self._title_text,
+        )
+
+    def _draw_osd(self, p: QPainter) -> None:
+        p.save()
+        p.setOpacity(self._osd_opacity)
+        if self._osd_primary:
+            # Large centered chip — used for primary actions like
+            # play/pause/mute toggles. Rounded background + bold text.
+            font = QFont("sans-serif", 22)
             font.setBold(True)
             p.setFont(font)
             fm = p.fontMetrics()
             text_w = fm.horizontalAdvance(self._osd_text)
             text_h = fm.height()
-            pad = 10
-            ox, oy = 20, 20
-            p.fillRect(ox, oy, text_w + pad * 2, text_h + pad * 2,
-                        QColor(0, 0, 0, 180))
+            pad_x, pad_y = 24, 14
+            chip_w = text_w + pad_x * 2
+            chip_h = text_h + pad_y * 2
+            cx = (self.width() - chip_w) // 2
+            cy = (self.height() - chip_h) // 2
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 200))
+            p.drawRoundedRect(cx, cy, chip_w, chip_h, 10, 10)
             p.setPen(QColor(255, 255, 255))
+            p.drawText(cx + pad_x, cy + pad_y + fm.ascent(), self._osd_text)
+        else:
+            # Corner toast — used for status updates (volume, seek, speed)
+            font = QFont("sans-serif", 13)
+            font.setBold(True)
+            p.setFont(font)
+            fm = p.fontMetrics()
+            text_w = fm.horizontalAdvance(self._osd_text)
+            text_h = fm.height()
+            pad = 9
+            ox, oy = 18, 18
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 195))
+            p.drawRoundedRect(ox, oy, text_w + pad * 2, text_h + pad * 2,
+                              6, 6)
+            p.setPen(QColor(245, 245, 245))
             p.drawText(ox + pad, oy + pad + fm.ascent(), self._osd_text)
-            p.restore()
-
-        p.end()
+        p.restore()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -336,29 +479,27 @@ class PlayerMode(QWidget):
         self.lbl_speed.setAlignment(Qt.AlignmentFlag.AlignCenter)
         controls.addWidget(self.lbl_speed)
 
-        # Seek bar (with hover timestamp tooltip)
-        self.seek_slider = ClickSlider(Qt.Orientation.Horizontal)
+        # Seek bar with hover thumbnail preview + A-B markers + played fill
+        self.seek_slider = SeekBar(Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.seek_slider.setMouseTracking(True)
         self.seek_slider.installEventFilter(self)
         controls.addWidget(self.seek_slider, stretch=1)
 
-        # Volume
-        self._vol_icon = QLabel()
-        self._vol_icon.setPixmap(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume).pixmap(16, 16)
+        # Volume — compact control: clickable icon + slider that fades
+        # in on hover. Container width is fixed so the seek bar never
+        # reflows during the animation.
+        self._vol_widget = CompactVolumeControl()
+        self._vol_widget.set_icon_pixmap(
+            self.style().standardIcon(
+                QStyle.StandardPixmap.SP_MediaVolume).pixmap(16, 16)
         )
-        controls.addWidget(self._vol_icon)
-        self.vol_slider = ClickSlider(Qt.Orientation.Horizontal)
-        self.vol_slider.setRange(0, 100)
-        self.vol_slider.setValue(100)
-        self.vol_slider.setFixedWidth(80)
-        self.vol_slider.setFixedHeight(16)
-        self.vol_slider.setStyleSheet("""
-            QSlider::groove:horizontal { height: 3px; }
-            QSlider::handle:horizontal { width: 8px; margin: -3px 0; border-radius: 4px; }
-        """)
-        controls.addWidget(self.vol_slider)
+        # Aliases so existing code keeps working unchanged
+        self.vol_slider = self._vol_widget.slider
+        self._vol_icon = self._vol_widget.icon
+        # Click on icon = toggle mute
+        self._vol_widget.icon_clicked.connect(self.toggle_mute)
+        controls.addWidget(self._vol_widget)
 
         cv.addWidget(self._controls_widget)
 
@@ -474,6 +615,18 @@ class PlayerMode(QWidget):
         self._duration_ms = 0
         self._seeking = False
 
+        # Background thumbnail extractor for seek-bar hover preview
+        self._thumb_worker = ThumbnailWorker(self)
+        self._thumb_worker.start()
+        self.seek_slider.set_thumbnail_worker(self._thumb_worker)
+
+        # Background pre-extractor for the next playlist file's first frame
+        self._preloader = FirstFramePreloader(self)
+        self._preloader.ready.connect(self._on_preload_ready)
+        self._preloader.start()
+        self._preload_cache: dict[str, QImage] = {}  # path -> first frame
+        self._preload_requested_for: str | None = None
+
     def _connect_signals(self):
         self._dir_tree.clicked.connect(self._on_dir_clicked)
         self._file_list.doubleClicked.connect(self._on_file_double_clicked)
@@ -564,21 +717,10 @@ class PlayerMode(QWidget):
             self._navigate_to_dir(path)
 
     def eventFilter(self, obj, event):
-        """Handle seek slider tooltip and wheel events."""
+        """Intercept wheel events on the seek bar for configurable step seek.
+        Hover-time tooltip is now handled by SeekBar's thumbnail popup."""
         if obj is self.seek_slider:
-            if event.type() == event.Type.MouseMove:
-                if self._duration_ms > 0:
-                    from PyQt6.QtWidgets import QToolTip
-                    from PyQt6.QtCore import QPoint
-                    w = self.seek_slider.width()
-                    x = event.position().x()
-                    ratio = max(0.0, min(1.0, x / w))
-                    ms = int(ratio * self._duration_ms)
-                    QToolTip.showText(
-                        self.seek_slider.mapToGlobal(QPoint(int(x), -25)),
-                        self._fmt(ms), self.seek_slider)
-            elif event.type() == event.Type.Wheel and self._duration_ms > 0:
-                # Intercept wheel on seek bar — seek by configured step
+            if event.type() == event.Type.Wheel and self._duration_ms > 0:
                 delta = event.angleDelta().y()
                 steps = delta // 120
                 if steps:
@@ -901,6 +1043,7 @@ class PlayerMode(QWidget):
             self._controls_widget.setVisible(False)
             self._nav_widget.setVisible(False)
             self.lbl_info.setVisible(False)
+            self.surface.set_title_visible(False)
             self._fs_start_autohide()
         else:
             # Exiting fullscreen — show everything, stop timers
@@ -909,6 +1052,7 @@ class PlayerMode(QWidget):
             self._controls_widget.setVisible(True)
             self._nav_widget.setVisible(True)
             self.lbl_info.setVisible(True)
+            self.surface.set_title_visible(False)
             self.surface.setCursor(Qt.CursorShape.ArrowCursor)
         self.fullscreen_changed.emit(self._fullscreen)
 
@@ -943,6 +1087,7 @@ class PlayerMode(QWidget):
         self._controls_widget.setVisible(False)
         self._nav_widget.setVisible(False)
         self.lbl_info.setVisible(False)
+        self.surface.set_title_visible(False)
 
     def _fs_hide_cursor(self):
         """Timer fired — hide cursor in fullscreen."""
@@ -953,11 +1098,12 @@ class PlayerMode(QWidget):
         """Mouse moved on surface — show controls and restart timers."""
         if not self._fullscreen:
             return
-        # Show controls
+        # Show controls + top title overlay
         if self._settings.get("player_controls_autohide", True):
             self._controls_widget.setVisible(True)
             self._nav_widget.setVisible(True)
             self.lbl_info.setVisible(True)
+            self.surface.set_title_visible(True)
             self._fs_controls_timer.start()
         # Restore cursor
         if self._settings.get("player_cursor_hide", True):
@@ -976,14 +1122,27 @@ class PlayerMode(QWidget):
         self.player.stop()
         self.player.setSource(QUrl())
         self._current_path = path
+
+        # If we preloaded this file's first frame, paint it immediately
+        # so the surface doesn't black-flash while QMediaPlayer loads.
+        preloaded = self._preload_cache.pop(path, None)
+        if preloaded is not None:
+            self.surface.set_placeholder_image(preloaded)
+
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
+        # Cancel any in-flight preload request that's no longer relevant
+        self._preload_requested_for = None
 
         # Reset speed and A-B loop for new file
         self._current_speed = 1.0
         self.player.setPlaybackRate(1.0)
         self._update_speed_label()
         self._loop_a_ms = self._loop_b_ms = None
+
+        # Update seek bar context (path + clear markers)
+        self.seek_slider.set_current_path(path)
+        self.seek_slider.set_ab_markers(None, None)
 
         # Update playlist index
         if path in self._playlist:
@@ -993,6 +1152,7 @@ class PlayerMode(QWidget):
         self._update_nav()
         self._update_info()
         self.title_changed.emit(Path(path).name)
+        self.surface.set_title(Path(path).name)
 
         # Resume saved position (guard against rapid file switching)
         if self._settings.get("player_remember_positions", False):
@@ -1011,9 +1171,11 @@ class PlayerMode(QWidget):
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
+            self._show_osd("Paused", primary=True)
         else:
             if self._current_path:
                 self.player.play()
+                self._show_osd("Play", primary=True)
 
     def _go_prev(self):
         if not self._playlist or self._playlist_index <= 0:
@@ -1044,9 +1206,39 @@ class PlayerMode(QWidget):
         if (self._loop_a_ms is not None and self._loop_b_ms is not None
                 and pos_ms >= self._loop_b_ms):
             self.player.setPosition(self._loop_a_ms)
+        # Preload next playlist file when current is ≥80% played
+        self._maybe_preload_next(pos_ms)
+
+    def _maybe_preload_next(self, pos_ms: int) -> None:
+        """Trigger preload of the next playlist file's first frame once
+        the current file is well into its tail. Cheap to skip — costs
+        nothing if already requested or the file is short."""
+        if self._duration_ms <= 0:
+            return
+        if pos_ms / self._duration_ms < 0.80:
+            return
+        if (self._playlist_index < 0
+                or self._playlist_index >= len(self._playlist) - 1):
+            return
+        next_path = self._playlist[self._playlist_index + 1]
+        if (self._preload_requested_for == next_path
+                or next_path in self._preload_cache):
+            return
+        self._preload_requested_for = next_path
+        self._preloader.request(next_path)
+
+    def _on_preload_ready(self, path: str, img: QImage) -> None:
+        if not isinstance(img, QImage) or img.isNull():
+            return
+        # Cap cache at 3 entries (LRU)
+        if path not in self._preload_cache and len(self._preload_cache) >= 3:
+            oldest = next(iter(self._preload_cache))
+            del self._preload_cache[oldest]
+        self._preload_cache[path] = img
 
     def _on_duration_changed(self, dur_ms: int):
         self._duration_ms = dur_ms
+        self.seek_slider.set_duration(dur_ms)
 
     def _on_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
@@ -1082,6 +1274,14 @@ class PlayerMode(QWidget):
             self.player.setActiveAudioTrack(index)
 
     def _on_media_status(self, status):
+        # Loading spinner: show during initial load + stall states.
+        # The placeholder image (preload) shows behind the spinner.
+        is_loading = status in (
+            QMediaPlayer.MediaStatus.LoadingMedia,
+            QMediaPlayer.MediaStatus.StalledMedia,
+        )
+        self.surface.set_loading(is_loading)
+
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
             return
         if self._loop_mode == 1:
@@ -1173,10 +1373,14 @@ class PlayerMode(QWidget):
 
     # ── Playback control methods (called by keybind handlers) ───
 
-    def _show_osd(self, text: str):
-        """Show OSD if enabled in settings."""
+    def _show_osd(self, text: str, primary: bool = False):
+        """Show OSD if enabled in settings.
+
+        primary=True renders as a large centered chip (used for major
+        actions like play/pause/mute); otherwise a small corner toast.
+        """
         if self._settings.get("player_osd", True):
-            self.surface.show_osd(text)
+            self.surface.show_osd(text, primary=primary)
 
     def seek_relative(self, delta_ms: int):
         """Seek forward/backward by delta_ms."""
@@ -1201,11 +1405,11 @@ class PlayerMode(QWidget):
             self._pre_mute_volume = self.vol_slider.value()
             self.vol_slider.setValue(0)
             self.audio.setVolume(0.0)
-            self._show_osd("Muted")
+            self._show_osd("Muted", primary=True)
         else:
             self.vol_slider.setValue(self._pre_mute_volume)
             self.audio.setVolume(self._pre_mute_volume / 100.0)
-            self._show_osd(f"Volume: {self._pre_mute_volume}%")
+            self._show_osd(f"Volume: {self._pre_mute_volume}%", primary=True)
         self._update_mute_icon()
         self.volume_changed.emit(self.vol_slider.value())
 
@@ -1326,6 +1530,7 @@ class PlayerMode(QWidget):
         else:
             self._loop_a_ms = self._loop_b_ms = None
             self._show_osd("A-B cleared")
+        self.seek_slider.set_ab_markers(self._loop_a_ms, self._loop_b_ms)
 
     def toggle_shuffle(self):
         """Toggle shuffle mode."""
@@ -1436,6 +1641,16 @@ class PlayerMode(QWidget):
         self._save_position()
         self.player.stop()
         self.player.setSource(QUrl())
+        # Stop background extractor threads
+        try:
+            self.seek_slider.set_thumbnail_worker(None)
+            self._thumb_worker.stop()
+        except Exception:
+            pass
+        try:
+            self._preloader.stop()
+        except Exception:
+            pass
 
     def set_volume(self, value: int):
         """Set volume from persisted settings."""
