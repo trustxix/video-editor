@@ -1,4 +1,16 @@
-PyQt6>=6.6
-PyQt6-Qt6>=6.6
-PyQt6-sip>=13.6
-pyinstaller>=6.0
+# Pinned for reproducible builds. Update with `pip freeze | grep ...` after
+# verifying the new version works on the target Python (3.14) and runs the
+# full test suite (`pytest tests/`).
+
+# Runtime
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.0
+PyQt6-sip==13.11.1
+
+# Build
+pyinstaller==6.19.0
+
+# Test (install with `pip install -r requirements-dev.txt` if separated later)
+pytest==9.0.2
+pytest-mock==3.15.1
+psutil==7.2.2  # for memory-leak harness in tests/test_memory_leak.py

@@ -6,3 +6,21 @@ dist/
 config/
 .delegate/
 archive/
+
+# Auto-archive backups (created by /backup skill)
+backups/
+
+# Test fixtures generated at test time
+tests/fixtures/
+tests/.pytest_cache/
+
+# Per-installation id (generated at runtime)
+config/.installation_id
+
+# Crash dumps (generated at runtime, contain sanitized stack traces)
+config/crashes/
+
+# IDE
+.vscode/
+.idea/
+*.swp
