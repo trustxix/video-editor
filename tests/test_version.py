@@ -41,8 +41,18 @@ def test_version_comparison_ordering():
     assert parse_version("1.0.0") > parse_version("0.99.99")
 
 
-def test_check_for_update_with_placeholder_url_returns_none():
-    """Until UPDATE_URL is replaced, check_for_update is a no-op."""
+def test_check_for_update_handles_404_gracefully(monkeypatch):
+    """Until release/latest.json exists at the published URL, requests 404.
+    The function must swallow that and return None — never raise."""
+    import urllib.error
+    import urllib.request
+
+    def fake_open(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            "url", 404, "Not Found", hdrs=None, fp=None
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_open)
     assert check_for_update(current="0.0.0") is None
 
 

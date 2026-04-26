@@ -22,10 +22,10 @@ from typing import Callable, Optional
 
 VERSION = "0.1.0"
 
-# REPLACE these placeholders before publishing the project to a real repo.
-# Until then, update checks fail gracefully (returning None) and the app
-# behaves as if no update is available.
-UPDATE_URL = "https://raw.githubusercontent.com/PLACEHOLDER_OWNER/PLACEHOLDER_REPO/main/release/latest.json"
+# Static JSON hosted on GitHub raw — free, no infrastructure to maintain.
+# When the repo exists at this URL with a `release/latest.json`, the update
+# check activates; until then it 404s and returns None silently.
+UPDATE_URL = "https://raw.githubusercontent.com/trustxix/video-editor/main/release/latest.json"
 
 
 def parse_version(s: str) -> tuple[int, ...]:
@@ -58,10 +58,6 @@ def check_for_update(
     """
     import urllib.error
     import urllib.request
-
-    if "PLACEHOLDER" in UPDATE_URL:
-        # Project not yet published — silent no-op
-        return None
 
     try:
         req = urllib.request.Request(

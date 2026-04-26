@@ -16,9 +16,8 @@ from src.core import paths
 from src.core.log_setup import sanitize_path
 from src.core.version import VERSION
 
-# REPLACE before publishing the project to a real repo.
 ISSUE_URL_TEMPLATE = (
-    "https://github.com/PLACEHOLDER_OWNER/PLACEHOLDER_REPO/issues/new"
+    "https://github.com/trustxix/video-editor/issues/new"
     "?title=Bug%20report&body=Paste%20clipboard%20contents%20here"
 )
 

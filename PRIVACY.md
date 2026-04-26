@@ -25,7 +25,7 @@ disabled in **Settings → General**.
 
 When the app starts, it may make a single HTTPS GET request to a small
 JSON file at:
-  `https://raw.githubusercontent.com/<owner>/<repo>/main/release/latest.json`
+  `https://raw.githubusercontent.com/trustxix/video-editor/main/release/latest.json`
 
 This request includes only:
 - Your IP address (visible to GitHub by virtue of the connection)

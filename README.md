@@ -132,5 +132,5 @@ Each one is OFF or under explicit user control.
 See [docs/BUILD.md](docs/BUILD.md) for prerequisites, build commands,
 optional code signing, and CI integration.
 
-To report bugs or request features: open an issue on the project's
-GitHub page.
+To report bugs or request features: open an issue at
+<https://github.com/trustxix/video-editor/issues>.
