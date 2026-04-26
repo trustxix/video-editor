@@ -21,11 +21,19 @@ def _is_already_running() -> bool:
     """Use a Windows named mutex for single-instance enforcement.
     The OS automatically releases it when the process exits, even on crash.
 
-    The mutex name is salted with a per-installation id so a malicious local
-    process cannot pre-grab a predictable name to DoS the launcher."""
-    from src.core.paths import installation_id
+    The name lives in the `Local\\` namespace, which is scoped to the current
+    Windows session. That gives two useful properties for free:
+    - All installs of Video Editor for one user share the mutex, so the user
+      can only have one app window open at a time regardless of which
+      install they launched.
+    - Different Windows users on the same machine are independent (each
+      session has its own `Local\\` namespace) so they can run in parallel.
+
+    The exact name (`Local\\VideoEditor_Instance`) is also the `AppMutex` in
+    `tools/installer.iss`, so the installer can detect a running app and
+    prompt before overwriting it."""
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    mutex_name = f"Global\\VideoEditor_{installation_id()}"
+    mutex_name = "Local\\VideoEditor_Instance"
     kernel32.CreateMutexW(None, True, mutex_name)
     return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
 

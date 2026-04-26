@@ -41,10 +41,12 @@ def get_ffprobe() -> str:
 
 
 def installation_id() -> str:
-    """Stable per-user installation id, persisted in config dir.
+    """Stable per-install id, persisted in `<install>/config/.installation_id`.
 
-    Used to salt the single-instance mutex name so a malicious local process
-    can't pre-grab a predictable mutex and DoS the launcher.
+    Used for crash-dump correlation (so we can tell two crashes from the
+    same install apart from two unrelated installs). NOT used for the
+    single-instance mutex — that lives in `Local\\` namespace and is
+    naturally per-Windows-session, see `main._is_already_running`.
     """
     cfg = get_config_dir()
     id_file = cfg / ".installation_id"
