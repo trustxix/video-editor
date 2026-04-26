@@ -1,5 +1,6 @@
 import json
 import math
+import threading
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -10,7 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from src.ui.widgets import ClickSlider
 from src.ui.player_mode import PlayerMode
-from PyQt6.QtCore import Qt, QByteArray, QEvent, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QByteArray, QEvent, QEventLoop, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer
 
@@ -29,7 +30,7 @@ from src.ui.automation_lane import AutomationLane
 from src.ui.themes import apply_theme, is_dark_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
-    build_command, extract_frame, get_output_path, get_video_duration, safe_output_path,
+    build_command, get_output_path, get_video_duration, safe_output_path,
     get_video_fps, get_video_resolution, loudnorm_analyze, run_export,
     export_with_automation,
 )
@@ -74,6 +75,161 @@ class ExportWorker(QThread):
             self._process.terminate()
 
 
+class LoudnormWorker(QThread):
+    """Runs loudnorm first-pass analysis in a background thread.
+
+    Cancellation is cooperative: the underlying ffmpeg subprocess can't be
+    killed mid-flight (loudnorm_analyze uses subprocess.run with a 120s
+    timeout), but flagging cancel discards the result so the export aborts
+    cleanly. The orphan ffmpeg process exits within its own timeout. Net
+    effect: the UI never freezes for more than the time it takes Qt to
+    process the cancel click."""
+    result_ready = pyqtSignal(object)  # dict or None
+
+    def __init__(self, path, trim_start, trim_duration, target_lufs):
+        super().__init__()
+        self.path = path
+        self.trim_start = trim_start
+        self.trim_duration = trim_duration
+        self.target_lufs = target_lufs
+        self._cancelled = False
+
+    def run(self):
+        try:
+            r = loudnorm_analyze(self.path, self.trim_start, self.trim_duration,
+                                 target_lufs=self.target_lufs)
+        except Exception:
+            r = None
+        if self._cancelled:
+            r = None
+        self.result_ready.emit(r)
+
+    def cancel(self):
+        self._cancelled = True
+
+
+class FrameStepWorker(QThread):
+    """Single-pending-slot background frame extractor for snappy frame
+    stepping. Newer requests overwrite the pending slot, so a user holding
+    the right-arrow key never queues up a backlog of stale subprocess
+    invocations.
+
+    Each request carries (video_path, ms). The worker lives for the
+    lifetime of MainWindow; emit `frame_ready(path, ms, bmp_bytes)` so the
+    receiver can drop results from old clips."""
+    frame_ready = pyqtSignal(str, int, bytes)  # path, ms, BMP bytes
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._pending: tuple[str, int] | None = None
+        self._stop = False
+        self._gen = 0
+
+    def request(self, video_path: str, ms: int):
+        with self._cv:
+            self._pending = (video_path, ms)
+            self._gen += 1
+            self._cv.notify_all()
+
+    def stop_worker(self):
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        self.wait(1500)
+
+    def run(self):
+        from src.core.ffmpeg_runner import extract_frame
+        while True:
+            with self._cv:
+                while self._pending is None and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                path, ms = self._pending
+                gen = self._gen
+                self._pending = None
+            try:
+                bmp = extract_frame(path, ms / 1000.0)
+            except Exception:
+                bmp = None
+            # Drop the result if a newer request landed mid-extract.
+            with self._cv:
+                if gen != self._gen or self._stop:
+                    continue
+            if bmp:
+                self.frame_ready.emit(path, ms, bmp)
+
+
+class ColorPreviewWorker(QThread):
+    """Single-pending-slot worker for the color-preview frame extract.
+
+    Takes (video_path, ms, brightness, exposure) per request. Reduces the
+    UI freeze that the synchronous subprocess.run was introducing on every
+    color-slider release."""
+    preview_ready = pyqtSignal(str, int, bytes)  # path, ms, BMP bytes
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._pending: tuple[str, int, float, float] | None = None
+        self._stop = False
+        self._gen = 0
+
+    def request(self, video_path: str, ms: int, brightness: float, exposure: float):
+        with self._cv:
+            self._pending = (video_path, ms, brightness, exposure)
+            self._gen += 1
+            self._cv.notify_all()
+
+    def stop_worker(self):
+        with self._cv:
+            self._stop = True
+            self._cv.notify_all()
+        self.wait(2500)
+
+    def run(self):
+        import subprocess
+        from src.core.ffmpeg_runner import _build_color_filters, get_ffmpeg, _hide_window
+        while True:
+            with self._cv:
+                while self._pending is None and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                path, ms, b, e = self._pending
+                gen = self._gen
+                self._pending = None
+            filters = _build_color_filters(b, e)
+            if not filters:
+                continue
+            cmd = [
+                get_ffmpeg(), '-loglevel', 'quiet',
+                '-ss', f'{ms / 1000.0:.3f}',
+                '-i', path,
+                '-vf', ','.join(filters),
+                '-frames:v', '1',
+                '-f', 'image2pipe', '-vcodec', 'bmp',
+                'pipe:1',
+            ]
+            bmp = b""
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, startupinfo=_hide_window(), timeout=3,
+                )
+                if result.returncode == 0 and result.stdout:
+                    bmp = result.stdout
+            except Exception:
+                bmp = b""
+            with self._cv:
+                if gen != self._gen or self._stop:
+                    continue
+            if bmp:
+                self.preview_ready.emit(path, ms, bmp)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -114,6 +270,11 @@ class MainWindow(QMainWindow):
         self._redo_stack: list[dict] = []
         self._export_cancelled = False
         self._stepped_pos: int | None = None  # accurate position during frame stepping
+        # Long-lived background workers (lazy-init on first use; stopped in
+        # closeEvent). Single-pending-slot pattern keeps rapid input from
+        # queueing stale subprocess invocations.
+        self._frame_step_worker: FrameStepWorker | None = None
+        self._color_preview_worker: ColorPreviewWorker | None = None
 
         self._editor_keybind_manager = KeybindManager(
             ACTION_DEFS, self._settings.get("editor_keybinds"))
@@ -945,6 +1106,14 @@ class MainWindow(QMainWindow):
             if self._worker.isRunning():
                 self._worker.terminate()
                 self._worker.wait()
+        # Stop long-lived background workers cleanly so their daemon ffmpeg
+        # children don't outlive pythonw as orphans.
+        if self._frame_step_worker is not None:
+            self._frame_step_worker.stop_worker()
+            self._frame_step_worker = None
+        if self._color_preview_worker is not None:
+            self._color_preview_worker.stop_worker()
+            self._color_preview_worker = None
         self.player.release()
         self.player_mode.release()
         super().closeEvent(event)
@@ -1059,27 +1228,47 @@ class MainWindow(QMainWindow):
         start_ms, end_ms = self.trim.slider.get_selection()
         new_ms = max(start_ms, min(new_ms, end_ms))
 
-        bmp = extract_frame(self._video_path, new_ms / 1000.0)
-        if bmp:
-            from PyQt6.QtGui import QImage
-            image = QImage()
-            if image.loadFromData(bmp, "BMP"):
-                self.player.surface._stepping = True
-                self.player.surface._image = image
-                self.player.surface.update()
-                self._stepped_pos = new_ms
-                # Update position-dependent UI manually
-                self.player.lbl_time.setText(
-                    f"{self.player._fmt(new_ms)} / {self.player._fmt(self.player._duration_ms)}"
-                )
-                self.trim.set_playhead(new_ms)
-                self.automation.set_playhead(new_ms)
-                return
+        # Update playhead immediately for responsiveness; the actual frame
+        # arrives via the worker thread (single-pending-slot, so a held
+        # arrow key never queues stale subprocess invocations).
+        self._stepped_pos = new_ms
+        self.player.lbl_time.setText(
+            f"{self.player._fmt(new_ms)} / {self.player._fmt(self.player._duration_ms)}"
+        )
+        self.trim.set_playhead(new_ms)
+        self.automation.set_playhead(new_ms)
+        if self._frame_step_worker is None:
+            self._frame_step_worker = FrameStepWorker()
+            self._frame_step_worker.frame_ready.connect(self._on_frame_step_ready)
+            self._frame_step_worker.start()
+        self._frame_step_worker.request(self._video_path, new_ms)
+        # Frame arrives via _on_frame_step_ready when extract finishes.
 
-        # Fallback: QMediaPlayer seek (keyframe-snapped but better than nothing)
-        self._stepped_pos = None
-        self.player.surface._stepping = False
-        self.player.seek(new_ms)
+    def _on_frame_step_ready(self, path: str, ms: int, bmp: bytes):
+        """Receives a stepped frame from FrameStepWorker. Drops stale results
+        whose path or position no longer matches what's loaded."""
+        if path != self._video_path:
+            return  # User switched clips
+        if ms != self._stepped_pos:
+            return  # Newer step request superseded this one
+        from PyQt6.QtGui import QImage
+        image = QImage()
+        if image.loadFromData(bmp, "BMP"):
+            self.player.surface._stepping = True
+            self.player.surface._image = image
+            self.player.surface.update()
+
+    def _on_color_preview_ready(self, path: str, ms: int, bmp: bytes):
+        """Receives a color-corrected preview frame from ColorPreviewWorker."""
+        if path != self._video_path:
+            return
+        from PyQt6.QtGui import QImage
+        img = QImage()
+        if img.loadFromData(bmp, "BMP"):
+            self.player.surface._stepping = True
+            self.player.surface._image = img
+            self.player.surface.set_color_adjust(0, 0)  # filters baked in
+            self.player.surface.update()
 
     def _seek_relative(self, delta_ms: int):
         """Seek forward or backward by delta_ms. Clears stepped state."""
@@ -1234,6 +1423,17 @@ class MainWindow(QMainWindow):
             defaults["preview_volume"] = max(0, min(100, int(defaults["preview_volume"])))
         except (ValueError, TypeError):
             defaults["preview_volume"] = 100
+        # normalize_lufs flows directly into ffmpeg's loudnorm filter via
+        # f"{target_lufs:.1f}" — bound it to a sane range so a hand-edited
+        # settings.json with NaN / inf / a huge number can't produce a
+        # filter string that ffmpeg silently rejects (export with no audio).
+        try:
+            lufs = float(defaults["normalize_lufs"])
+            if lufs != lufs or lufs < -50.0 or lufs > 0.0:  # NaN check + range
+                raise ValueError
+            defaults["normalize_lufs"] = lufs
+        except (ValueError, TypeError):
+            defaults["normalize_lufs"] = -14.0
         # Validate player numeric settings — corrupt JSON must not crash
         _player_int_keys = {
             "player_seek_step": 5, "player_seek_step_large": 30,
@@ -1797,35 +1997,19 @@ class MainWindow(QMainWindow):
             # No adjustments — clear any stepped frame, let live video show
             self.player.surface._stepping = False
             return
-        from src.core.ffmpeg_runner import _build_color_filters, get_ffmpeg, _hide_window
-        import subprocess
-        filters = _build_color_filters(b, e)
-        if not filters:
+        from src.core.ffmpeg_runner import _build_color_filters
+        if not _build_color_filters(b, e):
             return
-        pos_s = self.player.player.position() / 1000.0
-        cmd = [
-            get_ffmpeg(), '-loglevel', 'quiet',
-            '-ss', f'{pos_s:.3f}',
-            '-i', self._video_path,
-            '-vf', ','.join(filters),
-            '-frames:v', '1',
-            '-f', 'image2pipe', '-vcodec', 'bmp',
-            'pipe:1',
-        ]
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, startupinfo=_hide_window(), timeout=3,
-            )
-            if result.returncode == 0 and result.stdout:
-                from PyQt6.QtGui import QImage
-                img = QImage()
-                if img.loadFromData(result.stdout, "BMP"):
-                    self.player.surface._stepping = True
-                    self.player.surface._image = img
-                    self.player.surface.set_color_adjust(0, 0)  # frame already has filters baked in
-                    self.player.surface.update()
-        except Exception:
-            pass
+        # Run the preview extract on a background worker so the slider
+        # release doesn't hold the UI for up to 3 seconds. The worker uses
+        # the single-pending-slot pattern: rapid slider drags result in
+        # only the latest preview being rendered.
+        if self._color_preview_worker is None:
+            self._color_preview_worker = ColorPreviewWorker()
+            self._color_preview_worker.preview_ready.connect(self._on_color_preview_ready)
+            self._color_preview_worker.start()
+        ms = self.player.player.position()
+        self._color_preview_worker.request(self._video_path, ms, b, e)
 
     def _reset_color(self):
         self._push_undo()
@@ -2044,17 +2228,49 @@ class MainWindow(QMainWindow):
                 # {} = analysis ran but failed (no audio stream) — skip
                 normalize_data = cached if cached else None
             else:
+                # Run loudnorm in a background thread with a Qt event loop
+                # so the UI stays responsive (was a 2-minute freeze before).
+                # Cancel button discards the result and aborts the export.
                 self.progress_bar.setFormat("Analyzing audio loudness...")
-                self.progress_bar.setValue(0)
-                QApplication.processEvents()
-                result = loudnorm_analyze(
-                    self._video_path, trim_start, trim_end - trim_start,
-                    target_lufs=target_lufs,
+                self.progress_bar.setRange(0, 0)  # indeterminate spinner
+                ln_worker = LoudnormWorker(
+                    self._video_path, trim_start, trim_end - trim_start, target_lufs,
                 )
+                ln_loop = QEventLoop()
+                ln_holder: list = []
+
+                def _on_ln_done(r):
+                    ln_holder.append(r)
+                    ln_loop.quit()
+
+                def _on_ln_cancel():
+                    self._export_cancelled = True
+                    ln_worker.cancel()
+
+                ln_worker.result_ready.connect(_on_ln_done)
+                self.btn_cancel_export.clicked.connect(_on_ln_cancel)
+                try:
+                    ln_worker.start()
+                    ln_loop.exec()
+                finally:
+                    self.btn_cancel_export.clicked.disconnect(_on_ln_cancel)
+                    ln_worker.wait()
+                    self.progress_bar.setRange(0, 100)
+                    self.progress_bar.setFormat("%p%")
+
+                if self._export_cancelled:
+                    # User aborted — don't proceed with the export.
+                    self._export_cancelled = False
+                    self.progress_bar.setVisible(False)
+                    self.btn_cancel_export.setVisible(False)
+                    self.btn_export.setEnabled(True)
+                    self._sync_export_list_button()
+                    return
+
+                result = ln_holder[0] if ln_holder else None
                 # Cache result: dict with data on success, {} on failure
                 current_item.normalize_data = result if result else {}
                 normalize_data = result
-                self.progress_bar.setFormat("%p%")
 
         if keyframes:
             # Automated export: pre-render audio + segmented video
