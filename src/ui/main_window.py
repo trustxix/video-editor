@@ -29,7 +29,7 @@ from src.ui.automation_lane import AutomationLane
 from src.ui.themes import apply_theme, is_dark_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
-    build_command, extract_frame, get_output_path, get_video_duration,
+    build_command, extract_frame, get_output_path, get_video_duration, safe_output_path,
     get_video_fps, get_video_resolution, loudnorm_analyze, run_export,
     export_with_automation,
 )
@@ -1978,9 +1978,13 @@ class MainWindow(QMainWindow):
         exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
 
         suffix = self._settings.get("output_suffix", "_edited")
-        self._last_output = get_output_path(self._video_path, suffix)
         if self._settings["output_dir"]:
-            self._last_output = str(Path(self._settings["output_dir"]) / Path(self._last_output).name)
+            # Custom output dir → enforce containment to block traversal via suffix.
+            self._last_output = safe_output_path(
+                self._settings["output_dir"], self._video_path, suffix
+            )
+        else:
+            self._last_output = get_output_path(self._video_path, suffix)
 
         if Path(self._last_output).exists() and self._batch_queue is None:
             # Batch exports auto-overwrite — the whole point is "walk away

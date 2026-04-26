@@ -632,9 +632,51 @@ def export_with_automation(
             pass
 
 
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def _sanitize_suffix(suffix: str) -> str:
+    """Strip path separators and other invalid filename chars from a suffix.
+
+    This prevents an output_suffix like ``_edited/../../../evil`` from
+    redirecting the export outside the intended directory."""
+    if not suffix:
+        return ""
+    cleaned = _INVALID_FILENAME_CHARS_RE.sub("_", suffix)
+    # Collapse repeated underscores from the substitution
+    return re.sub(r"_+", "_", cleaned)[:64] if cleaned else ""
+
+
 def get_output_path(input_path: str, suffix: str = "_edited") -> str:
+    """Return ``<input_dir>/<stem><sanitized_suffix><ext>``.
+
+    The suffix is sanitized so it cannot redirect the path outside the
+    input directory."""
     p = Path(input_path)
-    return str(p.with_stem(p.stem + suffix))
+    return str(p.with_stem(p.stem + _sanitize_suffix(suffix)))
+
+
+def safe_output_path(output_dir: str, input_path: str, suffix: str = "_edited") -> str:
+    """Build the final output path, guaranteeing it stays inside ``output_dir``.
+
+    Resolves both paths to absolutes and verifies the candidate is contained
+    in the resolved output_dir. Falls back to a safe name if traversal is
+    detected. Used when the user has set a custom output directory; the
+    suffix is sanitized either way."""
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base = Path(input_path)
+    safe_suffix = _sanitize_suffix(suffix)
+    candidate_name = f"{base.stem}{safe_suffix}{base.suffix}"
+    candidate = (out_dir / candidate_name).resolve()
+    try:
+        candidate.relative_to(out_dir)
+    except ValueError:
+        # Belt-and-suspenders: if sanitization missed something, force the
+        # name into out_dir with a known-safe pattern.
+        candidate = out_dir / f"{base.stem}_export{base.suffix}"
+    return str(candidate)
 
 
 def _hide_window():

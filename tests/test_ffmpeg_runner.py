@@ -16,11 +16,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.ffmpeg_runner import (
     _build_speed_audio_filter,
+    _sanitize_suffix,
     build_command,
+    get_output_path,
     get_video_duration,
     get_video_fps,
     get_video_resolution,
     loudnorm_filter,
+    safe_output_path,
 )
 
 
@@ -222,3 +225,50 @@ def test_encoder_status_reports_reason_on_ffmpeg_missing(monkeypatch):
     encoder, reason = ffmpeg_runner.get_encoder_status()
     assert encoder == "software"
     assert "ffmpeg" in reason.lower()
+
+
+# ─── Output path traversal guard (Phase 1.6) ──────────────────────────────
+
+def test_sanitize_suffix_strips_path_separators():
+    assert "/" not in _sanitize_suffix("evil/../../traversal")
+    assert "\\" not in _sanitize_suffix(r"evil\..\..\traversal")
+
+
+def test_sanitize_suffix_preserves_normal_text():
+    assert _sanitize_suffix("_edited") == "_edited"
+    assert _sanitize_suffix("_v2") == "_v2"
+
+
+def test_sanitize_suffix_strips_invalid_filename_chars():
+    out = _sanitize_suffix('a:b*c?d"e<f>g|h')
+    for bad in ':*?"<>|':
+        assert bad not in out
+
+
+def test_get_output_path_blocks_traversal_via_suffix():
+    """A traversal-attempting suffix must NOT escape the input dir."""
+    out = get_output_path(r"C:\Users\alice\clip.mp4", suffix=r"/../../Windows/System32/evil")
+    out_path = Path(out)
+    # Output must still be in C:\Users\alice
+    assert out_path.parent == Path(r"C:\Users\alice")
+
+
+def test_safe_output_path_keeps_output_inside_output_dir(tmp_path):
+    result = safe_output_path(str(tmp_path), r"C:\source\clip.mp4", suffix="_edited")
+    assert str(tmp_path) in result
+    assert result.endswith(".mp4")
+
+
+def test_safe_output_path_blocks_suffix_traversal(tmp_path):
+    """Hand-edited output_suffix with .. cannot redirect output."""
+    result = safe_output_path(str(tmp_path), r"C:\source\clip.mp4", suffix=r"/../../Windows/System32/evil")
+    rp = Path(result).resolve()
+    # Result must be a descendant of tmp_path
+    rp.relative_to(tmp_path.resolve())  # raises ValueError if not contained
+
+
+def test_safe_output_path_creates_output_dir(tmp_path):
+    new_dir = tmp_path / "new" / "nested" / "dir"
+    result = safe_output_path(str(new_dir), r"C:\source\clip.mp4", suffix="_v")
+    assert new_dir.exists()
+    assert str(new_dir.resolve()) in str(Path(result).resolve())
