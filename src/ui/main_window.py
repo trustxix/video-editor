@@ -661,6 +661,27 @@ class MainWindow(QMainWindow):
         norm_row.addWidget(self.spn_lufs)
         ag.addLayout(norm_row)
 
+        # Formant (timbre) shift \u2014 audio, applied on export. Lowers the
+        # vocal-tract formants for a deeper/warmer voice without touching
+        # pitch or timing. Slider is 0..12 semitones of *downward* shift;
+        # upward isn't offered (the bundled rubberband can't deliver it).
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Formant:"))
+        self.sld_formant = ClickSlider(Qt.Orientation.Horizontal)
+        self.sld_formant.setRange(0, 12)
+        self.sld_formant.setValue(0)
+        self.sld_formant.setToolTip(
+            "Deepen voice: lowers vocal formants on export without changing\n"
+            "pitch or timing. 0 = off. (Two-pass rubberband; export only.)"
+        )
+        self.sld_formant.valueChanged.connect(self._on_formant_changed)
+        fmt_row.addWidget(self.sld_formant, stretch=1)
+        self.lbl_formant = QLabel("Off")
+        self.lbl_formant.setFixedWidth(45)
+        self.lbl_formant.setStyleSheet("font-family: monospace;")
+        fmt_row.addWidget(self.lbl_formant)
+        ag.addLayout(fmt_row)
+
         self.btn_toggle_adj = QPushButton("Brightness / Exposure \u25B6")
         self.btn_toggle_adj.setCheckable(True)
         ag.addWidget(self.btn_toggle_adj)
@@ -889,6 +910,7 @@ class MainWindow(QMainWindow):
         item.stretch_v = self.spn_stretch_v.value() / 100.0
         item.brightness = self.sld_brightness.value() * self._BRIGHTNESS_SCALE
         item.exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
+        item.formant = -float(self.sld_formant.value())  # slider 0..12 → 0..-12 st
         item.pan_x = self.player.surface._pan_x
         item.pan_y = self.player.surface._pan_y
         item.locked = self.btn_lock_crop.isChecked()
@@ -936,6 +958,13 @@ class MainWindow(QMainWindow):
         self.lbl_brightness.setText(f"{self.sld_brightness.value():+d}" if self.sld_brightness.value() else "0")
         self.lbl_exposure.setText(f"{self.sld_exposure.value():+d}" if self.sld_exposure.value() else "0")
         self.player.surface.set_color_adjust(item.brightness, item.exposure)
+
+        # Restore formant (stored as negative semitones; slider is 0..12).
+        self.sld_formant.blockSignals(True)
+        self.sld_formant.setValue(max(0, min(12, int(round(-item.formant)))))
+        self.sld_formant.blockSignals(False)
+        self.lbl_formant.setText(
+            f"-{self.sld_formant.value()} st" if self.sld_formant.value() else "Off")
 
         # Set aspect ratio lock only in Crop mode, not Stretch mode
         if item.crop_mode == "Crop":
@@ -1032,6 +1061,10 @@ class MainWindow(QMainWindow):
         self.lbl_brightness.setText("0")
         self.lbl_exposure.setText("0")
         self.player.surface.set_color_adjust(0.0, 0.0)
+        self.sld_formant.blockSignals(True)
+        self.sld_formant.setValue(0)
+        self.sld_formant.blockSignals(False)
+        self.lbl_formant.setText("Off")
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.progress_bar.setVisible(False)
@@ -1607,6 +1640,7 @@ class MainWindow(QMainWindow):
             'stretch_v': self.spn_stretch_v.value(),
             'brightness': self.sld_brightness.value(),
             'exposure': self.sld_exposure.value(),
+            'formant': self.sld_formant.value(),
             'locked': self.btn_lock_crop.isChecked(),
             'keyframes': self.automation.get_keyframes(),
             'locked_keyframes': list(self.automation._locked_keyframes),
@@ -1666,6 +1700,12 @@ class MainWindow(QMainWindow):
             self.sld_brightness.value() * self._BRIGHTNESS_SCALE,
             self.sld_exposure.value() * self._EXPOSURE_SCALE,
         )
+
+        self.sld_formant.blockSignals(True)
+        self.sld_formant.setValue(state.get('formant', 0))
+        self.sld_formant.blockSignals(False)
+        self.lbl_formant.setText(
+            f"-{self.sld_formant.value()} st" if self.sld_formant.value() else "Off")
 
         self.btn_lock_crop.setChecked(state['locked'])
 
@@ -1978,6 +2018,15 @@ class MainWindow(QMainWindow):
             exposure=value * self._EXPOSURE_SCALE,
         )
 
+    def _on_formant_changed(self, value: int):
+        """Formant slider (0..12 → 0..-12 st). Export-only: no live preview
+        is possible (the live audio engine is a pure-Python resampler), so
+        this just records undo state and updates the label."""
+        if self._restoring:
+            return
+        self._push_undo()
+        self.lbl_formant.setText(f"-{value} st" if value else "Off")
+
     def _on_color_slider_released(self):
         """Show accurate ffmpeg-rendered preview frame on slider release.
 
@@ -2169,6 +2218,7 @@ class MainWindow(QMainWindow):
         stretch_v = self.spn_stretch_v.value() / 100.0
         brightness = self.sld_brightness.value() * self._BRIGHTNESS_SCALE
         exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
+        formant = -float(self.sld_formant.value())  # slider 0..12 → 0..-12 st
 
         suffix = self._settings.get("output_suffix", "_edited")
         if self._settings["output_dir"]:
@@ -2295,6 +2345,7 @@ class MainWindow(QMainWindow):
                 exposure=exposure,
                 normalize_data=normalize_data,
                 target_lufs=target_lufs,
+                formant=formant,
                 auto_preset=self._settings.get("auto_preset"),
             ))
         else:
@@ -2317,6 +2368,7 @@ class MainWindow(QMainWindow):
                 exposure=exposure,
                 normalize_data=normalize_data,
                 target_lufs=target_lufs,
+                formant=formant,
                 auto_preset=self._settings.get("auto_preset"),
             )
             duration = (trim_end - trim_start) / speed
