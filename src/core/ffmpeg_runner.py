@@ -395,6 +395,84 @@ def loudnorm_filter(measured: dict, target_lufs: float = -14.0) -> str:
     )
 
 
+# ── Output container / format support ─────────────────────────────────────
+# Which codecs each container can hold (drives the lossless-remux decision) and
+# what we re-encode to per container. Verified empirically against the bundled
+# ffmpeg in tests/test_export_format.py — h264/h265+aac remux into everything
+# except webm; webm needs vp9+opus; flv in practice means h264.
+SUPPORTED_CONTAINERS = ("mp4", "mkv", "mov", "webm", "flv", "avi", "ts", "m4v")
+
+_CONTAINER_VCODECS = {
+    "mp4":  {"h264", "hevc", "av1", "mpeg4"},
+    "m4v":  {"h264", "hevc", "av1", "mpeg4"},
+    "mov":  {"h264", "hevc", "prores", "mpeg4", "av1"},
+    "mkv":  {"h264", "hevc", "vp9", "vp8", "av1", "mpeg4", "mpeg2video", "mjpeg"},
+    "flv":  {"h264", "flv1"},
+    "avi":  {"h264", "mpeg4", "mjpeg", "mpeg2video"},
+    "ts":   {"h264", "hevc", "mpeg2video"},
+    "webm": {"vp9", "vp8", "av1"},
+}
+_CONTAINER_ACODECS = {
+    "mp4":  {"aac", "mp3", "ac3"},
+    "m4v":  {"aac", "mp3", "ac3"},
+    "mov":  {"aac", "mp3", "ac3", "pcm_s16le"},
+    "mkv":  {"aac", "opus", "vorbis", "mp3", "ac3", "flac"},
+    "flv":  {"aac", "mp3"},
+    "avi":  {"aac", "mp3", "ac3", "pcm_s16le"},
+    "ts":   {"aac", "ac3", "mp3"},
+    "webm": {"opus", "vorbis"},
+}
+
+
+def normalize_container(container: str) -> str:
+    """Lower-case, strip a leading dot, map common aliases. '' means keep source."""
+    c = (container or "").strip().lstrip(".").lower()
+    return {"matroska": "mkv", "quicktime": "mov", "mpegts": "ts"}.get(c, c)
+
+
+def _target_video_codec(container: str, codec: str) -> str:
+    """The video codec family to ENCODE for a container. webm -> vp9 (software,
+    no NVENC); flv -> h264 (hevc-in-flv is non-standard); else the user's
+    h264/h265 choice."""
+    if container == "webm":
+        return "vp9"
+    if container == "flv":
+        return "h264"
+    return codec
+
+
+def _video_encode_args(container: str, codec: str, crf: int,
+                       auto_preset: dict | None,
+                       output_w: int | None, output_h: int | None) -> list[str]:
+    """Encoder args for the target container's video codec."""
+    if _target_video_codec(container, codec) == "vp9":
+        # VP9 constant-quality (-b:v 0 -crf). row-mt + good deadline keep
+        # software VP9 from being unusably slow. crf clamped to VP9's 0..63.
+        vcrf = max(0, min(63, int(crf)))
+        return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(vcrf),
+                "-row-mt", "1", "-deadline", "good", "-cpu-used", "2",
+                "-pix_fmt", "yuv420p"]
+    return _encode_args(_target_video_codec(container, codec), crf, auto_preset,
+                        output_w=output_w, output_h=output_h)
+
+
+def _audio_encode_args(container: str) -> list[str]:
+    """Audio encoder args for the target container (opus for webm, else aac)."""
+    if container == "webm":
+        return ["-c:a", "libopus", "-b:a", "160k"]
+    return ["-c:a", "aac", "-b:a", "320k"]
+
+
+def _can_copy_video(container: str, source_vcodec: str) -> bool:
+    """True when the source video stream can be losslessly remuxed (copied)
+    into the target container."""
+    return bool(source_vcodec) and source_vcodec.lower() in _CONTAINER_VCODECS.get(container, set())
+
+
+def _can_copy_audio(container: str, source_acodec: str) -> bool:
+    return bool(source_acodec) and source_acodec.lower() in _CONTAINER_ACODECS.get(container, set())
+
+
 def build_command(
     input_path: str,
     output_path: str,
@@ -418,8 +496,15 @@ def build_command(
     auto_preset: dict | None = None,
     source_w: int = 0,
     source_h: int = 0,
+    container: str = "",
+    source_vcodec: str = "",
+    source_acodec: str = "",
 ) -> list[str]:
     cmd = [get_ffmpeg(), "-y"]
+
+    # Target container: explicit arg, else inferred from the output extension.
+    container = normalize_container(container) or Path(output_path).suffix.lstrip(".").lower()
+    src_container = Path(input_path).suffix.lstrip(".").lower()
 
     if trim_start is not None and trim_start > 0:
         cmd += ["-ss", f"{trim_start:.3f}"]
@@ -458,15 +543,23 @@ def build_command(
         base_w = crop_w if crop_w is not None else (source_w or None)
         base_h = crop_h if crop_h is not None else (source_h or None)
         eff_w, eff_h = _effective_output_dims(base_w, base_h, stretch_h, stretch_v)
-        cmd += _encode_args(codec, crf, auto_preset, output_w=eff_w, output_h=eff_h)
+        cmd += _video_encode_args(container, codec, crf, auto_preset, eff_w, eff_h)
     else:
-        # No video modifications — stream copy (zero quality loss)
-        cmd += ["-c:v", "copy"]
+        # No video edits: losslessly remux (copy) when the source codec fits
+        # the target container; otherwise re-encode to a compatible codec
+        # (e.g. h264→webm must become vp9).
+        if container == src_container or _can_copy_video(container, source_vcodec):
+            cmd += ["-c:v", "copy"]
+        else:
+            cmd += _video_encode_args(container, codec, crf, auto_preset,
+                                      source_w or None, source_h or None)
 
     # ── Audio ─────────────────────────────────────────────────
     # Build the audio filter chain in signal order: speed (vinyl pitch) →
     # formant (independent timbre shift) → loudnorm (final loudness). Any
-    # non-empty chain forces a re-encode; otherwise honour mute/reencode/copy.
+    # non-empty chain forces a re-encode; otherwise copy when the source codec
+    # fits the container, else re-encode to the container's audio codec.
+    audio_args = _audio_encode_args(container)  # opus for webm, else aac
     if audio_mode == "mute":
         cmd += ["-an"]
     else:
@@ -479,12 +572,13 @@ def build_command(
         if normalize_data:
             af_parts.append(loudnorm_filter(normalize_data, target_lufs))
         if af_parts:
-            cmd += ["-af", ",".join(af_parts)]
-            cmd += ["-c:a", "aac", "-b:a", "320k"]
+            cmd += ["-af", ",".join(af_parts)] + audio_args
         elif audio_mode == "reencode":
-            cmd += ["-c:a", "aac", "-b:a", "320k"]
-        else:
+            cmd += audio_args
+        elif container == src_container or _can_copy_audio(container, source_acodec):
             cmd += ["-c:a", "copy"]
+        else:
+            cmd += audio_args
 
     cmd += [output_path]
     return cmd
@@ -654,6 +748,7 @@ def export_with_automation(
     status_cb: StatusCB = None,
     source_w: int = 0,
     source_h: int = 0,
+    container: str = "",
 ) -> bool:
     """Export with speed automation (pure GPU pipeline, no interpolation).
 
@@ -675,6 +770,7 @@ def export_with_automation(
     import os, tempfile, shutil
     ffmpeg = get_ffmpeg()
 
+    container = normalize_container(container) or Path(output_path).suffix.lstrip(".").lower()
     has_crop = all(v is not None for v in (crop_x, crop_y, crop_w, crop_h))
 
     temp_dir = tempfile.mkdtemp(prefix="ve_export_")
@@ -758,8 +854,11 @@ def export_with_automation(
 
         filter_complex = ";".join(filter_parts)
 
-        # ── Step 3: Single NVENC encode pass ────────────────
-        video_out = os.path.join(temp_dir, "video.mp4")
+        # ── Step 3: Single encode pass ──────────────────────
+        # Intermediate is .mkv (a universal container that holds h264/h265/vp9)
+        # so the same temp works whether the final container is mp4 or webm;
+        # the mux step copies this stream into the real target container.
+        video_out = os.path.join(temp_dir, "video.mkv")
         cmd = [
             ffmpeg, "-y", "-i", input_path,
             "-filter_complex", filter_complex,
@@ -768,11 +867,12 @@ def export_with_automation(
         # Same hardware-min guard as build_command: when the effective output
         # dim is below NVENC's threshold, software encode instead of silently
         # producing 0-byte output. Fall back to source dims when uncropped so
-        # stretch-only downscales are covered too.
+        # stretch-only downscales are covered too. Container picks the codec
+        # (vp9 for webm, h264 for flv, else the user's h264/h265).
         base_w = crop_w if crop_w is not None else (source_w or None)
         base_h = crop_h if crop_h is not None else (source_h or None)
         eff_w, eff_h = _effective_output_dims(base_w, base_h, stretch_h, stretch_v)
-        cmd += _encode_args(codec, crf, auto_preset, output_w=eff_w, output_h=eff_h)
+        cmd += _video_encode_args(container, codec, crf, auto_preset, eff_w, eff_h)
         cmd += ["-an", video_out]
 
         ok = run_export(
@@ -786,8 +886,14 @@ def export_with_automation(
             return False
 
         # ── Step 4: Mux video + pre-rendered audio ──────────
+        # The encoded video stream is already the correct codec for the
+        # container, so -c:v copy remuxes it into the final container (mkv→mp4,
+        # vp9→webm, etc.) losslessly. Audio is encoded for the container
+        # (opus for webm, else aac).
+        audio_args = _audio_encode_args(container)
         if audio_mode == "mute" or not os.path.exists(audio_wav):
-            os.replace(video_out, output_path)
+            # Remux the video-only intermediate into the final container.
+            cmd = [ffmpeg, "-y", "-i", video_out, "-c:v", "copy", "-an", output_path]
         else:
             # Re-analyze the pre-rendered WAV (not the source) for
             # normalization — speed automation changes the loudness.
@@ -806,8 +912,7 @@ def export_with_automation(
                 af_parts.append(loudnorm_filter(wav_norm, target_lufs))
             if af_parts:
                 cmd += ["-af", ",".join(af_parts)]
-            cmd += ["-c:a", "aac", "-b:a", "320k",
-                    "-map", "0:v:0", "-map", "1:a:0", output_path]
+            cmd += audio_args + ["-map", "0:v:0", "-map", "1:a:0", output_path]
             # Cap the mux at 10 minutes — stream-copy + AAC re-encode of an
             # already-rendered file is fast (a few seconds typically), and a
             # hung ffmpeg here would otherwise block the export thread forever.
@@ -856,35 +961,41 @@ def _sanitize_suffix(suffix: str) -> str:
     return re.sub(r"_+", "_", cleaned)[:64] if cleaned else ""
 
 
-def get_output_path(input_path: str, suffix: str = "_edited") -> str:
+def get_output_path(input_path: str, suffix: str = "_edited", container: str = "") -> str:
     """Return ``<input_dir>/<stem><sanitized_suffix><ext>``.
 
-    The suffix is sanitized so it cannot redirect the path outside the
-    input directory."""
+    ``container`` (e.g. "mkv") overrides the extension for format conversion;
+    empty keeps the source extension. The suffix is sanitized so it cannot
+    redirect the path outside the input directory."""
     p = Path(input_path)
-    return str(p.with_stem(p.stem + _sanitize_suffix(suffix)))
+    nc = normalize_container(container)
+    ext = f".{nc}" if nc else p.suffix
+    return str(p.with_stem(p.stem + _sanitize_suffix(suffix)).with_suffix(ext))
 
 
-def safe_output_path(output_dir: str, input_path: str, suffix: str = "_edited") -> str:
+def safe_output_path(output_dir: str, input_path: str, suffix: str = "_edited",
+                     container: str = "") -> str:
     """Build the final output path, guaranteeing it stays inside ``output_dir``.
 
     Resolves both paths to absolutes and verifies the candidate is contained
-    in the resolved output_dir. Falls back to a safe name if traversal is
-    detected. Used when the user has set a custom output directory; the
-    suffix is sanitized either way."""
+    in the resolved output_dir. ``container`` overrides the extension for
+    format conversion. Falls back to a safe name if traversal is detected;
+    the suffix is sanitized either way."""
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base = Path(input_path)
+    nc = normalize_container(container)
+    ext = f".{nc}" if nc else base.suffix
     safe_suffix = _sanitize_suffix(suffix)
-    candidate_name = f"{base.stem}{safe_suffix}{base.suffix}"
+    candidate_name = f"{base.stem}{safe_suffix}{ext}"
     candidate = (out_dir / candidate_name).resolve()
     try:
         candidate.relative_to(out_dir)
     except ValueError:
         # Belt-and-suspenders: if sanitization missed something, force the
         # name into out_dir with a known-safe pattern.
-        candidate = out_dir / f"{base.stem}_export{base.suffix}"
+        candidate = out_dir / f"{base.stem}_export{ext}"
     return str(candidate)
 
 
