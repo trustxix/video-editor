@@ -269,6 +269,11 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
         self._export_cancelled = False
+        # True while _export is in its synchronous pre-roll (notably the
+        # loudnorm analysis, which spins a nested QEventLoop). self._worker is
+        # still None during that window, so without this flag clip navigation
+        # could mutate _video_path / queue state mid-setup and corrupt the run.
+        self._export_in_progress = False
         self._stepped_pos: int | None = None  # accurate position during frame stepping
         # Long-lived background workers (lazy-init on first use; stopped in
         # closeEvent). Single-pending-slot pattern keeps rapid input from
@@ -817,6 +822,10 @@ class MainWindow(QMainWindow):
 
     def _navigate_to(self, index: int):
         if index < 0 or index >= len(self._queue):
+            return
+        if self._export_in_progress:
+            # An export is mid-setup (e.g. loudnorm analysis running its nested
+            # event loop). Switching clips now would desync the export state.
             return
         self._stepped_pos = None
         self.player.surface._stepping = False
@@ -2173,7 +2182,7 @@ class MainWindow(QMainWindow):
     # ── Export ────────────────────────────────────────────────
 
     def _export(self):
-        if not self._video_path or self._worker is not None:
+        if not self._video_path or self._worker is not None or self._export_in_progress:
             return
 
         trim_start, trim_end = self.trim.get_trim_seconds()
@@ -2299,10 +2308,12 @@ class MainWindow(QMainWindow):
 
                 ln_worker.result_ready.connect(_on_ln_done)
                 self.btn_cancel_export.clicked.connect(_on_ln_cancel)
+                self._export_in_progress = True  # block clip nav during the nested loop
                 try:
                     ln_worker.start()
                     ln_loop.exec()
                 finally:
+                    self._export_in_progress = False
                     self.btn_cancel_export.clicked.disconnect(_on_ln_cancel)
                     ln_worker.wait()
                     self.progress_bar.setRange(0, 100)
