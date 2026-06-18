@@ -646,6 +646,7 @@ def export_with_automation(
     progress_callback=None,
     process_callback=None,
     auto_preset: dict | None = None,
+    status_cb: StatusCB = None,
 ) -> bool:
     """Export with speed automation (pure GPU pipeline, no interpolation).
 
@@ -682,7 +683,7 @@ def export_with_automation(
             if progress_callback:
                 progress_callback(0)
             audio_ok = prerender_audio(input_path, audio_wav, keyframes, base_speed,
-                                       trim_start_ms, trim_end_ms)
+                                       trim_start_ms, trim_end_ms, status_cb=status_cb)
             if not audio_ok:
                 # Surface to export_error.log via the same sanitized + size-
                 # capped writer used by run_export, so the user can see why
@@ -782,7 +783,8 @@ def export_with_automation(
             # normalization — speed automation changes the loudness.
             wav_norm = None
             if normalize_data:
-                wav_norm = loudnorm_analyze(audio_wav, target_lufs=target_lufs)
+                wav_norm = loudnorm_analyze(audio_wav, target_lufs=target_lufs,
+                                            status_cb=status_cb)
             cmd = [ffmpeg, "-y", "-i", video_out, "-i", audio_wav,
                    "-c:v", "copy"]
             # Audio chain on the pre-rendered WAV: formant shift → loudnorm.
@@ -801,12 +803,21 @@ def export_with_automation(
             # hung ffmpeg here would otherwise block the export thread forever.
             try:
                 proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, startupinfo=_hide_window(),
-                    timeout=600)
+                    stderr=subprocess.PIPE, startupinfo=_hide_window(),
+                    timeout=600, encoding="utf-8", errors="replace")
             except subprocess.TimeoutExpired:
-                log().error("Mux step timed out (>10 min) — export aborted")
+                _surface(status_cb, "Audio mux timed out (>10 min) — export aborted", "error")
+                _write_export_error(cmd, -1, ["[mux] timed out after 10 min\n"])
                 return False
             if proc.returncode != 0:
+                # Without capturing stderr the user got "FFmpeg returned an
+                # error" with no underlying message. Record the tail to the
+                # sanitized export_error.log and surface a pointer to it.
+                tail = (proc.stderr or "").splitlines()[-40:]
+                _write_export_error(cmd, proc.returncode, [ln + "\n" for ln in tail])
+                _surface(status_cb,
+                         f"Audio mux failed (ffmpeg exit {proc.returncode}) — see export_error.log",
+                         "error")
                 return False
 
         if progress_callback:

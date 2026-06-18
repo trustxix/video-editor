@@ -41,6 +41,7 @@ VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')
 class ExportWorker(QThread):
     progress = pyqtSignal(float)
     finished = pyqtSignal(bool)
+    status = pyqtSignal(str)  # surfaced failures from the automation export path
 
     def __init__(self, cmd=None, duration=0.0, auto_kwargs=None):
         super().__init__()
@@ -57,6 +58,7 @@ class ExportWorker(QThread):
                     **self._auto_kwargs,
                     progress_callback=self.progress.emit,
                     process_callback=self._set_process,
+                    status_cb=self.status.emit,
                 )
             else:
                 ok = run_export(self.cmd, self.duration, self.progress.emit,
@@ -2463,7 +2465,13 @@ class MainWindow(QMainWindow):
 
         self._worker.progress.connect(lambda p: self.progress_bar.setValue(int(p)))
         self._worker.finished.connect(self._on_export_done)
+        self._worker.status.connect(self._on_export_status)
         self._worker.start()
+
+    def _on_export_status(self, msg: str):
+        """Surface an automation-export warning/failure in the status bar
+        (queued from the worker thread)."""
+        self.statusBar().showMessage(msg, 8000)
 
     def _on_export_done(self, success: bool):
         self.progress_bar.setVisible(False)
