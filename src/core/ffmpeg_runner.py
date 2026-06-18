@@ -416,6 +416,8 @@ def build_command(
     target_lufs: float = -14.0,
     formant: float = 0.0,
     auto_preset: dict | None = None,
+    source_w: int = 0,
+    source_h: int = 0,
 ) -> list[str]:
     cmd = [get_ffmpeg(), "-y"]
 
@@ -449,10 +451,13 @@ def build_command(
         cmd += ["-vf", ",".join(vfilters)]
         # Compute the effective output dimensions when known so _encode_args
         # can detect NVENC's hardware minimum and fall back to software.
-        # Only the crop path supplies dims here — stretch-only without crop
-        # would need source dim, which build_command doesn't take, so we
-        # pass None and the original probe-then-NVENC behavior applies.
-        eff_w, eff_h = _effective_output_dims(crop_w, crop_h, stretch_h, stretch_v)
+        # Fall back to the source dimensions when there's no crop so the
+        # NVENC minimum is still enforced for stretch-only (and tiny-source)
+        # outputs — without this a heavy downscale-stretch silently produces
+        # a 0-byte NVENC file.
+        base_w = crop_w if crop_w is not None else (source_w or None)
+        base_h = crop_h if crop_h is not None else (source_h or None)
+        eff_w, eff_h = _effective_output_dims(base_w, base_h, stretch_h, stretch_v)
         cmd += _encode_args(codec, crf, auto_preset, output_w=eff_w, output_h=eff_h)
     else:
         # No video modifications — stream copy (zero quality loss)
@@ -647,6 +652,8 @@ def export_with_automation(
     process_callback=None,
     auto_preset: dict | None = None,
     status_cb: StatusCB = None,
+    source_w: int = 0,
+    source_h: int = 0,
 ) -> bool:
     """Export with speed automation (pure GPU pipeline, no interpolation).
 
@@ -760,8 +767,11 @@ def export_with_automation(
         ]
         # Same hardware-min guard as build_command: when the effective output
         # dim is below NVENC's threshold, software encode instead of silently
-        # producing 0-byte output.
-        eff_w, eff_h = _effective_output_dims(crop_w, crop_h, stretch_h, stretch_v)
+        # producing 0-byte output. Fall back to source dims when uncropped so
+        # stretch-only downscales are covered too.
+        base_w = crop_w if crop_w is not None else (source_w or None)
+        base_h = crop_h if crop_h is not None else (source_h or None)
+        eff_w, eff_h = _effective_output_dims(base_w, base_h, stretch_h, stretch_v)
         cmd += _encode_args(codec, crf, auto_preset, output_w=eff_w, output_h=eff_h)
         cmd += ["-an", video_out]
 

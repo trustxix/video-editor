@@ -2436,6 +2436,8 @@ class MainWindow(QMainWindow):
                 target_lufs=target_lufs,
                 formant=formant,
                 auto_preset=self._settings.get("auto_preset"),
+                source_w=self._video_w,
+                source_h=self._video_h,
             ))
         else:
             # Simple export: single speed
@@ -2459,6 +2461,8 @@ class MainWindow(QMainWindow):
                 target_lufs=target_lufs,
                 formant=formant,
                 auto_preset=self._settings.get("auto_preset"),
+                source_w=self._video_w,
+                source_h=self._video_h,
             )
             duration = (trim_end - trim_start) / speed
             self._worker = ExportWorker(cmd=cmd, duration=duration)

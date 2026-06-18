@@ -351,6 +351,36 @@ def test_build_command_small_crop_with_stretch_uses_software(monkeypatch):
     assert "h264_nvenc" not in cmd
 
 
+def test_build_command_stretch_only_uses_source_dims_for_nvenc_guard(monkeypatch):
+    """Stretch-only (no crop) must still enforce the NVENC minimum via the
+    source dims: a 240-wide source at 0.5× stretch → 120 px, below h264_nvenc's
+    145 minimum, so it must fall back to software (was silently 0-byte before)."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    cmd = build_command(
+        "in.mp4", "out.mp4",
+        stretch_h=0.5, stretch_v=0.5,
+        source_w=240, source_h=240,
+        codec="h264", crf=17,
+    )
+    assert "libx264" in cmd, f"Expected software for 120×120 stretch-only output, got: {cmd}"
+    assert "h264_nvenc" not in cmd
+
+
+def test_build_command_stretch_only_large_source_keeps_nvenc(monkeypatch):
+    """The source-dim guard must not over-trigger: a 1920×1080 source at 0.5×
+    stretch → 960×540, well above the minimum, stays on NVENC."""
+    from src.core import ffmpeg_runner
+    monkeypatch.setitem(ffmpeg_runner._nvenc_available, "h264_nvenc", True)
+    cmd = build_command(
+        "in.mp4", "out.mp4",
+        stretch_h=0.5, stretch_v=0.5,
+        source_w=1920, source_h=1080,
+        codec="h264", crf=17,
+    )
+    assert "h264_nvenc" in cmd
+
+
 # ─── export_error.log sanitization + rotation ─────────────────────────────
 
 def test_write_export_error_sanitizes_paths(tmp_path, monkeypatch):
