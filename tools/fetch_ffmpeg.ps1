@@ -153,7 +153,10 @@ if ($LASTEXITCODE -ne 0) {
 # the build loudly if the bundled binary lacks it rather than silently shipping
 # an app where the formant slider does nothing. BtbN win64-gpl builds include
 # --enable-librubberband; this guards against an upstream build-flag change.
-$filters = & $bundledFfmpeg -hide_banner -filters 2>&1
+# Out-String collapses the multi-line filter list into ONE string so
+# -notmatch is a scalar boolean. On the raw array, -notmatch returns the
+# non-matching lines (almost always non-empty), which would always abort.
+$filters = (& $bundledFfmpeg -hide_banner -filters 2>&1 | Out-String)
 if ($filters -notmatch "rubberband") {
     Write-Error "[fetch_ffmpeg] Bundled ffmpeg has no 'rubberband' filter; formant shift would be disabled. Aborting."
     exit 1
