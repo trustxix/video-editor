@@ -48,6 +48,13 @@ class _PlayerSurface(QWidget):
         self.sink = QVideoSink(self)
         self.sink.videoFrameChanged.connect(self._on_frame)
         self._image = None
+        # Cache of the letterbox-scaled frame. paintEvent repaints constantly
+        # (OSD / spinner / title ticks) with the same frame, and a smooth
+        # rescale of an HD image per repaint is expensive — cache it keyed on
+        # (frame, target size, aspect mode) so the rescale runs only when one
+        # of those actually changes.
+        self._scaled_cache: QImage | None = None
+        self._scaled_key = None
         self.setMinimumSize(320, 180)
         self.setStyleSheet("background: black;")
 
@@ -190,17 +197,7 @@ class _PlayerSurface(QWidget):
                 w, h = int(iw * scale), int(ih * scale)
             x = (self.width() - w) // 2
             y = (self.height() - h) // 2
-            if self._aspect_override:
-                # Stretch to fill the computed rect (ignores original aspect)
-                p.drawImage(x, y, self._image.scaled(
-                    w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                ))
-            else:
-                p.drawImage(x, y, self._image.scaled(
-                    w, h, Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                ))
+            p.drawImage(x, y, self._scaled_image(w, h, bool(self._aspect_override)))
 
         # Loading spinner overlay
         if self._loading:
@@ -215,6 +212,18 @@ class _PlayerSurface(QWidget):
             self._draw_osd(p)
 
         p.end()
+
+    def _scaled_image(self, w: int, h: int, ignore_aspect: bool) -> QImage:
+        """Return the current frame scaled to (w, h), cached so repeated
+        repaints of the same frame/geometry reuse the smooth rescale."""
+        key = (self._image.cacheKey(), w, h, ignore_aspect)
+        if key != self._scaled_key:
+            mode = (Qt.AspectRatioMode.IgnoreAspectRatio if ignore_aspect
+                    else Qt.AspectRatioMode.KeepAspectRatio)
+            self._scaled_cache = self._image.scaled(
+                w, h, mode, Qt.TransformationMode.SmoothTransformation)
+            self._scaled_key = key
+        return self._scaled_cache
 
     def _draw_spinner(self, p: QPainter) -> None:
         # Subtle vignette so the spinner reads on bright frames

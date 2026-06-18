@@ -140,7 +140,11 @@ class PitchedAudioPlayer:
         if n <= 0:
             return
         total = len(pcm) // self._CHANNELS
-        out = array.array('h')
+        # Preallocate the output (zero-filled) and assign by index instead of
+        # growing it with append() — this runs every 15ms on the UI thread,
+        # so avoiding 2*n reallocating appends per tick keeps it cheap. Any
+        # frames past the end stay silent (the zero fill).
+        out = array.array('h', bytes(self._FRAME_BYTES * n))
         pos = self._pos
         auto = self._automation
         has_auto = auto is not None and auto.get_keyframes()
@@ -153,18 +157,18 @@ class PitchedAudioPlayer:
             else:
                 speed = self._speed
             idx = int(pos)
-            frac = pos - idx
             # Strict bound: we read pcm[b], pcm[b+1], pcm[b+2], pcm[b+3]
             # where b = idx*2, so idx must be <= total-2 for all four to
-            # be in range. Past that we emit silence and stop.
+            # be in range. Past that we leave the rest silent and stop.
             if idx > total - 2:
-                out.extend([0] * (n - i) * 2)
                 break
+            frac = pos - idx
             b = idx * 2
+            j = i * 2
             s1 = pcm[b];     s2 = pcm[b + 2]
-            out.append(int(s1 + (s2 - s1) * frac))
+            out[j] = int(s1 + (s2 - s1) * frac)
             s1 = pcm[b + 1]; s2 = pcm[b + 3]
-            out.append(int(s1 + (s2 - s1) * frac))
+            out[j + 1] = int(s1 + (s2 - s1) * frac)
             pos += speed
         self._pos = pos
         self._io.write(out.tobytes())
