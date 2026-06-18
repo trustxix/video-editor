@@ -1,0 +1,70 @@
+"""Behavioral regression tests for MainWindow-level wiring.
+
+Constructs the real MainWindow under the offscreen Qt platform. The startup
+update check is patched out so the tests never touch the network.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+pytest.importorskip("PyQt6.QtWidgets")
+from PyQt6.QtWidgets import QApplication
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def window(qapp, monkeypatch):
+    # Never hit the network from a test: stub the async update check.
+    import src.core.version as version
+    monkeypatch.setattr(version, "check_for_update_async", lambda cb: None)
+    from src.ui.main_window import MainWindow
+    w = MainWindow()
+    try:
+        yield w
+    finally:
+        w.close()
+
+
+def test_semitone_buttons_stay_in_slider_range(window):
+    """The semitone buttons must not drive the preview past the slider/export
+    maximum (2.0x) or minimum (0.25x) — otherwise preview and export diverge."""
+    for _ in range(40):
+        window._change_semitone(1)
+    assert window._semitones == 12
+    assert abs(window.player._speed - 2.0) < 1e-9          # preview rate
+    assert abs(window.sld_speed.value() / 100.0 - 2.0) < 1e-9  # export reads this
+    for _ in range(80):
+        window._change_semitone(-1)
+    assert window._semitones == -24
+    assert abs(window.player._speed - 0.25) < 1e-9
+    assert abs(window.sld_speed.value() / 100.0 - 0.25) < 1e-9
+
+
+def test_formant_round_trips_through_video_item(window):
+    from src.core.video_item import VideoItem
+    it = VideoItem(path="x.mp4", duration_ms=1000, trim_end_ms=1000)
+    window._queue = [it]
+    window._queue_index = 0
+    window.sld_formant.setValue(8)
+    window._save_current_state()
+    assert it.formant == -8.0  # slider 0..12 maps to 0..-12 semitones
+    window.sld_formant.setValue(0)
+    window._restore_state(it)
+    assert window.sld_formant.value() == 8
+    assert window.lbl_formant.text() == "-8 st"
+
+
+def test_help_menu_actions_exist(window):
+    assert "check_updates" in window._menu_actions
+    assert "report_bug" in window._menu_actions

@@ -1866,11 +1866,17 @@ class MainWindow(QMainWindow):
         self.sld_speed.blockSignals(False)
 
     def _change_semitone(self, delta: int):
-        """Semitone up/down buttons."""
+        """Semitone up/down buttons.
+
+        Clamp to the speed slider's representable band [0.25x, 2.0x] =
+        [-24, +12] st. Without the +12 ceiling the buttons could drive the
+        preview to 4.0x while the slider (and therefore the export, which
+        reads the slider) stayed pinned at 2.0x — preview and output diverged.
+        """
         if self._restoring:
             return
         self._push_undo()
-        self._semitones = max(-24, min(24, self._semitones + delta))
+        self._semitones = max(-24, min(12, self._semitones + delta))
         rate = 2 ** (self._semitones / 12)
         self._apply_speed(rate)
 
