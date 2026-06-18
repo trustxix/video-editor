@@ -486,11 +486,15 @@ class SettingsDialog(QDialog):
         elif prev in QUALITY_PRESETS:
             self.cmb_quality.setCurrentText(prev)
         else:
+            # Pick the exact-CRF preset, else the nearest one — never fall
+            # through and let the combo silently keep index 0, which would
+            # change the effective export quality on reopen.
             current_crf = self.settings.get("crf", 17)
-            for name, crf in QUALITY_PRESETS.items():
-                if crf == current_crf:
-                    self.cmb_quality.setCurrentText(name)
-                    break
+            best = next((n for n, c in QUALITY_PRESETS.items() if c == current_crf), None)
+            if best is None:
+                best = min(QUALITY_PRESETS,
+                           key=lambda n: abs(QUALITY_PRESETS[n] - current_crf))
+            self.cmb_quality.setCurrentText(best)
 
         self.cmb_quality.blockSignals(False)
         self._on_quality_changed(self.cmb_quality.currentText())
@@ -558,7 +562,10 @@ class SettingsDialog(QDialog):
             "editor_keybinds": self.editor_keybind_editor.get_bindings(),
             "player_keybinds": self.player_keybind_editor.get_bindings(),
             "auto_preset_name": quality_name if auto_preset else "",
-            "auto_preset": auto_preset,
+            # Shallow-copy so the persisted settings never share identity with
+            # the module-global AUTO_PRESETS table (a later in-place mutation
+            # of the saved dict would otherwise corrupt the preset table).
+            "auto_preset": dict(auto_preset) if auto_preset else None,
             "experimental_presets": (
                 self.chk_experimental.isChecked()
                 if self.chk_experimental is not None
