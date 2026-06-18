@@ -155,7 +155,7 @@ if ($LASTEXITCODE -ne 0) {
 # --enable-librubberband; this guards against an upstream build-flag change.
 $filters = & $bundledFfmpeg -hide_banner -filters 2>&1
 if ($filters -notmatch "rubberband") {
-    Write-Error "[fetch_ffmpeg] Bundled ffmpeg has no 'rubberband' filter — formant shift would be disabled. Aborting."
+    Write-Error "[fetch_ffmpeg] Bundled ffmpeg has no 'rubberband' filter; formant shift would be disabled. Aborting."
     exit 1
 }
 Write-Host "[fetch_ffmpeg] rubberband filter present (formant shift OK)."
