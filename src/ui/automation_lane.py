@@ -29,6 +29,10 @@ class AutomationLane(QWidget):
         self._drag_lock_speed: float | None = None  # non-None = horizontal-only drag (duplicate)
         self._locked_keyframes: set[tuple[int, float]] = set()  # locked (time_ms, speed) pairs
         self._selected_idx: int = -1  # currently selected keyframe for arrow-key nudge
+        # Index of a keyframe the most recent empty-space press just created.
+        # Lets mouseDoubleClickEvent undo that stray keyframe so a double-click
+        # on empty space is a clean no-op instead of leaving one behind.
+        self._press_created_idx: int = -1
         self._playhead = 0
         self._base_speed = 1.0
 
@@ -238,6 +242,7 @@ class AutomationLane(QWidget):
         self.setFocus()
         self.focus_taken.emit()
         x, y = event.pos().x(), event.pos().y()
+        self._press_created_idx = -1  # only set when this press creates a keyframe
 
         if event.button() == Qt.MouseButton.LeftButton:
             idx = self._hit_test(x, y)
@@ -260,6 +265,7 @@ class AutomationLane(QWidget):
                 appended_idx = len(self._keyframes) - 1
                 self._dragging_idx = self._sort_and_find(appended_idx)
                 self._selected_idx = self._dragging_idx
+                self._press_created_idx = self._dragging_idx
                 self.changed.emit()
                 self.update()
 
@@ -280,9 +286,11 @@ class AutomationLane(QWidget):
                 # the lock (lock is tracked by (t, s) identity).
                 # If already at the right edge, can't place a unique copy.
                 t, s = self._keyframes[idx]
-                if t >= self._max_ms:
-                    return
-                new_t = t + 1
+                # Offset by 1ms so the copy doesn't inherit the lock. If the
+                # source is at the right edge, offset left instead of silently
+                # doing nothing, so a duplicate is always created.
+                new_t = t + 1 if t + 1 <= self._max_ms else t - 1
+                new_t = max(0, new_t)
                 self._keyframes.append((new_t, s))
                 appended_idx = len(self._keyframes) - 1
                 new_idx = self._sort_and_find(appended_idx)
@@ -299,6 +307,16 @@ class AutomationLane(QWidget):
             return
         x, y = event.pos().x(), event.pos().y()
         idx = self._hit_test(x, y)
+        # Undo the stray keyframe the leading press created on empty space —
+        # a double-click on empty space should be a clean no-op, not leave a
+        # keyframe behind.
+        if idx >= 0 and idx == self._press_created_idx:
+            self._keyframes.pop(idx)
+            self._selected_idx = -1
+            self._press_created_idx = -1
+            self.changed.emit()
+            self.update()
+            return
         if idx < 0:
             return
         t, old_s = self._keyframes[idx]
