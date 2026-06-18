@@ -157,3 +157,36 @@ def test_export_lossless_remux_mp4_to_mkv(fixture_video, tmp_path):
     assert run_export(cmd, 5.0), "remux failed"
     assert _probe_codec(out, "v:0") == "h264"
     assert _probe_codec(out, "a:0") == "aac"
+
+
+@pytest.mark.skipif(not _have_ffmpeg(), reason="ffmpeg not on PATH")
+def test_automation_export_to_mkv(fixture_video, tmp_path):
+    """Speed-automation export into a non-source container: .mkv intermediate
+    must mux into mkv as h264+aac."""
+    from src.core.ffmpeg_runner import export_with_automation
+    out = tmp_path / "auto.mkv"
+    ok = export_with_automation(
+        str(fixture_video), str(out),
+        keyframes=[(0, 1.0), (500, 1.5)], base_speed=1.0,
+        trim_start_ms=0, trim_end_ms=1000,
+        codec="h264", crf=30, source_fps=30.0, container="mkv",
+    )
+    assert ok and out.exists() and out.stat().st_size > 0
+    assert _probe_codec(out, "v:0") == "h264"
+    assert _probe_codec(out, "a:0") == "aac"
+
+
+@pytest.mark.skipif(not _have_ffmpeg(), reason="ffmpeg not on PATH")
+def test_automation_export_to_webm(fixture_video, tmp_path):
+    """Speed-automation export to webm: vp9 intermediate muxed with opus."""
+    from src.core.ffmpeg_runner import export_with_automation
+    out = tmp_path / "auto.webm"
+    ok = export_with_automation(
+        str(fixture_video), str(out),
+        keyframes=[(0, 1.0), (500, 1.5)], base_speed=1.0,
+        trim_start_ms=0, trim_end_ms=1000,
+        codec="h264", crf=34, source_fps=30.0, container="webm",
+    )
+    assert ok and out.exists() and out.stat().st_size > 0
+    assert _probe_codec(out, "v:0") == "vp9"
+    assert _probe_codec(out, "a:0") == "opus"

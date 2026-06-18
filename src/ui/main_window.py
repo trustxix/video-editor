@@ -32,7 +32,7 @@ from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_f
 from src.core.ffmpeg_runner import (
     build_command, get_output_path, get_video_duration, safe_output_path,
     get_video_fps, get_video_resolution, loudnorm_analyze, run_export,
-    export_with_automation,
+    export_with_automation, probe_video,
 )
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')
@@ -825,6 +825,32 @@ class MainWindow(QMainWindow):
 
         export_group = QGroupBox("Export")
         eg = QVBoxLayout(export_group)
+
+        # Output container/format. "" = keep the source container.
+        self._format_options = [
+            ("Same as source", ""), ("MP4", "mp4"), ("MKV", "mkv"),
+            ("MOV", "mov"), ("WebM (VP9)", "webm"), ("FLV", "flv"),
+            ("AVI", "avi"), ("MPEG-TS", "ts"),
+        ]
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Format:"))
+        self.cmb_format = QComboBox()
+        for label, _ in self._format_options:
+            self.cmb_format.addItem(label)
+        self.cmb_format.setToolTip(
+            "Output format. WebM re-encodes to VP9+Opus; the rest keep your\n"
+            "H.264/H.265 codec. With no edits, a compatible format is remuxed\n"
+            "losslessly (instant); otherwise it's converted.")
+        # Restore the persisted choice.
+        _saved_fmt = self._settings.get("output_format", "")
+        for i, (_, c) in enumerate(self._format_options):
+            if c == _saved_fmt:
+                self.cmb_format.setCurrentIndex(i)
+                break
+        self.cmb_format.currentIndexChanged.connect(self._on_format_changed)
+        fmt_row.addWidget(self.cmb_format, stretch=1)
+        eg.addLayout(fmt_row)
+
         self.btn_export = QPushButton("Export")
         self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self._export)
@@ -2265,6 +2291,18 @@ class MainWindow(QMainWindow):
 
     # ── Export ────────────────────────────────────────────────
 
+    def _selected_container(self) -> str:
+        """Target output container ('' = keep source) from the Format combo."""
+        idx = self.cmb_format.currentIndex()
+        if 0 <= idx < len(self._format_options):
+            return self._format_options[idx][1]
+        return ""
+
+    def _on_format_changed(self, idx: int):
+        """Persist the output-format choice so it sticks across sessions."""
+        self._settings["output_format"] = self._selected_container()
+        self._save_settings()
+
     def _export(self):
         if not self._video_path or self._worker is not None or self._export_in_progress:
             return
@@ -2313,14 +2351,21 @@ class MainWindow(QMainWindow):
         exposure = self.sld_exposure.value() * self._EXPOSURE_SCALE
         formant = -float(self.sld_formant.value())  # slider 0..12 → 0..-12 st
 
+        # Output container/format + source codecs (so a no-edit conversion can
+        # losslessly remux when compatible, else re-encode).
+        container = self._selected_container()
+        src_info = probe_video(self._video_path) or {}
+        source_vcodec = src_info.get("video_codec", "")
+        source_acodec = src_info.get("audio_codec", "")
+
         suffix = self._settings.get("output_suffix", "_edited")
         if self._settings["output_dir"]:
             # Custom output dir → enforce containment to block traversal via suffix.
             self._last_output = safe_output_path(
-                self._settings["output_dir"], self._video_path, suffix
+                self._settings["output_dir"], self._video_path, suffix, container
             )
         else:
-            self._last_output = get_output_path(self._video_path, suffix)
+            self._last_output = get_output_path(self._video_path, suffix, container)
 
         if Path(self._last_output).exists() and self._batch_queue is None:
             # Batch exports auto-overwrite — the whole point is "walk away
@@ -2444,6 +2489,7 @@ class MainWindow(QMainWindow):
                 auto_preset=self._settings.get("auto_preset"),
                 source_w=self._video_w,
                 source_h=self._video_h,
+                container=container,
             ))
         else:
             # Simple export: single speed
@@ -2469,6 +2515,9 @@ class MainWindow(QMainWindow):
                 auto_preset=self._settings.get("auto_preset"),
                 source_w=self._video_w,
                 source_h=self._video_h,
+                container=container,
+                source_vcodec=source_vcodec,
+                source_acodec=source_acodec,
             )
             duration = (trim_end - trim_start) / speed
             self._worker = ExportWorker(cmd=cmd, duration=duration)
