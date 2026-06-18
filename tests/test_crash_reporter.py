@@ -75,6 +75,19 @@ def test_list_pending_crashes_finds_files(isolated_crash_dir):
     assert len(pending) == 2
 
 
+def test_write_crash_prunes_to_cap(isolated_crash_dir):
+    """Dumps must not accumulate unbounded — writing more than the cap keeps
+    only the most recent _MAX_CRASH_DUMPS."""
+    from src.core import crash_reporter
+    n = crash_reporter._MAX_CRASH_DUMPS + 5
+    for i in range(n):
+        try:
+            raise ValueError(f"boom {i}")
+        except ValueError as e:
+            crash_reporter.write_crash(type(e), e, e.__traceback__)
+    assert len(crash_reporter.list_pending_crashes()) == crash_reporter._MAX_CRASH_DUMPS
+
+
 def test_acknowledge_deletes_dump(isolated_crash_dir):
     from src.core import crash_reporter
     try:

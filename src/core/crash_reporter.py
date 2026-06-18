@@ -37,6 +37,26 @@ def _crashes_dir() -> Path:
     return d
 
 
+# Cap retained crash dumps. Nothing acknowledges them yet, so without this
+# they accumulate forever in <config>/crashes/.
+_MAX_CRASH_DUMPS = 20
+
+
+def _prune_old_crashes(keep: int = _MAX_CRASH_DUMPS) -> None:
+    """Delete all but the most recent `keep` crash dumps. The filename embeds
+    the timestamp so a name sort is chronological. Best-effort — never raises
+    from the crash path."""
+    try:
+        dumps = sorted(_crashes_dir().glob("crash_*.json"))
+        for old in dumps[:-keep]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def write_crash(exc_type: type, exc_value: BaseException,
                 exc_tb: Optional[TracebackType]) -> Path:
     """Write a sanitized crash dump to <config>/crashes/. Returns the file path."""
@@ -58,6 +78,7 @@ def write_crash(exc_type: type, exc_value: BaseException,
     except OSError as e:
         # Last resort — print to stderr (which main.py routes to the log).
         sys.stderr.write(f"[crash_reporter] dump write failed ({e}): {dump}\n")
+    _prune_old_crashes()
     return path
 
 
