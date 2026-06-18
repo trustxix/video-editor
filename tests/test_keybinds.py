@@ -87,6 +87,20 @@ def test_parse_format_round_trip(s):
     assert format_binding(kb) == s
 
 
+def test_exotic_mouse_button_round_trips():
+    """An exotic mouse button not in _MOUSE_BUTTON_MAP must serialize to a
+    numeric, parseable token (the old 'Mouse?' was a constant that collided
+    for every unmapped button and could not be parsed back)."""
+    from src.core.keybinds import Keybind
+    kb = Keybind(mouse_button=99)
+    s = format_binding(kb)
+    assert s == "Mouse99"
+    assert parse_binding(s) == kb
+    # With a modifier too
+    ctrl = parse_binding("Ctrl+Mouse99")
+    assert ctrl is not None and ctrl.mouse_button == 99
+
+
 # ─── KeybindManager ──────────────────────────────────────────────────────
 
 def test_manager_default_bindings_loaded():

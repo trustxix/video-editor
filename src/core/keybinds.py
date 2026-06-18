@@ -180,6 +180,10 @@ def parse_binding(s: str) -> Keybind | None:
             mods |= Qt.KeyboardModifier.AltModifier.value
         elif part in _NAME_TO_MOUSE:
             mouse = _NAME_TO_MOUSE[part]
+        elif part.startswith("Mouse") and part[5:].isdigit():
+            # Numeric fallback for exotic buttons not in _MOUSE_BUTTON_MAP,
+            # matching the "Mouse<id>" form emitted by format_binding.
+            mouse = int(part[5:])
         elif part in _NAME_TO_KEY:
             key = _NAME_TO_KEY[part]
         else:
@@ -198,7 +202,10 @@ def format_binding(kb: Keybind) -> str:
     if kb.key:
         parts.append(_KEY_TO_NAME.get(kb.key, f"0x{kb.key:X}"))
     if kb.mouse_button:
-        parts.append(_MOUSE_BUTTON_MAP.get(kb.mouse_button, f"Mouse?"))
+        # Fall back to a numeric, round-trippable token for exotic buttons
+        # (the old "Mouse?" was a constant that collided for every unmapped
+        # button and could not be parsed back).
+        parts.append(_MOUSE_BUTTON_MAP.get(kb.mouse_button, f"Mouse{kb.mouse_button}"))
     return "+".join(parts)
 
 
