@@ -231,6 +231,10 @@ class ColorPreviewWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    # Emitted from the update-check worker thread; Qt queues delivery to the
+    # GUI thread so the result dialog is built safely on the main thread.
+    _update_available = pyqtSignal(object)  # dict | None
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Editor")
@@ -325,6 +329,14 @@ class MainWindow(QMainWindow):
             is_dark_theme(self._settings.get("theme", DEFAULT_THEME))
         ))
 
+        # Background update check on startup, gated on the privacy setting.
+        # The worker thread emits _update_available; the queued connection
+        # marshals it to the GUI thread (see _on_update_available).
+        self._update_available.connect(self._on_update_available)
+        if self._settings.get("check_for_updates", True):
+            from src.core.version import check_for_update_async
+            check_for_update_async(self._update_available.emit)
+
     def _setup_menu(self):
         self._menu_actions: dict[str, object] = {}
         menu = self.menuBar()
@@ -353,7 +365,71 @@ class MainWindow(QMainWindow):
         vm.addSeparator()
         self._menu_actions["fullscreen"] = vm.addAction("&Fullscreen", self._toggle_fullscreen)
 
+        hm = menu.addMenu("&Help")
+        self._menu_actions["check_updates"] = hm.addAction(
+            "Check for &Updates...", self._check_updates_manual)
+        self._menu_actions["report_bug"] = hm.addAction(
+            "&Report a Bug...", self._report_bug)
+
         self._sync_menu_shortcuts()
+
+    # ── Help: updates + bug report ────────────────────────────
+
+    def _check_updates_manual(self):
+        """User-initiated update check with feedback either way."""
+        from src.core.version import VERSION, check_for_update
+        info = check_for_update()
+        if info:
+            self._show_update_available(info)
+        else:
+            QMessageBox.information(
+                self, "Check for Updates",
+                f"You're on the latest version ({VERSION}).")
+
+    def _on_update_available(self, info):
+        """Queued slot for the startup background check — runs on the GUI thread."""
+        if info:
+            self._show_update_available(info)
+
+    def _show_update_available(self, info: dict):
+        from src.core.version import VERSION
+        msg = (f"A new version is available: {info.get('latest', '?')} "
+               f"(you have {VERSION}).")
+        if info.get("notes"):
+            msg += f"\n\n{info['notes']}"
+        box = QMessageBox(self)
+        box.setWindowTitle("Update Available")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(msg)
+        url = info.get("url")
+        if url:
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Close)
+            box.setDefaultButton(QMessageBox.StandardButton.Open)
+            if box.exec() == QMessageBox.StandardButton.Open:
+                from PyQt6.QtCore import QUrl
+                from PyQt6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl(url))
+        else:
+            box.exec()
+
+    def _report_bug(self):
+        """Prepare a sanitized bug report (clipboard + Desktop file + GitHub URL)."""
+        from src.core.bug_report import open_bug_report
+        try:
+            result = open_bug_report()
+        except Exception as e:
+            QMessageBox.warning(self, "Report a Bug",
+                                f"Could not prepare the bug report:\n{e}")
+            return
+        lines = ["A bug report was prepared from a sanitized copy of your recent log:"]
+        if result.get("clipboard_set"):
+            lines.append("• Copied to your clipboard.")
+        if result.get("saved_path"):
+            lines.append(f"• Saved to:\n   {result['saved_path']}")
+        lines.append("• The GitHub issue page was opened in your browser.")
+        lines.append("\nIf GitHub isn't reachable, attach the saved file to an email instead.")
+        QMessageBox.information(self, "Report a Bug", "\n".join(lines))
 
     def _build_action_handlers(self):
         """Map action IDs to callables. Called once after _setup_ui."""
