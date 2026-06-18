@@ -174,6 +174,70 @@ def _build_speed_audio_filter(speed: float) -> str:
     return f"aresample={rate},asetrate={adjusted}"
 
 
+# librubberband ('rubberband' filter) availability — cached single probe.
+# Needed for formant shifting; absent in a stripped ffmpeg build we'd otherwise
+# emit an invalid filter graph that fails the whole export.
+_rubberband_available: dict[str, bool] = {}
+
+
+def _has_rubberband() -> bool:
+    """Probe whether ffmpeg exposes the librubberband 'rubberband' filter (cached)."""
+    if "rb" in _rubberband_available:
+        return _rubberband_available["rb"]
+    try:
+        result = subprocess.run(
+            [get_ffmpeg(), "-hide_banner", "-filters"],
+            capture_output=True, text=True, startupinfo=_hide_window(),
+            timeout=10,
+        )
+        ok = result.returncode == 0 and "rubberband" in (result.stdout or "")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        _rubberband_available["rb"] = False
+        log().warning(f"rubberband probe failed: {e} — formant shift disabled")
+        return False
+    _rubberband_available["rb"] = ok
+    if not ok:
+        log().warning("ffmpeg has no 'rubberband' filter — formant shift disabled")
+    return ok
+
+
+# Independent formant shifting is built from a two-pass rubberband chain. The
+# bundled rubberband (R2 engine) honours formant=preserved only when pitch is
+# shifted UP, so the reliable independent direction is DOWNWARD (deeper/warmer
+# timbre). The UI exposes the range the spectral regression test proves
+# (tests/test_ffmpeg_runner.py::test_formant_*). Magnitude is clamped so the
+# pitch ratio 2**(s/12) stays well inside rubberband's 0.01..100 bounds.
+FORMANT_MIN_SEMITONES = -12.0
+FORMANT_MAX_SEMITONES = 0.0
+
+
+def _build_formant_audio_filter(semitones: float) -> str:
+    """Independent formant (timbre) shift that preserves pitch and duration.
+
+    Two-pass librubberband chain: the first pass shifts pitch by the target
+    ratio (formants follow), the second restores the original pitch while
+    *preserving* the now-shifted formant envelope. Net: pitch unchanged,
+    spectral envelope (formants) scaled by 2**(semitones/12).
+
+    Negative semitones lower the formants (deeper, 'larger' voice). Returns ''
+    for ~0, when rubberband is unavailable, or for a positive shift the bundled
+    engine can't deliver (see module note).
+    """
+    if abs(semitones) < 1e-3:
+        return ""
+    s = max(FORMANT_MIN_SEMITONES, min(FORMANT_MAX_SEMITONES, float(semitones)))
+    if abs(s) < 1e-3:
+        return ""
+    if not _has_rubberband():
+        return ""
+    ratio = 2.0 ** (s / 12.0)
+    inv = 1.0 / ratio
+    return (
+        f"rubberband=pitch={ratio:.6f}:formant=shifted,"
+        f"rubberband=pitch={inv:.6f}:formant=preserved"
+    )
+
+
 def _build_color_filters(brightness: float, exposure: float) -> list[str]:
     """Return the ffmpeg video filter fragments for brightness/exposure.
 
@@ -350,6 +414,7 @@ def build_command(
     exposure: float = 0.0,
     normalize_data: dict | None = None,
     target_lufs: float = -14.0,
+    formant: float = 0.0,
     auto_preset: dict | None = None,
 ) -> list[str]:
     cmd = [get_ffmpeg(), "-y"]
@@ -394,24 +459,27 @@ def build_command(
         cmd += ["-c:v", "copy"]
 
     # ── Audio ─────────────────────────────────────────────────
-    # Precedence: mute > speed change (forces re-encode with pitch shift) > reencode > copy
-    # Normalization is chained after any speed filter when present.
-    norm_filter = loudnorm_filter(normalize_data, target_lufs) if normalize_data else ""
+    # Build the audio filter chain in signal order: speed (vinyl pitch) →
+    # formant (independent timbre shift) → loudnorm (final loudness). Any
+    # non-empty chain forces a re-encode; otherwise honour mute/reencode/copy.
     if audio_mode == "mute":
         cmd += ["-an"]
-    elif speed != 1.0:
-        af = _build_speed_audio_filter(speed)
-        if norm_filter:
-            af += "," + norm_filter
-        cmd += ["-af", af]
-        cmd += ["-c:a", "aac", "-b:a", "320k"]
-    elif norm_filter:
-        cmd += ["-af", norm_filter]
-        cmd += ["-c:a", "aac", "-b:a", "320k"]
-    elif audio_mode == "reencode":
-        cmd += ["-c:a", "aac", "-b:a", "320k"]
     else:
-        cmd += ["-c:a", "copy"]
+        af_parts: list[str] = []
+        if speed != 1.0:
+            af_parts.append(_build_speed_audio_filter(speed))
+        formant_filter = _build_formant_audio_filter(formant)
+        if formant_filter:
+            af_parts.append(formant_filter)
+        if normalize_data:
+            af_parts.append(loudnorm_filter(normalize_data, target_lufs))
+        if af_parts:
+            cmd += ["-af", ",".join(af_parts)]
+            cmd += ["-c:a", "aac", "-b:a", "320k"]
+        elif audio_mode == "reencode":
+            cmd += ["-c:a", "aac", "-b:a", "320k"]
+        else:
+            cmd += ["-c:a", "copy"]
 
     cmd += [output_path]
     return cmd
@@ -574,6 +642,7 @@ def export_with_automation(
     exposure: float = 0.0,
     normalize_data: dict | None = None,
     target_lufs: float = -14.0,
+    formant: float = 0.0,
     progress_callback=None,
     process_callback=None,
     auto_preset: dict | None = None,
@@ -716,8 +785,15 @@ def export_with_automation(
                 wav_norm = loudnorm_analyze(audio_wav, target_lufs=target_lufs)
             cmd = [ffmpeg, "-y", "-i", video_out, "-i", audio_wav,
                    "-c:v", "copy"]
+            # Audio chain on the pre-rendered WAV: formant shift → loudnorm.
+            af_parts: list[str] = []
+            formant_filter = _build_formant_audio_filter(formant)
+            if formant_filter:
+                af_parts.append(formant_filter)
             if wav_norm:
-                cmd += ["-af", loudnorm_filter(wav_norm, target_lufs)]
+                af_parts.append(loudnorm_filter(wav_norm, target_lufs))
+            if af_parts:
+                cmd += ["-af", ",".join(af_parts)]
             cmd += ["-c:a", "aac", "-b:a", "320k",
                     "-map", "0:v:0", "-map", "1:a:0", output_path]
             # Cap the mux at 10 minutes — stream-copy + AAC re-encode of an

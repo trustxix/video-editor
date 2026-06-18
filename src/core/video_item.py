@@ -32,6 +32,10 @@ class VideoItem:
     locked: bool = False
     probed: bool = False
     export_listed: bool = False  # manually added to the batch export list
+    # Independent formant (timbre) shift in semitones, applied on export via a
+    # two-pass rubberband chain (pitch and duration preserved). Negative makes
+    # the voice deeper/warmer. See ffmpeg_runner._build_formant_audio_filter.
+    formant: float = 0.0
     audio_normalize: bool = False  # per-clip loudness normalization on export
     normalize_data: dict | None = None  # cached first-pass loudnorm measurements
     speed_keyframes: list = field(default_factory=list)  # [(time_ms, speed), ...]
