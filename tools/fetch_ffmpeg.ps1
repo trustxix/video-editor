@@ -149,6 +149,17 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# The formant-shift feature requires librubberband ('rubberband' filter). Fail
+# the build loudly if the bundled binary lacks it rather than silently shipping
+# an app where the formant slider does nothing. BtbN win64-gpl builds include
+# --enable-librubberband; this guards against an upstream build-flag change.
+$filters = & $bundledFfmpeg -hide_banner -filters 2>&1
+if ($filters -notmatch "rubberband") {
+    Write-Error "[fetch_ffmpeg] Bundled ffmpeg has no 'rubberband' filter — formant shift would be disabled. Aborting."
+    exit 1
+}
+Write-Host "[fetch_ffmpeg] rubberband filter present (formant shift OK)."
+
 Write-Host "[fetch_ffmpeg] Done."
 Write-Host "[fetch_ffmpeg]   $bundledFfmpeg"
 Write-Host "[fetch_ffmpeg]   $verResult"
