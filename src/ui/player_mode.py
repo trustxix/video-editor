@@ -624,6 +624,12 @@ class PlayerMode(QWidget):
         self.player.setVideoSink(self.surface.sink)
         self._duration_ms = 0
         self._seeking = False
+        # Coalesce scrub seeks to ~30/sec so a fast drag doesn't flood
+        # QMediaPlayer.setPosition (decoder thrash / sluggish scrub).
+        self._pending_scrub_pos: int | None = None
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setSingleShot(True)
+        self._scrub_timer.timeout.connect(self._do_scrub)
 
         # Background thumbnail extractor for seek-bar hover preview
         self._thumb_worker = ThumbnailWorker(self)
@@ -1319,11 +1325,19 @@ class PlayerMode(QWidget):
 
     def _on_seek_changed(self, value: int):
         if self._seeking and self._duration_ms > 0:
-            pos = int(value / 1000 * self._duration_ms)
-            self.player.setPosition(pos)
+            self._pending_scrub_pos = int(value / 1000 * self._duration_ms)
+            if not self._scrub_timer.isActive():
+                self._scrub_timer.start(33)
+
+    def _do_scrub(self):
+        if self._pending_scrub_pos is not None:
+            self.player.setPosition(self._pending_scrub_pos)
+            self._pending_scrub_pos = None
 
     def _on_seek_released(self):
         self._seeking = False
+        self._scrub_timer.stop()
+        self._pending_scrub_pos = None
         if self._duration_ms > 0:
             pos = int(self.seek_slider.value() / 1000 * self._duration_ms)
             self.player.setPosition(pos)

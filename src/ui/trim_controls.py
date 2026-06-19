@@ -10,6 +10,7 @@ class RangeSlider(QWidget):
 
     range_changed = pyqtSignal(int, int)  # start_ms, end_ms
     playhead_changed = pyqtSignal(int)   # ms — user clicked/dragged to seek
+    playhead_released = pyqtSignal(int)  # ms — playhead drag ended (settle here)
     focus_taken = pyqtSignal()  # this widget grabbed focus
 
     def __init__(self, parent=None):
@@ -144,7 +145,12 @@ class RangeSlider(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        was_playhead = self._dragging == "playhead"
         self._dragging = None
+        if was_playhead:
+            # Final settle: lets the consumer do the one expensive seek
+            # (audio resync) here instead of on every drag pixel.
+            self.playhead_released.emit(self._playhead)
 
     def keyPressEvent(self, event):
         if self._selected is None:
@@ -181,7 +187,8 @@ class TrimControls(QWidget):
     """Trim panel: range slider + start/end time text fields."""
 
     trim_changed = pyqtSignal(float, float)  # start_s, end_s
-    seek_requested = pyqtSignal(int)  # ms — user clicked timeline to seek
+    seek_requested = pyqtSignal(int)  # ms — user clicked/dragged timeline to seek
+    seek_finished = pyqtSignal(int)   # ms — playhead drag ended, settle here
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -198,6 +205,7 @@ class TrimControls(QWidget):
         self.slider = RangeSlider()
         self.slider.range_changed.connect(self._on_slider_changed)
         self.slider.playhead_changed.connect(self.seek_requested.emit)
+        self.slider.playhead_released.connect(self.seek_finished.emit)
         gl.addWidget(self.slider)
 
         row = QHBoxLayout()

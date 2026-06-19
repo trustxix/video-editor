@@ -24,10 +24,14 @@ class ClickSlider(QSlider):
                 self.minimum(), self.maximum(),
                 int(event.position().x()), self.width(),
             )
-            self.setValue(val)
             event.accept()
+            # Emit sliderPressed BEFORE setValue so any "is the user dragging?"
+            # flag (e.g. player-mode _seeking) is set when the resulting
+            # valueChanged fires — otherwise a click-to-seek while paused
+            # doesn't jog the frame until the button is released.
             self.setSliderDown(True)
             self.sliderPressed.emit()
+            self.setValue(val)
         else:
             super().mousePressEvent(event)
 

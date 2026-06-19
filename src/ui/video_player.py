@@ -549,6 +549,13 @@ class VideoPlayer(QWidget):
         self._pitched.set_speed(rate)
         self.player.setPlaybackRate(rate)
 
+    def scrub(self, ms: int):
+        """Video-only seek for live scrubbing — moves the displayed frame
+        WITHOUT tearing down and recreating the pitched QAudioSink (which would
+        stutter the audio on every drag pixel). Audio is resynced once when the
+        scrub settles, via seek()."""
+        self.player.setPosition(ms)
+
     def seek(self, ms: int):
         self.player.setPosition(ms)
         if (self._pitched_active and self._pitched.ready

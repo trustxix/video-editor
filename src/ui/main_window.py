@@ -280,6 +280,15 @@ class MainWindow(QMainWindow):
         # still None during that window, so without this flag clip navigation
         # could mutate _video_path / queue state mid-setup and corrupt the run.
         self._export_in_progress = False
+        # Scrub coalescing: a fast playhead drag emits a seek per mouse-move
+        # pixel. Collapse those into ~30 video-only seeks/sec (QMediaPlayer is
+        # otherwise flooded and the audio sink would be torn down each pixel);
+        # the pitched audio resyncs once when the drag settles.
+        self._pending_scrub_ms: int | None = None
+        self._scrub_timer = QTimer(self)
+        self._scrub_timer.setSingleShot(True)
+        self._scrub_timer.timeout.connect(self._do_scrub)
+        self._stopping_at_end = False  # latch so trim-end auto-stop fires once
         self._stepped_pos: int | None = None  # accurate position during frame stepping
         # Long-lived background workers (lazy-init on first use; stopped in
         # closeEvent). Single-pending-slot pattern keeps rapid input from
@@ -886,6 +895,7 @@ class MainWindow(QMainWindow):
         self.player.player.playbackStateChanged.connect(self._on_playback_state)
         self.trim.trim_changed.connect(self._on_trim_changed)
         self.trim.seek_requested.connect(self._on_seek_requested)
+        self.trim.seek_finished.connect(self._on_seek_finished)
         self.crop_overlay.crop_changed.connect(self._on_overlay_crop_changed)
         self.crop_overlay.stretch_changed.connect(self._on_stretch_dragged)
         self.spn_stretch_h.valueChanged.connect(self._on_stretch_spinbox_changed)
@@ -1988,9 +1998,25 @@ class MainWindow(QMainWindow):
         self.player.enable_pitched_audio(need_pitched)
 
     def _on_seek_requested(self, ms: int):
-        """User clicked/dragged on the timeline to seek."""
+        """User clicked/dragged the timeline. Coalesce rapid drag seeks into a
+        ~30fps cadence and only move the video frame (no audio-sink churn);
+        audio resyncs in _on_seek_finished when the drag settles."""
         self._stepped_pos = None
         self.player.surface._stepping = False
+        self._stopping_at_end = False
+        self._pending_scrub_ms = ms
+        if not self._scrub_timer.isActive():
+            self._scrub_timer.start(33)  # ~30 video-only seeks/sec max
+
+    def _do_scrub(self):
+        if self._pending_scrub_ms is not None:
+            self.player.scrub(self._pending_scrub_ms)
+            self._pending_scrub_ms = None
+
+    def _on_seek_finished(self, ms: int):
+        """Playhead drag ended — settle on the exact frame and resync audio."""
+        self._scrub_timer.stop()
+        self._pending_scrub_ms = None
         self.player.seek(ms)
 
     def _on_trim_changed(self, start_s: float, end_s: float):
