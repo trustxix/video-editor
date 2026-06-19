@@ -148,14 +148,30 @@ class PitchedAudioPlayer:
         if n <= 0:
             return
         total = len(pcm) // self._CHANNELS
+        pos = self._pos
+        auto = self._automation
+        has_auto = auto is not None and auto.get_keyframes()
+
+        # Fast path: at exactly 1.0x with no automation there is NO resampling,
+        # so copy a contiguous PCM slice instead of running the per-sample
+        # Python interpolation loop. This is the common playback case and the
+        # single biggest cost on the 15ms UI-thread tick.
+        if not has_auto and self._speed == 1.0:
+            idx = int(pos)
+            take = max(0, min(n, total - idx))
+            b = idx * 2
+            chunk = pcm[b:b + take * 2] if take > 0 else array.array('h')
+            if take < n:  # pad the tail with silence
+                chunk = chunk + array.array('h', bytes((n - take) * self._FRAME_BYTES))
+            self._pos = pos + take
+            self._io.write(chunk.tobytes())
+            return
+
         # Preallocate the output (zero-filled) and assign by index instead of
         # growing it with append() — this runs every 15ms on the UI thread,
         # so avoiding 2*n reallocating appends per tick keeps it cheap. Any
         # frames past the end stay silent (the zero fill).
         out = array.array('h', bytes(self._FRAME_BYTES * n))
-        pos = self._pos
-        auto = self._automation
-        has_auto = auto is not None and auto.get_keyframes()
 
         # Per-sample speed: query automation for each sample's position
         for i in range(n):

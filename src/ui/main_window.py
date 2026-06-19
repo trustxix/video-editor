@@ -30,9 +30,8 @@ from src.ui.automation_lane import AutomationLane
 from src.ui.themes import apply_theme, is_dark_theme, DEFAULT_THEME
 from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_fit
 from src.core.ffmpeg_runner import (
-    build_command, get_output_path, get_video_duration, safe_output_path,
-    get_video_fps, get_video_resolution, loudnorm_analyze, run_export,
-    export_with_automation, probe_video,
+    build_command, get_output_path, safe_output_path,
+    loudnorm_analyze, run_export, export_with_automation, probe_video,
 )
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')
@@ -952,9 +951,16 @@ class MainWindow(QMainWindow):
 
         if not item.probed:
             try:
-                item.video_w, item.video_h = get_video_resolution(item.path)
-                item.duration_s = get_video_duration(item.path)
-                item.fps = get_video_fps(item.path)
+                # One cached ffprobe instead of three separate subprocess
+                # launches (resolution + duration + fps). probe_video caches
+                # by (path, mtime); the later _export source-codec probe reuses
+                # it. info is None only if ffprobe failed → handled by the
+                # video_w==0 guard below.
+                info = probe_video(item.path)
+                if info:
+                    item.video_w, item.video_h = info["width"], info["height"]
+                    item.duration_s = info["duration"]
+                    item.fps = info["fps"]
             except FileNotFoundError:
                 QMessageBox.warning(self, "FFmpeg Not Found",
                     "FFmpeg/FFprobe is required but was not found.\n"
