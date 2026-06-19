@@ -1149,7 +1149,8 @@ class MainWindow(QMainWindow):
         Disabled mid-export — removing the clip being exported would
         cause all sorts of chaos with the worker thread.
         """
-        if self._worker is not None or self._batch_queue is not None:
+        if (self._worker is not None or self._batch_queue is not None
+                or self._export_in_progress):
             return
         if not (0 <= self._queue_index < len(self._queue)):
             return
@@ -1219,7 +1220,8 @@ class MainWindow(QMainWindow):
 
     def _clear_queue(self):
         """Remove every clip from the queue (with confirmation)."""
-        if self._worker is not None or self._batch_queue is not None:
+        if (self._worker is not None or self._batch_queue is not None
+                or self._export_in_progress):
             return
         if not self._queue:
             return
@@ -1430,6 +1432,8 @@ class MainWindow(QMainWindow):
             return  # User switched clips
         if ms != self._stepped_pos:
             return  # Newer step request superseded this one
+        if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            return  # Playback resumed before the frame arrived — don't freeze it
         from PyQt6.QtGui import QImage
         image = QImage()
         if image.loadFromData(bmp, "BMP"):
@@ -1441,6 +1445,8 @@ class MainWindow(QMainWindow):
         """Receives a color-corrected preview frame from ColorPreviewWorker."""
         if path != self._video_path:
             return
+        if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            return  # Playback resumed before the preview arrived — don't freeze it
         from PyQt6.QtGui import QImage
         img = QImage()
         if img.loadFromData(bmp, "BMP"):
