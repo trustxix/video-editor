@@ -12,6 +12,8 @@ class AutomationLane(QWidget):
 
     changed = pyqtSignal()  # keyframes were modified
     focus_taken = pyqtSignal()  # this lane grabbed focus (for global selection tracking)
+    gesture_started = pyqtSignal()   # a keyframe drag began (for undo coalescing)
+    gesture_finished = pyqtSignal()  # the keyframe drag ended
 
     _MIN_SPEED = 0.05
     _MAX_SPEED = 2.0
@@ -241,6 +243,7 @@ class AutomationLane(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         self.setFocus()
         self.focus_taken.emit()
+        self.gesture_started.emit()  # coalesce a keyframe drag into one undo step
         x, y = event.pos().x(), event.pos().y()
         self._press_created_idx = -1  # only set when this press creates a keyframe
 
@@ -347,6 +350,7 @@ class AutomationLane(QWidget):
     def mouseReleaseEvent(self, event):
         self._dragging_idx = -1
         self._drag_lock_speed = None
+        self.gesture_finished.emit()
 
     # ── Arrow key nudging for selected keyframe ─────────────
 

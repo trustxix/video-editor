@@ -273,6 +273,11 @@ class MainWindow(QMainWindow):
 
         self._undo_stack: list[dict] = []
         self._redo_stack: list[dict] = []
+        # Undo gesture coalescing: a continuous drag captures one pre-drag
+        # snapshot (on gesture start) and commits it once on release, so one
+        # Ctrl+Z reverts the whole drag instead of a single tick.
+        self._gesture_active = False
+        self._gesture_pre_state: dict | None = None
         self._export_cancelled = False
         # True while _export is in its synchronous pre-roll (notably the
         # loudnorm analysis, which spins a nested QEventLoop). self._worker is
@@ -612,6 +617,8 @@ class MainWindow(QMainWindow):
         # ── Speed automation lane ─────────────────────────────
         self.automation = AutomationLane()
         self.automation.changed.connect(self._on_automation_changed)
+        self.automation.gesture_started.connect(self._undo_begin_gesture)
+        self.automation.gesture_finished.connect(self._undo_end_gesture)
         self.automation.focus_taken.connect(lambda: self._on_widget_focus("automation"))
         self.trim.slider.focus_taken.connect(lambda: self._on_widget_focus("trim"))
         root.addWidget(self.automation)
@@ -686,6 +693,8 @@ class MainWindow(QMainWindow):
         self.sld_speed.setValue(100)
         self.sld_speed.setMinimumWidth(120)  # floor, not ceiling — grows with window
         self.sld_speed.valueChanged.connect(self._on_speed_slider_changed)
+        self.sld_speed.sliderPressed.connect(self._undo_begin_gesture)
+        self.sld_speed.sliderReleased.connect(self._undo_end_gesture)
         efx.addWidget(self.sld_speed, stretch=1)
 
         self.lbl_speed = QLabel("100%")
@@ -766,6 +775,8 @@ class MainWindow(QMainWindow):
             "pitch or timing. 0 = off. (Two-pass rubberband; export only.)"
         )
         self.sld_formant.valueChanged.connect(self._on_formant_changed)
+        self.sld_formant.sliderPressed.connect(self._undo_begin_gesture)
+        self.sld_formant.sliderReleased.connect(self._undo_end_gesture)
         fmt_row.addWidget(self.sld_formant, stretch=1)
         self.lbl_formant = QLabel("Off")
         self.lbl_formant.setFixedWidth(45)
@@ -789,6 +800,8 @@ class MainWindow(QMainWindow):
         self.sld_brightness.setToolTip("Preview is approximate; export is precise (ffmpeg eq)")
         self.sld_brightness.valueChanged.connect(self._on_brightness_changed)
         self.sld_brightness.sliderReleased.connect(self._on_color_slider_released)
+        self.sld_brightness.sliderPressed.connect(self._undo_begin_gesture)
+        self.sld_brightness.sliderReleased.connect(self._undo_end_gesture)
         row.addWidget(self.sld_brightness, stretch=1)
         self.lbl_brightness = QLabel("0")
         self.lbl_brightness.setFixedWidth(35)
@@ -804,6 +817,8 @@ class MainWindow(QMainWindow):
         self.sld_exposure.setToolTip("Photographic stops (-3 to +3). Export is precise (ffmpeg exposure)")
         self.sld_exposure.valueChanged.connect(self._on_exposure_changed)
         self.sld_exposure.sliderReleased.connect(self._on_color_slider_released)
+        self.sld_exposure.sliderPressed.connect(self._undo_begin_gesture)
+        self.sld_exposure.sliderReleased.connect(self._undo_end_gesture)
         row.addWidget(self.sld_exposure, stretch=1)
         self.lbl_exposure = QLabel("0")
         self.lbl_exposure.setFixedWidth(35)
@@ -897,6 +912,8 @@ class MainWindow(QMainWindow):
         self.trim.seek_finished.connect(self._on_seek_finished)
         self.crop_overlay.crop_changed.connect(self._on_overlay_crop_changed)
         self.crop_overlay.stretch_changed.connect(self._on_stretch_dragged)
+        self.crop_overlay.gesture_started.connect(self._undo_begin_gesture)
+        self.crop_overlay.gesture_finished.connect(self._undo_end_gesture)
         self.spn_stretch_h.valueChanged.connect(self._on_stretch_spinbox_changed)
         self.spn_stretch_v.valueChanged.connect(self._on_stretch_spinbox_changed)
 
@@ -1778,10 +1795,45 @@ class MainWindow(QMainWindow):
     def _push_undo(self):
         if self._restoring:
             return
+        if self._gesture_active:
+            # Inside a continuous drag — the gesture's single pre-state entry
+            # (captured at gesture start) represents the whole drag, so per-tick
+            # pushes are coalesced away. One Ctrl+Z then reverts the whole drag.
+            return
         state = self._capture_state()
         if self._undo_stack and self._undo_stack[-1] == state:
             return
         self._undo_stack.append(state)
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _undo_begin_gesture(self):
+        """Start a drag gesture: snapshot the pre-drag state once. Self-heals
+        if a previous gesture's end signal was missed."""
+        if self._restoring:
+            return
+        if self._gesture_active:
+            self._commit_gesture_state()
+        self._gesture_pre_state = self._capture_state()
+        self._gesture_active = True
+
+    def _undo_end_gesture(self):
+        """End a drag gesture: commit the single pre-drag entry if the drag
+        actually changed anything."""
+        self._commit_gesture_state()
+        self._gesture_active = False
+
+    def _commit_gesture_state(self):
+        pre = self._gesture_pre_state
+        self._gesture_pre_state = None
+        if pre is None:
+            return
+        if self._capture_state() == pre:
+            return  # gesture was a no-op (e.g. a click that didn't move)
+        if self._undo_stack and self._undo_stack[-1] == pre:
+            return
+        self._undo_stack.append(pre)
         if len(self._undo_stack) > 50:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
@@ -2065,6 +2117,20 @@ class MainWindow(QMainWindow):
         if self._updating_spinboxes:
             return
         self._push_undo()
+        # Enforce the locked aspect ratio for typed entry too — dragging a
+        # handle already constrains the ratio, so numeric entry must match.
+        # Derive the dependent dimension from whichever box the user edited.
+        ratio = self.crop_overlay._aspect_ratio
+        if ratio is not None:
+            aw, ah = ratio
+            target = aw / ah
+            sender = self.sender()
+            self._updating_spinboxes = True
+            if sender is self.spn_w:
+                self.spn_h.setValue(max(2, int(round(self.spn_w.value() / target))))
+            elif sender is self.spn_h:
+                self.spn_w.setValue(max(2, int(round(self.spn_h.value() * target))))
+            self._updating_spinboxes = False
         self.crop_overlay.set_crop_from_video(
             self.spn_x.value(), self.spn_y.value(),
             self.spn_w.value(), self.spn_h.value()

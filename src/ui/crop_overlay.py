@@ -12,6 +12,8 @@ class CropOverlay(QWidget):
 
     crop_changed = pyqtSignal(int, int, int, int)  # x, y, w, h in video coords
     stretch_changed = pyqtSignal(float, float)      # stretch_h, stretch_v
+    gesture_started = pyqtSignal()   # a drag began (for undo coalescing)
+    gesture_finished = pyqtSignal()  # the drag ended
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -237,6 +239,9 @@ class CropOverlay(QWidget):
         return None
 
     def mousePressEvent(self, event):
+        # A drag begins — let the host snapshot one undo entry for the whole
+        # gesture (a no-op gesture like a view-pan commits nothing).
+        self.gesture_started.emit()
         if event.button() == Qt.MouseButton.MiddleButton:
             # View pan (widget coords — moves the viewport)
             self._panning = True
@@ -403,6 +408,7 @@ class CropOverlay(QWidget):
                 self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseReleaseEvent(self, event):
+        self.gesture_finished.emit()
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = False
             self.unsetCursor()

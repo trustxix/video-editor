@@ -68,3 +68,26 @@ def test_formant_round_trips_through_video_item(window):
 def test_help_menu_actions_exist(window):
     assert "check_updates" in window._menu_actions
     assert "report_bug" in window._menu_actions
+
+
+def test_undo_coalesces_a_drag_gesture(window):
+    """A continuous drag must collapse to exactly one undo entry holding the
+    pre-drag state, so one Ctrl+Z reverts the whole drag (not a single tick)."""
+    n0 = len(window._undo_stack)
+    window._undo_begin_gesture()
+    for val in (10, 20, 30, 40):
+        window.sld_brightness.setValue(val)   # per-tick pushes are coalesced away
+    window._undo_end_gesture()
+    assert len(window._undo_stack) - n0 == 1
+    assert window._undo_stack[-1]["brightness"] == 0  # the pre-drag value
+
+
+def test_aspect_lock_enforced_on_spinbox_entry(window):
+    """A locked aspect ratio must constrain typed crop dims, not just drags."""
+    window._video_w, window._video_h = 1920, 1080
+    window.crop_overlay.set_video_size(1920, 1080)
+    window.crop_overlay.set_aspect_ratio((16, 9))
+    window.spn_w.setValue(800)
+    assert window.spn_h.value() == 450   # 800 * 9/16
+    window.spn_h.setValue(360)
+    assert window.spn_w.value() == 640   # 360 * 16/9
