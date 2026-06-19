@@ -1983,10 +1983,18 @@ class MainWindow(QMainWindow):
                 if abs(auto_speed - self.player._speed) > 0.005:
                     self._apply_speed_live(auto_speed)
 
-            # Stop at trim end — always, not just when trim < clip duration
-            if pos_ms >= end_ms:
+            # Keep pitched audio locked to the video clock during long playback.
+            self.player.resync_audio_if_drifting(pos_ms)
+
+            # Stop at trim end ONCE — pause() is async so further position
+            # ticks arrive; without the latch they'd re-fire pause()+seek()
+            # every tick, retriggering the audio sink at the boundary.
+            if pos_ms >= end_ms and not self._stopping_at_end:
+                self._stopping_at_end = True
                 self.player.player.pause()
                 self.player.seek(end_ms)
+        else:
+            self._stopping_at_end = False
 
     # ── Trim sync ─────────────────────────────────────────────
 

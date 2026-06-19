@@ -100,6 +100,14 @@ class PitchedAudioPlayer:
         """Update speed smoothly — no sink recreation needed."""
         self._speed = speed
 
+    def resync_to(self, source_ms: int):
+        """Snap the read cursor to the given SOURCE timeline position (ms).
+
+        Used to relock audio to the video clock when they drift — the audio
+        runs off its own QAudioSink cadence while video runs off QMediaPlayer,
+        so over long playback at speed != 1 the two can creep apart."""
+        self._pos = max(0.0, float(source_ms) * self._BASE_RATE / 1000.0)
+
     def set_volume(self, volume: float):
         """Set preview volume (linear 0.0-1.0).
 
@@ -485,9 +493,25 @@ class VideoPlayer(QWidget):
         self.player.stop()
         self.player.setSource(QUrl())
         self.surface.reset_zoom()
+        # A fresh clip must always render live frames — clear any leftover
+        # frame-step / colour-preview hold so the new video isn't frozen.
+        self.surface._stepping = False
         self._pitched.extract_audio(path)
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.pause()
+
+    def resync_audio_if_drifting(self, video_ms: int, threshold_ms: int = 80):
+        """Relock pitched audio to the video clock when drift exceeds the
+        threshold. Only acts while pitched audio is the active, playing source;
+        the threshold keeps a tiny, rare correction from becoming a constant
+        audible nudge."""
+        if not (self._pitched_active and self._pitched.ready):
+            return
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        audio_ms = self._pitched._pos * 1000.0 / self._pitched._BASE_RATE
+        if abs(audio_ms - video_ms) > threshold_ms:
+            self._pitched.resync_to(video_ms)
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
