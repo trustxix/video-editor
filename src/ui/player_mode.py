@@ -1230,9 +1230,10 @@ class PlayerMode(QWidget):
                 self.seek_slider.setValue(int(pos_ms / self._duration_ms * 1000))
             self.seek_slider.blockSignals(False)
         self.lbl_time.setText(f"{self._fmt(pos_ms)} / {self._fmt(self._duration_ms)}")
-        # A-B loop
-        if (self._loop_a_ms is not None and self._loop_b_ms is not None
-                and pos_ms >= self._loop_b_ms):
+        # A-B loop — only during playback, not while the user is scrubbing
+        # (otherwise dragging the playhead past B fights the drag every tick).
+        if (not self._seeking and self._loop_a_ms is not None
+                and self._loop_b_ms is not None and pos_ms >= self._loop_b_ms):
             self.player.setPosition(self._loop_a_ms)
         # Preload next playlist file when current is ≥80% played
         self._maybe_preload_next(pos_ms)
