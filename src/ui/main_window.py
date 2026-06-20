@@ -907,6 +907,7 @@ class MainWindow(QMainWindow):
         self.player.duration_changed.connect(self._on_video_duration)
         self.player.position_changed.connect(self._on_playback_position)
         self.player.player.playbackStateChanged.connect(self._on_playback_state)
+        self.player.player.errorOccurred.connect(self._on_editor_media_error)
         self.trim.trim_changed.connect(self._on_trim_changed)
         self.trim.seek_requested.connect(self._on_seek_requested)
         self.trim.seek_finished.connect(self._on_seek_finished)
@@ -2100,6 +2101,17 @@ class MainWindow(QMainWindow):
         self._scrub_timer.stop()
         self._pending_scrub_ms = None
         self.player.seek(ms)
+
+    def _on_editor_media_error(self, error, error_string: str):
+        """Surface a playback decode error. The clip already passed the ffprobe
+        check on load, but QMediaPlayer can still fail to decode a codec the OS
+        lacks — without this the preview just shows black with no explanation."""
+        if error == QMediaPlayer.Error.NoError:
+            return
+        name = Path(self._video_path).name if self._video_path else "clip"
+        self.statusBar().showMessage(
+            f"Cannot play {name}: {error_string or 'unsupported or missing codec'}",
+            10000)
 
     def _on_trim_changed(self, start_s: float, end_s: float):
         if self._restoring:

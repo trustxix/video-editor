@@ -685,6 +685,7 @@ class PlayerMode(QWidget):
         self.player.durationChanged.connect(self._on_duration_changed)
         self.player.playbackStateChanged.connect(self._on_state_changed)
         self.player.mediaStatusChanged.connect(self._on_media_status)
+        self.player.errorOccurred.connect(self._on_media_error)
 
     # ── Directory navigation ──────────────────────────────────
 
@@ -1335,6 +1336,18 @@ class PlayerMode(QWidget):
                     self._load_video(self._playlist[self._playlist_index])
                 elif self._playlist_index < len(self._playlist) - 1:
                     self._go_next()
+
+    def _on_media_error(self, error, error_string: str):
+        """A file failed to load/decode — clear the spinner and surface the
+        reason instead of leaving a silent black screen (e.g. missing codec,
+        corrupt file, unsupported container)."""
+        if error == QMediaPlayer.Error.NoError:
+            return
+        self.surface.set_loading(False)
+        name = Path(self._current_path).name if self._current_path else "file"
+        reason = error_string or "could not be played"
+        self._show_osd(f"Cannot play: {reason}", primary=True)
+        self.lbl_info.setText(f"⚠ {name} — {reason}")
 
     def _on_seek_changed(self, value: int):
         if self._seeking and self._duration_ms > 0:
