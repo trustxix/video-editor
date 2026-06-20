@@ -645,7 +645,9 @@ class PlayerMode(QWidget):
 
     def _connect_signals(self):
         self._dir_tree.clicked.connect(self._on_dir_clicked)
-        self._file_list.doubleClicked.connect(self._on_file_double_clicked)
+        # `activated` fires on double-click AND Enter (vs doubleClicked which is
+        # mouse-only), so the file list opens with the keyboard too.
+        self._file_list.activated.connect(self._on_file_double_clicked)
         self._file_list.customContextMenuRequested.connect(self._on_file_context_menu)
 
         # Surface click/double-click (configurable behavior)

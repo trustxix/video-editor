@@ -82,6 +82,28 @@ def test_undo_coalesces_a_drag_gesture(window):
     assert window._undo_stack[-1]["brightness"] == 0  # the pre-drag value
 
 
+def test_every_keybind_action_has_a_handler(window):
+    """No dead keybinds: every declared editor/player action must have a wired
+    handler, and there must be no orphan handlers."""
+    from src.core.keybinds import ACTION_DEFS, PLAYER_ACTION_DEFS
+    assert set(ACTION_DEFS) == set(window._action_handlers)
+    assert set(PLAYER_ACTION_DEFS) == set(window._player_action_handlers)
+
+
+def test_default_keybinds_parse_with_no_conflicts(window):
+    """Every default binding must parse, and no two defaults in the same
+    context may map to the same key combo."""
+    from src.core.keybinds import ACTION_DEFS, PLAYER_ACTION_DEFS, parse_binding
+    for defs in (ACTION_DEFS, PLAYER_ACTION_DEFS):
+        seen = {}
+        for aid, ad in defs.items():
+            for b in ad.default_bindings:
+                kb = parse_binding(b)
+                assert kb is not None, f"unparseable default {b!r} for {aid}"
+                assert kb not in seen, f"default conflict {b!r}: {seen.get(kb)} and {aid}"
+                seen[kb] = aid
+
+
 def test_aspect_lock_enforced_on_spinbox_entry(window):
     """A locked aspect ratio must constrain typed crop dims, not just drags."""
     window._video_w, window._video_h = 1920, 1080

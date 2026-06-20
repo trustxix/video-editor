@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QPushButton, QFileDialog,
     QProgressBar, QMessageBox, QApplication, QLineEdit, QSlider,
-    QStackedWidget,
+    QStackedWidget, QAbstractItemView,
 )
 from src.ui.widgets import ClickSlider
 from src.ui.player_mode import PlayerMode
@@ -1339,6 +1339,16 @@ class MainWindow(QMainWindow):
                     return super().eventFilter(obj, event)
                 if hasattr(focused, '_selected') and focused._selected is not None:
                     return super().eventFilter(obj, event)
+            # Player-mode file list / dir tree: when one holds focus, arrows,
+            # Home/End/PageUp/Down and Enter must navigate/activate the list,
+            # not seek/jump playback (those keys are bound globally in player
+            # mode). Without this the file browser can't be keyboard-driven.
+            if isinstance(focused, QAbstractItemView) and key in (
+                Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
+                Qt.Key.Key_Home, Qt.Key.Key_End, Qt.Key.Key_PageUp,
+                Qt.Key.Key_PageDown, Qt.Key.Key_Return, Qt.Key.Key_Enter,
+            ):
+                return super().eventFilter(obj, event)
             is_repeat = event.isAutoRepeat()
             kb = keybind_from_key_event(event.modifiers(), event.key())
 
