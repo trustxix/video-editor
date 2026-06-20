@@ -29,7 +29,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFra
 from src.ui.widgets import ClickSlider, CompactVolumeControl
 from src.ui.seek_bar import SeekBar
 from src.ui.thumbnail_worker import ThumbnailWorker, FirstFramePreloader
-from src.core.ffmpeg_runner import probe_video, _probe_cache
+from src.core.ffmpeg_runner import probe_video, _probe_cache, extract_frame
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
 
@@ -55,6 +55,10 @@ class _PlayerSurface(QWidget):
         # of those actually changes.
         self._scaled_cache: QImage | None = None
         self._scaled_key = None
+        # When True, ignore live QVideoSink frames so an ffmpeg-decoded
+        # frame-step image isn't overwritten by QMediaPlayer's keyframe-snapped
+        # seek frame. Cleared when playback resumes / on seek.
+        self._stepping = False
         self.setMinimumSize(320, 180)
         self.setStyleSheet("background: black;")
 
@@ -127,6 +131,8 @@ class _PlayerSurface(QWidget):
         self.update()
 
     def _on_frame(self, frame: QVideoFrame):
+        if self._stepping:
+            return  # keep the accurate frame-step image on screen
         img = frame.toImage()
         if img.isNull():
             # Don't overwrite a placeholder/preload image with a null
@@ -624,6 +630,7 @@ class PlayerMode(QWidget):
         self.player.setVideoSink(self.surface.sink)
         self._duration_ms = 0
         self._seeking = False
+        self._stepped_pos: int | None = None  # accurate position while frame-stepping
         # Coalesce scrub seeks to ~30/sec so a fast drag doesn't flood
         # QMediaPlayer.setPosition (decoder thrash / sluggish scrub).
         self._pending_scrub_pos: int | None = None
@@ -1139,6 +1146,8 @@ class PlayerMode(QWidget):
         self._save_position()
         self.player.stop()
         self.player.setSource(QUrl())
+        self.surface._stepping = False  # new clip renders live frames
+        self._stepped_pos = None
         self._current_path = path
 
         # If we preloaded this file's first frame, paint it immediately
@@ -1261,6 +1270,8 @@ class PlayerMode(QWidget):
     def _on_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            self.surface._stepping = False  # resume live frames
+            self._stepped_pos = None
         else:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
 
@@ -1333,6 +1344,8 @@ class PlayerMode(QWidget):
 
     def _do_scrub(self):
         if self._pending_scrub_pos is not None:
+            self.surface._stepping = False  # a seek supersedes a stepped frame
+            self._stepped_pos = None
             self.player.setPosition(self._pending_scrub_pos)
             self._pending_scrub_pos = None
 
@@ -1340,6 +1353,8 @@ class PlayerMode(QWidget):
         self._seeking = False
         self._scrub_timer.stop()
         self._pending_scrub_pos = None
+        self.surface._stepping = False
+        self._stepped_pos = None
         if self._duration_ms > 0:
             pos = int(self.seek_slider.value() / 1000 * self._duration_ms)
             self.player.setPosition(pos)
@@ -1456,19 +1471,33 @@ class PlayerMode(QWidget):
         self._show_osd("Speed: 1.00x")
 
     def frame_step(self, direction: int):
-        """Step one frame forward (1) or backward (-1)."""
+        """Step one frame forward (1) or backward (-1), frame-accurately.
+
+        QMediaPlayer.setPosition snaps to the nearest keyframe on Windows, so
+        stepping forward by one frame can jump *backward* to the GOP start.
+        Instead, extract the EXACT frame with ffmpeg and display it (blocking
+        the QVideoSink keyframe frame via surface._stepping); setPosition still
+        advances the clock so the timecode and resume point are right."""
         if not self._current_path or self._duration_ms <= 0:
             return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-        # Use probed fps (already cached from _update_info), fallback 30
         fps = 30.0
         info = probe_video(self._current_path)
         if info and info["fps"] > 0:
             fps = info["fps"]
         frame_ms = max(1, int(round(1000 / fps)))
-        pos = max(0, min(self._duration_ms,
-                         self.player.position() + direction * frame_ms))
+        base = self._stepped_pos if self._stepped_pos is not None else self.player.position()
+        pos = max(0, min(self._duration_ms, base + direction * frame_ms))
+        self._stepped_pos = pos
+        bmp = extract_frame(self._current_path, pos / 1000.0)
+        if bmp:
+            img = QImage()
+            if img.loadFromData(bmp, "BMP"):
+                self.surface._stepping = True
+                self.surface._image = img
+                self.surface._scaled_key = None  # force rescale of the new frame
+                self.surface.update()
         self.player.setPosition(pos)
         self._show_osd(self._fmt(pos))
 
@@ -1602,17 +1631,30 @@ class PlayerMode(QWidget):
         self._show_osd("Compact" if tree_vis else "Normal")
 
     def take_screenshot(self):
-        """Capture current frame as PNG to clipboard and file."""
+        """Capture current frame to the clipboard and a PNG next to the video,
+        falling back to the Desktop if that directory isn't writable."""
         if not self._current_path:
             return
-        if self.surface._image and not self.surface._image.isNull():
-            QApplication.clipboard().setImage(self.surface._image)
-            # Also save to file next to the video
-            p = Path(self._current_path)
-            pos_s = self.player.position() / 1000.0
-            out = p.parent / f"{p.stem}_screenshot_{pos_s:.1f}s.png"
-            self.surface._image.save(str(out), "PNG")
-            self._show_osd(f"Screenshot saved")
+        if not (self.surface._image and not self.surface._image.isNull()):
+            return
+        QApplication.clipboard().setImage(self.surface._image)
+        p = Path(self._current_path)
+        pos_s = self.player.position() / 1000.0
+        name = f"{p.stem}_screenshot_{pos_s:.1f}s.png"
+        # Try next to the video; if that fails (read-only mount/NAS), the
+        # Desktop; the clipboard copy above is the always-works fallback.
+        saved = None
+        for target in (p.parent / name, Path.home() / "Desktop" / name):
+            try:
+                if self.surface._image.save(str(target), "PNG"):
+                    saved = target
+                    break
+            except OSError:
+                continue
+        if saved:
+            self._show_osd("Screenshot saved")
+        else:
+            self._show_osd("Screenshot copied to clipboard")
 
     def copy_path(self):
         """Copy current file path to clipboard."""
