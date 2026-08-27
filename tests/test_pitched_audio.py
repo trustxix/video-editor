@@ -24,11 +24,20 @@ def qapp():
 
 
 class _FakeSink:
-    def __init__(self, free):
+    """Stands in for QAudioSink. Never opens an audio device."""
+
+    def __init__(self, free, size=None):
         self._free = free
+        self._size = size if size is not None else free
+
+    def bufferSize(self):
+        return self._size
 
     def bytesFree(self):
         return self._free
+
+    def stop(self):
+        pass
 
 
 def _run_feed(pcm_list, pos, speed, free=100000):
@@ -90,3 +99,151 @@ def test_resync_to_maps_source_ms_to_cursor(qapp):
     assert abs(pa._pos - 48000.0) < 1e-6
     pa.resync_to(0)
     assert pa._pos == 0.0
+
+
+# ── A/V lock: the write cursor is not the playback position ──────────────
+#
+# A Windows QAudioSink hands out a 250 ms buffer. _feed writes ahead into it,
+# so the read cursor (_pos) legitimately leads the audio the user is hearing
+# by the queued amount — and in SOURCE time that lead is (queued ms x speed).
+# Treating the lead as A/V drift is what made playback stutter above ~1.35x.
+
+_BUF_FRAMES = 48000 // 4          # 250 ms at 48 kHz
+_BUF_BYTES = _BUF_FRAMES * 4
+
+
+def _primed_player(speed, queued_frames, pcm_seconds=20):
+    """A PitchedAudioPlayer that has written `queued_frames` still sitting in
+    a full-size sink buffer, at a constant read rate."""
+    from src.ui.video_player import PitchedAudioPlayer
+    pa = PitchedAudioPlayer()
+    pa._pcm = array.array('h', bytes(4 * 48000 * pcm_seconds))
+    pa._speed = speed
+    pa._automation = None
+    free = (_BUF_FRAMES - queued_frames) * 4
+    pa._sink = _FakeSink(free, _BUF_BYTES)
+    pa._io = type("IO", (), {"write": lambda self, b: None})()
+    return pa
+
+
+def test_queued_frames_reads_the_sink_backlog(qapp):
+    pa = _primed_player(1.0, 5000)
+    pa._written = 10000
+    assert pa.queued_frames() == 5000
+    # Never reports more than has actually been written.
+    pa._written = 100
+    assert pa.queued_frames() == 100
+
+
+def test_playback_position_subtracts_the_queued_lead(qapp):
+    """At 1.35x a full 250 ms buffer puts the write cursor 337 ms of source
+    time ahead. playback_position_ms must report the heard position, not that."""
+    speed = 1.35
+    pa = _primed_player(speed, _BUF_FRAMES)
+    # Simulate 60 ticks of 800 output frames each, written at a constant rate.
+    pos = 0.0
+    for _ in range(60):
+        pa._marks.append((pa._written, pos))
+        pa._written += 800
+        pos += 800 * speed
+    pa._pos = pos
+
+    write_ms = pa._pos * 1000.0 / 48000
+    heard_ms = pa.playback_position_ms()
+    lead_ms = write_ms - heard_ms
+    expected_lead = _BUF_FRAMES / 48000 * 1000 * speed   # 250 ms x 1.35
+    assert abs(lead_ms - expected_lead) < 5, (lead_ms, expected_lead)
+    # And the bug: the raw write cursor is way past the 80 ms resync threshold.
+    assert lead_ms > 80
+
+
+@pytest.fixture
+def playing_player(qapp):
+    """A VideoPlayer whose QMediaPlayer is stubbed to report PlayingState, with
+    pitched audio primed and a full sink backlog. No media is loaded and no
+    audio device is ever opened."""
+    from PyQt6.QtMultimedia import QMediaPlayer
+    from src.ui.video_player import VideoPlayer
+
+    vp = VideoPlayer()
+    real_player = vp.player
+    vp.player = type("P", (), {
+        "playbackState": lambda self: QMediaPlayer.PlaybackState.PlayingState,
+    })()
+    yield vp
+    vp.player = real_player
+    vp.release()
+    vp.deleteLater()
+
+
+def _prime(vp, speed, ticks=60, frames=800):
+    pa = vp._pitched
+    vp._pitched_active = True
+    pa._pcm = array.array('h', bytes(4 * 48000 * 20))
+    pa._speed = speed
+    pa._sink = _FakeSink(0, _BUF_BYTES)      # buffer completely full
+    pa._io = type("IO", (), {"write": lambda self, b: None})()
+    pos = 0.0
+    for _ in range(ticks):
+        pa._marks.append((pa._written, pos))
+        pa._written += frames
+        pos += frames * speed
+    pa._pos = pos
+    return pa
+
+
+@pytest.mark.parametrize("speed", [1.0, 1.2, 1.35, 1.5, 2.0])
+def test_resync_does_not_fire_on_buffer_lead(playing_player, speed):
+    """Regression: the write-cursor comparison fired on ~97% of position ticks
+    at every speed, yanking the read cursor backwards each time. With the
+    playback position it must not fire at all when audio is actually in sync."""
+    pa = _prime(playing_player, speed)
+    video_ms = pa.playback_position_ms()      # audio and video agree
+    before = pa._pos
+    playing_player.resync_audio_if_drifting(int(round(video_ms)))
+    assert pa._pos == before, "in-sync audio must not be resynced"
+
+
+def test_resync_shifts_by_the_error_and_keeps_the_lead(playing_player):
+    """A genuine drift must still be corrected — by the measured error, so the
+    buffer lead survives (slamming _pos to video_ms destroyed it)."""
+    pa = _prime(playing_player, 1.35)
+    heard_ms = pa.playback_position_ms()
+    before = pa._pos
+    drift = 300.0                              # video is 300 ms ahead
+    playing_player.resync_audio_if_drifting(int(round(heard_ms + drift)))
+
+    moved_ms = (pa._pos - before) * 1000.0 / 48000
+    assert abs(moved_ms - drift) < 1.0, moved_ms
+    # The lead over the queued audio is preserved, not thrown away.
+    assert pa._pos > before
+
+
+def test_block_speed_lookup_tracks_the_per_sample_curve(qapp):
+    """Sampling the curve once per SPEED_LOOKUP_BLOCK frames instead of per
+    frame must not measurably change where the read cursor ends up. The block
+    holds the speed from the block's start, so on a rising ramp it lags very
+    slightly; the bound below is what that costs over the steepest ramp the
+    automation lane can produce (0.05x -> 2.0x across 500 ms)."""
+    from src.core.speed_curve import SPEED_LOOKUP_BLOCK, SpeedCurve
+
+    kf = [(0, 0.05), (500, 2.0)]
+    per_sample = SpeedCurve(kf, 1.0)
+    blocked = SpeedCurve(kf, 1.0)
+    rate = 48000
+    n = rate  # one second of output
+
+    pos = 0.0
+    for _ in range(n):
+        pos += per_sample.get_speed_at(int(pos * 1000 / rate))
+
+    bpos = 0.0
+    i = 0
+    while i < n:
+        speed = blocked.get_speed_at(int(bpos * 1000 / rate))
+        for _ in range(min(SPEED_LOOKUP_BLOCK, n - i)):
+            bpos += speed
+            i += 1
+
+    diff_ms = abs(pos - bpos) * 1000.0 / rate
+    assert diff_ms < 5.0, diff_ms

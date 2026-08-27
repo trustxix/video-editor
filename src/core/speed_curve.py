@@ -5,6 +5,14 @@ pipeline (ffmpeg_runner calls this from worker threads). Separating the
 math from the QWidget avoids creating GUI objects on background threads.
 """
 
+# Resampling loops look the curve up once per this many output samples
+# instead of once per sample. At 48 kHz that is 1.33 ms of audio, over which
+# even the steepest curve the UI can draw moves the read rate by a fraction
+# of a sample — inaudible — while cutting the lookup cost by 64x. Shared by
+# the live preview (video_player._feed) and the export (prerender_audio) so
+# the two stay the same algorithm.
+SPEED_LOOKUP_BLOCK = 64
+
 
 class SpeedCurve:
     """Linear interpolation over speed keyframes."""

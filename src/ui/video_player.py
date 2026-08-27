@@ -1,6 +1,7 @@
 import array
 import subprocess
 import threading
+from collections import deque
 
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QStyle
 from src.ui.widgets import ClickSlider
@@ -9,6 +10,7 @@ from PyQt6.QtCore import Qt, QRect, QPointF, pyqtSignal, QUrl, QTimer
 from PyQt6.QtGui import QPainter
 
 from src.core.paths import get_ffmpeg
+from src.core.speed_curve import SPEED_LOOKUP_BLOCK
 
 
 class PitchedAudioPlayer:
@@ -31,7 +33,13 @@ class PitchedAudioPlayer:
         self._timer.timeout.connect(self._feed)
         self._speed = 1.0
         self._volume = 1.0  # Linear 0.0-1.0 — re-applied to each new sink in play()
-        self._pos = 0.0  # fractional frame position in input
+        self._pos = 0.0  # fractional frame position in input (WRITE cursor)
+        # Output frames handed to the sink since play(), plus a short history
+        # of (written_frames, source_pos) so the source position of the audio
+        # currently being HEARD can be recovered — the write cursor above runs
+        # ahead of it by whatever is still queued in the sink.
+        self._written = 0
+        self._marks: deque[tuple[int, float]] = deque(maxlen=128)
         self._gen = 0
         self._automation = None  # set to AutomationLane for per-sample speed lookup
         self._extract_proc: subprocess.Popen | None = None  # current ffmpeg PCM extraction
@@ -108,6 +116,57 @@ class PitchedAudioPlayer:
         so over long playback at speed != 1 the two can creep apart."""
         self._pos = max(0.0, float(source_ms) * self._BASE_RATE / 1000.0)
 
+    def shift_cursor(self, delta_ms: float):
+        """Nudge the write cursor by delta_ms of SOURCE time.
+
+        Unlike resync_to this preserves the cursor's lead over the sink's
+        queued audio, which is what keeps the heard audio aligned with the
+        displayed frame — it corrects the error without discarding the lead.
+        """
+        self._pos = max(0.0, self._pos + delta_ms * self._BASE_RATE / 1000.0)
+
+    def queued_frames(self) -> int:
+        """Output frames handed to the sink but not yet played."""
+        if self._sink is None:
+            return 0
+        size = self._sink.bufferSize()
+        if size <= 0:
+            return 0
+        queued = (size - self._sink.bytesFree()) // self._FRAME_BYTES
+        return max(0, min(self._written, queued))
+
+    def _source_pos_at(self, out_frame: int) -> float:
+        """Source frame position that output frame `out_frame` was built from."""
+        marks = self._marks
+        if not marks:
+            return self._pos
+        prev_w, prev_p = marks[0]
+        if out_frame <= prev_w:
+            return prev_p
+        for w, p in marks:
+            if w > out_frame:
+                span = w - prev_w
+                if span <= 0:
+                    return prev_p
+                return prev_p + (p - prev_p) * (out_frame - prev_w) / span
+            prev_w, prev_p = w, p
+        # Newer than the last mark — extrapolate at the current read rate.
+        return prev_p + (out_frame - prev_w) * self._speed
+
+    def playback_position_ms(self) -> float:
+        """Source-timeline position (ms) of the audio being heard right now.
+
+        `self._pos` is the WRITE cursor. It legitimately runs ahead of what the
+        listener hears by however much audio is sitting in the sink's buffer —
+        in source time that lead is (queued ms x speed), and a Windows
+        QAudioSink buffer is 250 ms, so at 1.35x the write cursor is a third of
+        a second ahead. That lead is correct: it is exactly what makes the
+        audio land in sync when it finally plays. Only this position may be
+        compared against the video clock.
+        """
+        played = max(0, self._written - self.queued_frames())
+        return self._source_pos_at(played) * 1000.0 / self._BASE_RATE
+
     def set_volume(self, volume: float):
         """Set preview volume (linear 0.0-1.0).
 
@@ -132,6 +191,8 @@ class PitchedAudioPlayer:
         self._sink.setVolume(self._volume)  # Re-apply persisted slider value
         self._io = self._sink.start()
         self._pos = float(position_ms * self._BASE_RATE / 1000)
+        self._written = 0
+        self._marks.clear()
         self._feed()  # prime buffer immediately
         self._timer.start(15)
 
@@ -156,6 +217,11 @@ class PitchedAudioPlayer:
         # so copy a contiguous PCM slice instead of running the per-sample
         # Python interpolation loop. This is the common playback case and the
         # single biggest cost on the 15ms UI-thread tick.
+        # Every write records where in the source it started, so
+        # playback_position_ms can map the sink's play cursor back to a source
+        # position later.
+        self._marks.append((self._written, pos))
+
         if not has_auto and self._speed == 1.0:
             idx = int(pos)
             take = max(0, min(n, total - idx))
@@ -164,6 +230,7 @@ class PitchedAudioPlayer:
             if take < n:  # pad the tail with silence
                 chunk = chunk + array.array('h', bytes((n - take) * self._FRAME_BYTES))
             self._pos = pos + take
+            self._written += n
             self._io.write(chunk.tobytes())
             return
 
@@ -173,28 +240,36 @@ class PitchedAudioPlayer:
         # frames past the end stay silent (the zero fill).
         out = array.array('h', bytes(self._FRAME_BYTES * n))
 
-        # Per-sample speed: query automation for each sample's position
-        for i in range(n):
+        # Speed is sampled once per SPEED_LOOKUP_BLOCK output frames rather
+        # than once per frame: the curve moves imperceptibly over 1.33ms of
+        # audio, and the lookup was the dominant cost of this UI-thread tick.
+        i = 0
+        ended = False
+        while i < n and not ended:
             if has_auto:
-                time_ms = pos * 1000 / self._BASE_RATE
-                speed = auto.get_speed_at(int(time_ms))
+                speed = auto.get_speed_at(int(pos * 1000 / self._BASE_RATE))
             else:
                 speed = self._speed
-            idx = int(pos)
-            # Strict bound: we read pcm[b], pcm[b+1], pcm[b+2], pcm[b+3]
-            # where b = idx*2, so idx must be <= total-2 for all four to
-            # be in range. Past that we leave the rest silent and stop.
-            if idx > total - 2:
-                break
-            frac = pos - idx
-            b = idx * 2
-            j = i * 2
-            s1 = pcm[b];     s2 = pcm[b + 2]
-            out[j] = int(s1 + (s2 - s1) * frac)
-            s1 = pcm[b + 1]; s2 = pcm[b + 3]
-            out[j + 1] = int(s1 + (s2 - s1) * frac)
-            pos += speed
+            stop = min(i + SPEED_LOOKUP_BLOCK, n)
+            while i < stop:
+                idx = int(pos)
+                # Strict bound: we read pcm[b], pcm[b+1], pcm[b+2], pcm[b+3]
+                # where b = idx*2, so idx must be <= total-2 for all four to
+                # be in range. Past that we leave the rest silent and stop.
+                if idx > total - 2:
+                    ended = True
+                    break
+                frac = pos - idx
+                b = idx * 2
+                j = i * 2
+                s1 = pcm[b];     s2 = pcm[b + 2]
+                out[j] = int(s1 + (s2 - s1) * frac)
+                s1 = pcm[b + 1]; s2 = pcm[b + 3]
+                out[j + 1] = int(s1 + (s2 - s1) * frac)
+                pos += speed
+                i += 1
         self._pos = pos
+        self._written += n
         self._io.write(out.tobytes())
 
     def stop(self):
@@ -520,14 +595,24 @@ class VideoPlayer(QWidget):
         """Relock pitched audio to the video clock when drift exceeds the
         threshold. Only acts while pitched audio is the active, playing source;
         the threshold keeps a tiny, rare correction from becoming a constant
-        audible nudge."""
+        audible nudge.
+
+        The comparison uses the pitched player's PLAYBACK position, never its
+        write cursor. The write cursor legitimately leads by whatever is queued
+        in the sink, and in source time that lead is (queued ms x speed) — with
+        a 250 ms Windows QAudioSink buffer that is 250 ms at 1.0x and 500 ms at
+        2.0x. Comparing the write cursor read the lead as drift, so above
+        ~1.3x this fired on essentially every position tick and yanked the read
+        cursor backwards each time, chopping playback into restarting fragments
+        (the "stutter above 1.35x" bug). Correcting by the measured error keeps
+        the lead intact."""
         if not (self._pitched_active and self._pitched.ready):
             return
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             return
-        audio_ms = self._pitched._pos * 1000.0 / self._pitched._BASE_RATE
-        if abs(audio_ms - video_ms) > threshold_ms:
-            self._pitched.resync_to(video_ms)
+        error_ms = video_ms - self._pitched.playback_position_ms()
+        if abs(error_ms) > threshold_ms:
+            self._pitched.shift_cursor(error_ms)
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:

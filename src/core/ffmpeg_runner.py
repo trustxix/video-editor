@@ -602,7 +602,7 @@ def prerender_audio(
     failed (instead of silently producing a video with no audio track)."""
     import array, wave
 
-    from src.core.speed_curve import SpeedCurve
+    from src.core.speed_curve import SPEED_LOOKUP_BLOCK, SpeedCurve
     lane = SpeedCurve(keyframes, base_speed)
 
     BASE_RATE = 48000
@@ -661,17 +661,22 @@ def prerender_audio(
     # b = idx*2. With idx == total_frames-2, b+3 == 2*total_frames-1, the
     # last valid array index. Without this strict bound, an exact landing
     # at idx == total_frames-1 reads past the array.
+    # Speed is sampled once per SPEED_LOOKUP_BLOCK output frames, matching the
+    # live PitchedAudioPlayer._feed loop exactly so the export sounds like the
+    # preview.
     while pos < end_pos and int(pos) <= total_frames - 2:
-        time_ms = pos * 1000 / BASE_RATE
-        speed = lane.get_speed_at(int(time_ms))
-        idx = int(pos)
-        frac = pos - idx
-        b = idx * 2
-        s1 = pcm[b];     s2 = pcm[b + 2]
-        out.append(int(s1 + (s2 - s1) * frac))
-        s1 = pcm[b + 1]; s2 = pcm[b + 3]
-        out.append(int(s1 + (s2 - s1) * frac))
-        pos += speed
+        speed = lane.get_speed_at(int(pos * 1000 / BASE_RATE))
+        for _ in range(SPEED_LOOKUP_BLOCK):
+            if pos >= end_pos or int(pos) > total_frames - 2:
+                break
+            idx = int(pos)
+            frac = pos - idx
+            b = idx * 2
+            s1 = pcm[b];     s2 = pcm[b + 2]
+            out.append(int(s1 + (s2 - s1) * frac))
+            s1 = pcm[b + 1]; s2 = pcm[b + 3]
+            out.append(int(s1 + (s2 - s1) * frac))
+            pos += speed
 
     with wave.open(output_wav, 'wb') as w:
         w.setnchannels(2)
