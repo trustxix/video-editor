@@ -19,6 +19,25 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+def _add_bundled_ffmpeg_to_path() -> None:
+    """Put the FFmpeg bundled next to the built app on PATH when the system has
+    none.
+
+    Runs at conftest import time, before the test modules are collected, because
+    several of them decide `@pytest.mark.skipif(not _have_ffmpeg())` at their own
+    import time. Without this, every export/format/formant E2E test silently
+    skips on a machine where FFmpeg was never installed system-wide — a green
+    run that verified nothing."""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+    bundled = Path(__file__).parent.parent / "dist" / "Video Editor" / "ffmpeg"
+    if (bundled / "ffmpeg.exe").exists() and (bundled / "ffprobe.exe").exists():
+        os.environ["PATH"] = f"{bundled}{os.pathsep}{os.environ.get('PATH', '')}"
+
+
+_add_bundled_ffmpeg_to_path()
+
+
 def _have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
