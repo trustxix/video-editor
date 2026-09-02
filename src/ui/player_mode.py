@@ -29,6 +29,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFra
 from src.ui.widgets import ClickSlider, CompactVolumeControl
 from src.ui.seek_bar import SeekBar
 from src.ui.thumbnail_worker import ThumbnailWorker, FirstFramePreloader
+from src.ui.frame_converter import FrameConverter
 from src.core.ffmpeg_runner import probe_video, _probe_cache, extract_frame
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
@@ -58,7 +59,19 @@ class _PlayerSurface(QWidget):
         # When True, ignore live QVideoSink frames so an ffmpeg-decoded
         # frame-step image isn't overwritten by QMediaPlayer's keyframe-snapped
         # seek frame. Cleared when playback resumes / on seek.
-        self._stepping = False
+        #
+        # Set up before the converter's first use — assigning `_stepping` goes
+        # through the property below, which touches both of these.
+        self.__stepping = False
+        self._frame_gen = 0
+
+        # QVideoFrame -> QImage runs on a worker thread and is coalesced to the
+        # display cadence; inline it cost 8-19 ms of GUI thread per delivered
+        # frame at 1440p120. The _scaled_cache below avoids the *rescale*, not
+        # the conversion — see frame_converter.py.
+        self._converter = FrameConverter(self)
+        self._converter.image_ready.connect(self._on_image_ready)
+
         self.setMinimumSize(320, 180)
         self.setStyleSheet("background: black;")
 
@@ -130,10 +143,37 @@ class _PlayerSurface(QWidget):
             self._osd_opacity = 1.0
         self.update()
 
+    @property
+    def _stepping(self) -> bool:
+        return self.__stepping
+
+    @_stepping.setter
+    def _stepping(self, value: bool):
+        """Assigning this flag also invalidates any conversion in flight.
+
+        Callers set `_stepping = True` and then assign `_image` directly (the
+        ffmpeg-decoded frame-step image). A conversion that started before that
+        would land afterwards and overwrite it, so the generation token is
+        bumped here and stale results are dropped in `_on_image_ready`.
+
+        Re-assigning the same value is a no-op — clearing an already-clear flag
+        must not cost a queued frame."""
+        value = bool(value)
+        if value == self.__stepping:
+            return
+        self.__stepping = value
+        self._frame_gen += 1
+        self._converter.discard_pending()
+
     def _on_frame(self, frame: QVideoFrame):
         if self._stepping:
             return  # keep the accurate frame-step image on screen
-        img = frame.toImage()
+        # Just a refcounted handle — no pixel work on the GUI thread.
+        self._converter.submit(frame, self._frame_gen)
+
+    def _on_image_ready(self, img: QImage, gen: int) -> None:
+        if gen != self._frame_gen or self._stepping:
+            return  # Superseded by a frame-step, a seek or a new file
         if img.isNull():
             # Don't overwrite a placeholder/preload image with a null
             # frame — QVideoSink emits these briefly between setSource
@@ -147,8 +187,16 @@ class _PlayerSurface(QWidget):
         the next QVideoSink frame arrives. Pass None to clear."""
         if img is None or img.isNull():
             return
+        # Same reasoning as the _stepping setter: a conversion started before
+        # this call must not land on top of the placeholder.
+        self._frame_gen += 1
+        self._converter.discard_pending()
         self._image = img
         self.update()
+
+    def shutdown(self) -> None:
+        """Stop the conversion thread. Call once, on application shutdown."""
+        self._converter.shutdown()
 
     def set_loading(self, state: bool) -> None:
         """Show/hide the loading spinner overlay."""
@@ -1733,6 +1781,7 @@ class PlayerMode(QWidget):
             self._preloader.stop()
         except Exception:
             pass
+        self.surface.shutdown()
 
     def set_volume(self, value: int):
         """Set volume from persisted settings."""
