@@ -75,14 +75,28 @@ def test_feed_1x_from_offset(qapp):
 def test_feed_1x_fastpath_equals_slowpath(qapp):
     """The fast path must be sample-identical to the interpolation loop at 1.0x.
 
-    Use a buffer larger than one feed tick (960 frames) so neither path hits
-    the end-of-stream boundary (where they legitimately differ by one frame:
-    the slow path drops the final frame because interpolation needs idx+1)."""
-    pcm = [((i * 37) % 65536) - 32768 for i in range(4000)]  # 2000 frames > tick
-    fast, _ = _run_feed(pcm, 0, 1.0)
-    n = len(fast) // 2  # one tick = 960 frames, well inside the buffer
+    `free` is set so the write is smaller than the PCM buffer — neither path
+    then hits the end-of-stream boundary, where they legitimately differ by one
+    frame (the slow path drops the final frame because interpolation needs
+    idx+1)."""
+    pcm = [((i * 37) % 65536) - 32768 for i in range(4000)]  # 2000 frames
+    fast, _ = _run_feed(pcm, 0, 1.0, free=960 * 4)           # 960 frames
+    n = len(fast) // 2
+    assert n == 960, n
     # Slow path at 1.0x on integer pos: out[i] = pcm[2i] (frac == 0).
     assert list(fast) == pcm[:2 * n]
+
+
+def test_feed_fills_the_whole_sink_not_a_fixed_cap(qapp):
+    """Regression: _feed used to cap each write at 960 frames — 20 ms of audio
+    per 15 ms tick, so a drained buffer refilled at +5 ms/tick and took ~750 ms
+    to recover. It must write everything the sink reports as free."""
+    free_frames = 48000 // 2                       # a full 500 ms buffer
+    # More source than the sink can take, kept inside the int16 range.
+    pcm = [(i % 30000) - 15000 for i in range(2 * (free_frames + 1000))]
+    out, newpos = _run_feed(pcm, 0, 1.0, free=free_frames * 4)
+    assert len(out) // 2 == free_frames
+    assert newpos == float(free_frames)
 
 
 def test_feed_2x_still_runs_slowpath(qapp):
@@ -172,7 +186,7 @@ def playing_player(qapp):
     })()
     yield vp
     vp.player = real_player
-    vp.release()
+    vp.shutdown()          # terminal teardown: also stops the conversion thread
     vp.deleteLater()
 
 

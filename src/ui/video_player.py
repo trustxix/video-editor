@@ -24,6 +24,13 @@ class PitchedAudioPlayer:
     _BASE_RATE = 48000
     _CHANNELS = 2
     _FRAME_BYTES = _CHANNELS * 2
+    # Requested sink depth. Windows hands out 250 ms by default, which is only
+    # ~16 feed ticks of headroom — one GUI-thread hitch longer than that and the
+    # sink runs dry. 500 ms doubles the margin. The request is advisory: the
+    # backend may ignore or round it, so every calculation that depends on the
+    # depth reads the real `bufferSize()` back rather than assuming this value.
+    # Costs nothing in latency because play() recreates the sink on every seek.
+    _BUFFER_MS = 500
 
     def __init__(self):
         self._pcm: array.array | None = None  # array('h'), interleaved stereo
@@ -188,6 +195,9 @@ class PitchedAudioPlayer:
         fmt.setChannelCount(self._CHANNELS)
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
         self._sink = QAudioSink(fmt)
+        # Must be set before start() — Qt ignores it afterwards.
+        self._sink.setBufferSize(
+            self._BASE_RATE * self._BUFFER_MS // 1000 * self._FRAME_BYTES)
         self._sink.setVolume(self._volume)  # Re-apply persisted slider value
         self._io = self._sink.start()
         self._pos = float(position_ms * self._BASE_RATE / 1000)
@@ -204,8 +214,15 @@ class PitchedAudioPlayer:
             pcm = self._pcm
         if not self._io or not pcm or not self._sink:
             return
+        # Fill everything the sink will take. There used to be a 960-frame cap
+        # here, which is 20 ms of audio per 15 ms tick: the buffer refilled at
+        # only +5 ms per tick, so recovering from empty took ~750 ms and any
+        # missed tick left it dry. In steady state a tick frees fewer frames
+        # than that anyway, so lifting the cap only changes the recovery path
+        # (and the initial prime, which now fills the buffer in one write).
+        # `bytesFree()` is bounded by the sink's own buffer, so this is bounded.
         free = self._sink.bytesFree()
-        n = min(960, free // self._FRAME_BYTES)
+        n = free // self._FRAME_BYTES
         if n <= 0:
             return
         total = len(pcm) // self._CHANNELS
