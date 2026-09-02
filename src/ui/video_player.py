@@ -220,7 +220,9 @@ class PitchedAudioPlayer:
         # only +5 ms per tick, so recovering from empty took ~750 ms and any
         # missed tick left it dry. In steady state a tick frees fewer frames
         # than that anyway, so lifting the cap only changes the recovery path
-        # (and the initial prime, which now fills the buffer in one write).
+        # and the initial prime, which now fills the buffer in one write —
+        # measured 5.7 ms for a 500 ms buffer through the interpolation loop,
+        # once per play/seek, and effectively free on the 1.0x fast path.
         # `bytesFree()` is bounded by the sink's own buffer, so this is bounded.
         free = self._sink.bytesFree()
         n = free // self._FRAME_BYTES

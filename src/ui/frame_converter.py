@@ -101,6 +101,16 @@ class FrameConverter(QObject):
         self._cooling = False     # the minimum gap between conversions
         self._shutdown = False
 
+        # Single-shot: armed when a conversion starts, so the *first* frame
+        # after an idle period converts immediately (no added latency) and
+        # only a sustained stream gets throttled to the display cadence.
+        # Built before the thread so every field shutdown() touches exists by
+        # the time anything can call it.
+        self._cooldown = QTimer(self)
+        self._cooldown.setSingleShot(True)
+        self._cooldown.setInterval(interval_ms)
+        self._cooldown.timeout.connect(self._on_cooldown)
+
         self._thread = QThread(self)
         self._thread.setObjectName("frame-convert")
         self._worker = _ConverterWorker()
@@ -112,16 +122,10 @@ class FrameConverter(QObject):
         # Backstop: a QThread destroyed while still running aborts the process.
         # The owning surface is expected to call shutdown() explicitly, but a
         # surface that is simply dropped must not take the app down with it.
+        # `destroyed` is emitted from ~QObject before children are deleted, so
+        # this converter is still alive to stop its thread when it fires.
         if parent is not None:
             parent.destroyed.connect(self._on_owner_destroyed)
-
-        # Single-shot: armed when a conversion starts, so the *first* frame
-        # after an idle period converts immediately (no added latency) and
-        # only a sustained stream gets throttled to the display cadence.
-        self._cooldown = QTimer(self)
-        self._cooldown.setSingleShot(True)
-        self._cooldown.setInterval(interval_ms)
-        self._cooldown.timeout.connect(self._on_cooldown)
 
     def submit(self, frame: QVideoFrame, gen: int):
         """Hand over the newest frame. Replaces any frame not yet started —
