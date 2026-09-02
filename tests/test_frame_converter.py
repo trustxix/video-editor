@@ -191,6 +191,57 @@ def test_display_interval_falls_back_without_a_screen(qapp, monkeypatch):
     assert fc.display_interval_ms() == 16
 
 
+def test_owner_destroyed_reaches_a_live_child(qapp):
+    """FrameConverter stops its thread from its owner's `destroyed` signal.
+    That only works because the owner emits `destroyed` while its non-widget
+    children are still alive — QWidget also deletes children inside its own
+    destructor, so the ordering is what makes the backstop reachable at all.
+    If a Qt/PyQt upgrade reverses it, fail here rather than aborting the
+    process with 'QThread: Destroyed while thread is still running'."""
+    from PyQt6.QtCore import QEvent
+    from PyQt6.QtWidgets import QWidget
+
+    order = []
+
+    class _Child(QObject):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.destroyed.connect(lambda *_: order.append("child"))
+
+    w = QWidget()
+    _Child(w)
+    w.destroyed.connect(lambda *_: order.append("parent"))
+    w.deleteLater()
+    qapp.processEvents()
+    qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+
+    assert order[:1] == ["parent"], (
+        f"Qt now destroys children first (order={order}); FrameConverter's "
+        "destroyed-backstop can no longer stop its thread in time")
+
+
+def test_dropping_the_owner_stops_the_thread(qapp):
+    """The backstop end to end. Before it existed, a surface dropped without
+    shutdown() aborted the whole process — it happened in this test suite."""
+    from PyQt6.QtCore import QEvent
+    from PyQt6.QtWidgets import QWidget
+    from src.ui.frame_converter import FrameConverter
+
+    w = QWidget()
+    conv = FrameConverter(w)
+    assert conv._thread.isRunning()
+
+    w.deleteLater()
+    del w
+    qapp.processEvents()
+    qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+
+    # `_shutdown` is a plain Python attribute, so it outlives the C++ object.
+    assert conv._shutdown, "the owner was destroyed with the thread still running"
+
+
 def test_submits_after_shutdown_are_ignored(qapp):
     from src.ui.frame_converter import FrameConverter
 
@@ -263,6 +314,39 @@ def test_zoom_changed_fires_once_on_the_first_frame(surface, qapp):
     surface._on_frame(_frame(120))
     assert _spin(qapp, lambda: surface._image.pixel(3, 3) == 0xFF_78_78_78)
     assert len(fired) == 1, "zoom_changed fired again on a later frame"
+
+
+def test_a_null_frame_does_not_burn_the_zoom_changed_one_shot(surface, qapp):
+    """release() drops the source, QVideoSink answers with a null frame, and
+    the next clip loads. If the null is stored, `first` is already False when
+    the real frame lands and CropOverlay never gets its one rebuild — so the
+    crop box stays mapped to the bare widget rect, black bars included."""
+    fired = []
+    surface.zoom_changed.connect(lambda: fired.append(1))
+
+    surface._on_image_ready(QImage(), surface._frame_gen)
+    assert surface._image is None, "a null frame was stored"
+    assert fired == [], "a null frame emitted zoom_changed"
+
+    surface._on_frame(_frame(200))
+    assert _spin(qapp, lambda: surface._image is not None)
+    assert len(fired) == 1, "the real first frame did not emit zoom_changed"
+
+
+def test_player_surface_also_drops_null_frames(qapp):
+    """The sibling guard, so the pair cannot drift apart again."""
+    from src.ui.player_mode import _PlayerSurface
+
+    s = _PlayerSurface()
+    try:
+        placeholder = QImage(32, 32, QImage.Format.Format_RGB32)
+        placeholder.fill(0xFF_00_00_FF)
+        s.set_placeholder_image(placeholder)
+        s._on_image_ready(QImage(), s._frame_gen)
+        assert s._image is placeholder, "a null frame erased the placeholder"
+    finally:
+        s.shutdown()
+        s.deleteLater()
 
 
 def test_player_surface_placeholder_survives_an_in_flight_conversion(qapp):

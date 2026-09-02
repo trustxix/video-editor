@@ -119,11 +119,20 @@ class FrameConverter(QObject):
         self._worker.converted.connect(self._on_converted)
         self._thread.start()
 
-        # Backstop: a QThread destroyed while still running aborts the process.
-        # The owning surface is expected to call shutdown() explicitly, but a
-        # surface that is simply dropped must not take the app down with it.
-        # `destroyed` is emitted from ~QObject before children are deleted, so
-        # this converter is still alive to stop its thread when it fires.
+        # Backstop: a QThread destroyed while still running aborts the process
+        # with qFatal. The owning surface is expected to call shutdown()
+        # explicitly, but a surface that is simply dropped must not take the app
+        # down with it — which it did, in this project's own test suite, before
+        # this connection existed.
+        #
+        # It works because the owner's `destroyed` reaches this converter while
+        # the converter is still alive. That is an ordering guarantee, not an
+        # obvious one: QWidget deletes children during its own destructor, so if
+        # that ran before `destroyed` were emitted this whole branch would be
+        # dead code. Measured on PyQt6 6.11 the parent's `destroyed` fires
+        # first, and `test_owner_destroyed_reaches_a_live_child` in
+        # tests/test_frame_converter.py asserts exactly that, so a Qt or PyQt
+        # bump that reverses it fails a test instead of aborting at runtime.
         if parent is not None:
             parent.destroyed.connect(self._on_owner_destroyed)
 
