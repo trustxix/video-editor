@@ -7,10 +7,11 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLab
 from src.ui.widgets import ClickSlider
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame, QAudioSink, QAudioFormat
 from PyQt6.QtCore import Qt, QRect, QPointF, pyqtSignal, QUrl, QTimer
-from PyQt6.QtGui import QPainter
+from PyQt6.QtGui import QPainter, QImage
 
 from src.core.paths import get_ffmpeg
 from src.core.speed_curve import SPEED_LOOKUP_BLOCK
+from src.ui.frame_converter import FrameConverter
 
 
 class PitchedAudioPlayer:
@@ -334,6 +335,23 @@ class VideoSurface(QWidget):
         self.sink = QVideoSink(self)
         self.sink.videoFrameChanged.connect(self._on_frame)
         self._image = None
+
+        # Frame stepping: when True, ignore QVideoSink frames so the
+        # accurate ffmpeg-decoded frame isn't overwritten by QMediaPlayer's
+        # keyframe-snapped seek. Cleared when playback resumes.
+        #
+        # Set up before the converter's first use: assigning `_stepping`
+        # goes through the property below, which touches both of these.
+        self.__stepping = False
+        self._frame_gen = 0
+
+        # QVideoFrame -> QImage runs on a worker thread and is coalesced to
+        # the display cadence. Doing it inline here saturated the GUI thread
+        # at 1440p120 and starved the pitched-audio feed timer — see
+        # frame_converter.py.
+        self._converter = FrameConverter(self)
+        self._converter.image_ready.connect(self._on_image_ready)
+
         self.setMinimumSize(640, 360)
         self.setStyleSheet("background: black;")
 
@@ -355,19 +373,57 @@ class VideoSurface(QWidget):
         self._brightness = 0.0
         self._exposure = 0.0
 
-        # Frame stepping: when True, ignore QVideoSink frames so the
-        # accurate ffmpeg-decoded frame isn't overwritten by QMediaPlayer's
-        # keyframe-snapped seek. Cleared when playback resumes.
-        self._stepping = False
+    @property
+    def _stepping(self) -> bool:
+        return self.__stepping
+
+    @_stepping.setter
+    def _stepping(self, value: bool):
+        """Assigning this flag also invalidates any conversion in flight.
+
+        Callers set `_stepping = True` and then assign `_image` directly (an
+        ffmpeg-decoded frame-step or colour-preview image). A conversion that
+        started before that would land afterwards and overwrite it, so the
+        generation token is bumped here and stale results are dropped in
+        `_on_image_ready`. Going back to False invalidates too: the held
+        image is being abandoned and the next live frame supersedes it.
+
+        Re-assigning the same value is a no-op: the colour sliders clear the
+        flag on every change tick, and throwing away a queued frame each time
+        would visibly thin out playback during a drag.
+        """
+        value = bool(value)
+        if value == self.__stepping:
+            return
+        self.__stepping = value
+        self._frame_gen += 1
+        self._converter.discard_pending()
 
     def _on_frame(self, frame: QVideoFrame):
         if self._stepping:
             return  # Keep the accurate stepped frame on screen
+        # Just a refcounted handle — no pixel work on the GUI thread.
+        self._converter.submit(frame, self._frame_gen)
+
+    def _on_image_ready(self, img: QImage, gen: int):
+        if gen != self._frame_gen or self._stepping:
+            return  # Superseded by a frame-step, colour preview or new clip
         first = self._image is None
-        self._image = frame.toImage()
+        self._image = img
         self.update()
         if first:
             self.zoom_changed.emit()
+
+    def clear_image(self):
+        """Drop the displayed frame and invalidate anything in flight."""
+        self._frame_gen += 1
+        self._converter.discard_pending()
+        self._image = None
+        self.update()
+
+    def shutdown(self):
+        """Stop the conversion thread. Call once, on application shutdown."""
+        self._converter.shutdown()
 
     def video_display_rect(self) -> QRect:
         """Video rect with content pan and stretch (for painting)."""
@@ -591,11 +647,20 @@ class VideoPlayer(QWidget):
         self._duration_ms = 0
 
     def release(self):
-        """Release all file handles and resources."""
+        """Release all file handles and resources.
+
+        Reusable — the editor calls this when the queue is emptied and then
+        loads clips again, so the frame-conversion thread stays alive. Use
+        shutdown() for the terminal teardown."""
         self.player.stop()
         self.player.setSource(QUrl())
-        self.surface._image = None
+        self.surface.clear_image()
         self._pitched.release()
+
+    def shutdown(self):
+        """Terminal teardown — release, then stop the conversion thread."""
+        self.release()
+        self.surface.shutdown()
 
     def load(self, path: str):
         self.player.stop()

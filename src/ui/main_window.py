@@ -1296,7 +1296,7 @@ class MainWindow(QMainWindow):
         if self._color_preview_worker is not None:
             self._color_preview_worker.stop_worker()
             self._color_preview_worker = None
-        self.player.release()
+        self.player.shutdown()
         self.player_mode.release()
         super().closeEvent(event)
 
