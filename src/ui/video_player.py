@@ -25,13 +25,21 @@ class PitchedAudioPlayer:
     _BASE_RATE = 48000
     _CHANNELS = 2
     _FRAME_BYTES = _CHANNELS * 2
-    # Requested sink depth. Windows hands out 250 ms by default, which is only
-    # ~16 feed ticks of headroom — one GUI-thread hitch longer than that and the
-    # sink runs dry. 500 ms doubles the margin. The request is advisory: the
-    # backend may ignore or round it, so every calculation that depends on the
-    # depth reads the real `bufferSize()` back rather than assuming this value.
-    # Costs nothing in latency because play() recreates the sink on every seek.
-    _BUFFER_MS = 500
+    # NOTE: the sink depth is deliberately left at the platform default
+    # (250 ms on Windows). Requesting 500 ms was tried and measured: with the
+    # frame conversion off the GUI thread the feed timer no longer misses
+    # ticks, so the extra depth changed nothing (feed health 96-98% and a
+    # 16-19 ms worst-case deficit either way) while making two things worse —
+    # a manual speed change mid-playback leaves a whole buffer of audio still
+    # running at the old rate, so the transient before `resync_audio_if_drifting`
+    # settles it doubles; and the buffer prime doubles in cost. Depth is read
+    # from `bufferSize()` everywhere, so nothing here assumes a value.
+    #
+    # Output frames between position marks on the resampling path. 1024 frames
+    # is 21 ms of output, so the linear interpolation `playback_position_ms`
+    # does between marks stays a good fit even across the steepest speed ramp,
+    # and 128 marks still span 2.7 s of output against the sink queue.
+    _MARK_FRAMES = 1024
 
     def __init__(self):
         self._pcm: array.array | None = None  # array('h'), interleaved stereo
@@ -196,9 +204,6 @@ class PitchedAudioPlayer:
         fmt.setChannelCount(self._CHANNELS)
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
         self._sink = QAudioSink(fmt)
-        # Must be set before start() — Qt ignores it afterwards.
-        self._sink.setBufferSize(
-            self._BASE_RATE * self._BUFFER_MS // 1000 * self._FRAME_BYTES)
         self._sink.setVolume(self._volume)  # Re-apply persisted slider value
         self._io = self._sink.start()
         self._pos = float(position_ms * self._BASE_RATE / 1000)
@@ -221,8 +226,8 @@ class PitchedAudioPlayer:
         # missed tick left it dry. In steady state a tick frees fewer frames
         # than that anyway, so lifting the cap only changes the recovery path
         # and the initial prime, which now fills the buffer in one write —
-        # measured 5.7 ms for a 500 ms buffer through the interpolation loop,
-        # once per play/seek, and effectively free on the 1.0x fast path.
+        # ~2.8 ms for a 250 ms buffer through the interpolation loop, once per
+        # play/seek, and effectively free on the 1.0x fast path.
         # `bytesFree()` is bounded by the sink's own buffer, so this is bounded.
         free = self._sink.bytesFree()
         n = free // self._FRAME_BYTES
@@ -237,12 +242,11 @@ class PitchedAudioPlayer:
         # so copy a contiguous PCM slice instead of running the per-sample
         # Python interpolation loop. This is the common playback case and the
         # single biggest cost on the 15ms UI-thread tick.
-        # Every write records where in the source it started, so
-        # playback_position_ms can map the sink's play cursor back to a source
-        # position later.
-        self._marks.append((self._written, pos))
-
+        # One mark is exact here: output maps to source at a constant rate, so
+        # the straight line playback_position_ms draws between marks IS the
+        # mapping.
         if not has_auto and self._speed == 1.0:
+            self._marks.append((self._written, pos))
             idx = int(pos)
             take = max(0, min(n, total - idx))
             b = idx * 2
@@ -263,9 +267,27 @@ class PitchedAudioPlayer:
         # Speed is sampled once per SPEED_LOOKUP_BLOCK output frames rather
         # than once per frame: the curve moves imperceptibly over 1.33ms of
         # audio, and the lookup was the dominant cost of this UI-thread tick.
+        #
+        # Marks are recorded INSIDE the loop, every _MARK_FRAMES, not once per
+        # call. `playback_position_ms` maps the sink's play cursor back to a
+        # source position by interpolating linearly between marks, and this
+        # path is the one where the read rate bends mid-write. A whole-buffer
+        # write (which play() now does) under a single mark draws one chord
+        # right across the curve: measured 194-419 ms of phantom position error
+        # over a whole-buffer prime, versus the 80 ms threshold in
+        # `resync_audio_if_drifting`. It reads that as drift, and — because the
+        # reported position comes from these marks, not from `_pos` —
+        # `shift_cursor` cannot reduce it, so it re-fires every tick. Marking
+        # every 1024 frames bounds the chord to ~21 ms of output no matter how
+        # much is written at once (measured error 0.5-0.7 ms), and the
+        # 128-entry ring still spans 2.7 s against a quarter-second queue.
         i = 0
         ended = False
+        next_mark = 0
         while i < n and not ended:
+            if i >= next_mark:
+                self._marks.append((self._written + i, pos))
+                next_mark = i + self._MARK_FRAMES
             if has_auto:
                 speed = auto.get_speed_at(int(pos * 1000 / self._BASE_RATE))
             else:
@@ -410,6 +432,17 @@ class VideoSurface(QWidget):
     def _on_image_ready(self, img: QImage, gen: int):
         if gen != self._frame_gen or self._stepping:
             return  # Superseded by a frame-step, colour preview or new clip
+        if img.isNull():
+            # QVideoSink emits a null frame when a source is dropped, and
+            # release() drops one every time the queue is emptied. Storing it
+            # would burn the one-shot below: `first` is computed from
+            # `_image is None`, so the null would consume the only
+            # zoom_changed the CropOverlay gets, and it would fire while
+            # video_crop_rect() still reports the bare widget rect — leaving
+            # the crop box mapped to the full widget, black bars included,
+            # for the clip loaded next. _PlayerSurface has always had this
+            # guard; VideoSurface needs it for the same reason.
+            return
         first = self._image is None
         self._image = img
         self.update()

@@ -91,7 +91,7 @@ def test_feed_fills_the_whole_sink_not_a_fixed_cap(qapp):
     """Regression: _feed used to cap each write at 960 frames — 20 ms of audio
     per 15 ms tick, so a drained buffer refilled at +5 ms/tick and took ~750 ms
     to recover. It must write everything the sink reports as free."""
-    free_frames = 48000 // 2                       # a full 500 ms buffer
+    free_frames = 48000 // 2                       # a generously sized sink
     # More source than the sink can take, kept inside the int16 range.
     pcm = [(i % 30000) - 15000 for i in range(2 * (free_frames + 1000))]
     out, newpos = _run_feed(pcm, 0, 1.0, free=free_frames * 4)
@@ -104,6 +104,92 @@ def test_feed_2x_still_runs_slowpath(qapp):
     out, newpos = _run_feed(pcm, 0, 2.0)
     assert len(out) > 0
     assert newpos > 0  # consumed input faster than 1x
+
+
+class _Auto:
+    """Stands in for AutomationLane — pure curve, no QWidget."""
+
+    def __init__(self, keyframes):
+        from src.core.speed_curve import SpeedCurve
+        self._kf = list(keyframes)
+        self._curve = SpeedCurve(self._kf, 1.0)
+
+    def get_keyframes(self):
+        return self._kf
+
+    def get_speed_at(self, ms):
+        return self._curve.get_speed_at(ms)
+
+
+def _feed_once(keyframes, frames, pcm_seconds=40):
+    """Run a single _feed of `frames` output frames over a speed curve and
+    return the player, so its _marks can be inspected."""
+    from src.ui.video_player import PitchedAudioPlayer
+    pa = PitchedAudioPlayer()
+    pa._pcm = array.array('h', bytes(4 * 48000 * pcm_seconds))
+    pa._speed = 1.0
+    pa._automation = _Auto(keyframes)
+    pa._sink = _FakeSink(frames * 4, frames * 4)
+    pa._io = type("IO", (), {"write": lambda self, b: None})()
+    pa._feed()
+    return pa
+
+
+@pytest.mark.parametrize("keyframes", [
+    [(0, 2.0), (300, 0.05)],               # steep deceleration
+    [(0, 2.0), (400, 2.0), (700, 0.05)],   # hold, then decelerate
+    [(0, 0.05), (500, 2.0)],               # acceleration
+])
+def test_position_map_survives_a_whole_buffer_write(qapp, keyframes):
+    """Regression: `play()` primes the entire sink in one _feed. With a single
+    position mark per write that is one straight line drawn across 500 ms of a
+    bending speed curve — on a decelerating ramp it misreports the source
+    position by >100 ms, which `resync_audio_if_drifting` (80 ms threshold)
+    reads as drift and "corrects" forever, because the reported position comes
+    from the marks and `shift_cursor` only moves `_pos`.
+
+    The mark-derived map must track the true one however much is written at
+    once, so compare a single whole-buffer write against the same audio fed in
+    small ticks."""
+    big_frames = 48000 // 2                    # a whole-buffer prime
+    big = _feed_once(keyframes, big_frames)
+
+    # Ground truth: the identical curve fed 480 frames (10 ms) at a time, where
+    # one mark per write is already a fine-grained map.
+    from src.ui.video_player import PitchedAudioPlayer
+    ref = PitchedAudioPlayer()
+    ref._pcm = array.array('h', bytes(4 * 48000 * 40))
+    ref._speed = 1.0
+    ref._automation = _Auto(keyframes)
+    ref._io = type("IO", (), {"write": lambda self, b: None})()
+    step = 480
+    for _ in range(big_frames // step):
+        ref._sink = _FakeSink(step * 4, step * 4)
+        ref._feed()
+
+    worst = 0.0
+    for played in range(0, big_frames, 500):
+        a = big._source_pos_at(played) * 1000.0 / 48000
+        b = ref._source_pos_at(played) * 1000.0 / 48000
+        worst = max(worst, abs(a - b))
+    assert worst < 20.0, f"position map off by {worst:.1f} ms across one write"
+    # And well inside the resync threshold, which is the reason it matters.
+    assert worst < 80.0
+
+
+def test_marks_stay_within_the_ring_on_a_whole_buffer_write(qapp):
+    """Marking mid-write must not blow the 128-entry ring: the history still
+    has to reach back further than the sink queue it is used to index into."""
+    from src.ui.video_player import PitchedAudioPlayer
+    big_frames = 48000 // 2
+    pa = _feed_once([(0, 2.0), (300, 0.05)], big_frames)
+    assert len(pa._marks) <= pa._marks.maxlen
+    span = pa._written - pa._marks[0][0]
+    assert span >= big_frames, (span, big_frames)
+    # Marks are monotonic in written-frames, which _source_pos_at relies on.
+    written = [w for w, _ in pa._marks]
+    assert written == sorted(written)
+    assert len(set(written)) == len(written)
 
 
 def test_resync_to_maps_source_ms_to_cursor(qapp):
