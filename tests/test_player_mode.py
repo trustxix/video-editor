@@ -57,20 +57,37 @@ def test_player_methods_safe_without_clip(player):
         getattr(player, name)(*args)  # must not raise
 
 
+def _await_step(player, qapp, timeout_s=20.0):
+    """Frame extraction runs on a worker now (it decodes a whole GOP, which
+    froze the window when it ran inline). Pump the loop until the frame for the
+    current stepped position has been displayed."""
+    import time
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        qapp.processEvents()
+        if player.surface._stepping and player.surface._image is not None \
+                and not player.surface._image.isNull():
+            return True
+        time.sleep(0.005)
+    return False
+
+
 @pytest.mark.skipif(not _have_ffmpeg(), reason="ffmpeg not on PATH")
-def test_player_frame_step_is_frame_accurate(player, fixture_video):
+def test_player_frame_step_is_frame_accurate(player, fixture_video, qapp):
     player._current_path = str(fixture_video)
     player._duration_ms = 5000
     player._stepped_pos = None
 
     player.frame_step(1)
     assert player._stepped_pos == 33  # exactly one frame at 30 fps
+    assert _await_step(player, qapp), "stepped frame never arrived"
     assert player.surface._stepping   # live frames blocked while showing it
-    assert player.surface._image is not None and not player.surface._image.isNull()
     img1 = player.surface._image.copy()
 
+    player.surface._stepping = False  # so the wait below sees the NEXT frame
     player.frame_step(1)
     assert player._stepped_pos == 66  # advances from the stepped pos, not a keyframe
+    assert _await_step(player, qapp), "second stepped frame never arrived"
     # The displayed frame must actually change — proves it's not keyframe-stuck.
     changed = sum(
         1 for y in range(0, 240, 40) for x in range(0, 320, 40)

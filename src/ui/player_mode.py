@@ -28,7 +28,9 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFra
 
 from src.ui.widgets import ClickSlider, CompactVolumeControl
 from src.ui.seek_bar import SeekBar
-from src.ui.thumbnail_worker import ThumbnailWorker, FirstFramePreloader
+from src.ui.thumbnail_worker import (
+    ThumbnailWorker, FirstFramePreloader, FrameStepWorker,
+)
 from src.ui.frame_converter import FrameConverter
 from src.core.ffmpeg_runner import probe_video, _probe_cache, extract_frame
 
@@ -679,6 +681,9 @@ class PlayerMode(QWidget):
         self._duration_ms = 0
         self._seeking = False
         self._stepped_pos: int | None = None  # accurate position while frame-stepping
+        # Created on first use; its ffmpeg child must not outlive the app, so
+        # release() stops it alongside the thumbnail and preload workers.
+        self._frame_step_worker: FrameStepWorker | None = None
         # Coalesce scrub seeks to ~30/sec so a fast drag doesn't flood
         # QMediaPlayer.setPosition (decoder thrash / sluggish scrub).
         self._pending_scrub_pos: int | None = None
@@ -1552,16 +1557,32 @@ class PlayerMode(QWidget):
         base = self._stepped_pos if self._stepped_pos is not None else self.player.position()
         pos = max(0, min(self._duration_ms, base + direction * frame_ms))
         self._stepped_pos = pos
-        bmp = extract_frame(self._current_path, pos / 1000.0)
-        if bmp:
-            img = QImage()
-            if img.loadFromData(bmp, "BMP"):
-                self.surface._stepping = True
-                self.surface._image = img
-                self.surface._scaled_key = None  # force rescale of the new frame
-                self.surface.update()
+        # Extract on a worker, not here. extract_frame decodes a whole GOP of
+        # 1440p HEVC — measured ~700 ms — and running it inline froze the
+        # window for that long on every press, so holding the arrow key was
+        # unusable. The editor has always done this asynchronously; this is
+        # the same worker, with the same single-pending slot so a held key
+        # never builds a backlog of stale extractions.
+        if self._frame_step_worker is None:
+            self._frame_step_worker = FrameStepWorker(self)
+            self._frame_step_worker.frame_ready.connect(self._on_frame_step_ready)
+            self._frame_step_worker.start()
+        self._frame_step_worker.request(self._current_path, pos)
         self.player.setPosition(pos)
         self._show_osd(self._fmt(pos))
+
+    def _on_frame_step_ready(self, path: str, ms: int, bmp: bytes):
+        """Display an extracted frame. Drops results for a clip the user has
+        already navigated away from, or a step that a seek has superseded."""
+        if path != self._current_path or self._stepped_pos != ms:
+            return
+        img = QImage()
+        if not img.loadFromData(bmp, "BMP"):
+            return
+        self.surface._stepping = True
+        self.surface._image = img
+        self.surface._scaled_key = None  # force rescale of the new frame
+        self.surface.update()
 
     def _update_speed_label(self):
         if self._current_speed == 1.0:
@@ -1781,6 +1802,9 @@ class PlayerMode(QWidget):
             self._preloader.stop()
         except Exception:
             pass
+        if self._frame_step_worker is not None:
+            self._frame_step_worker.stop_worker()
+            self._frame_step_worker = None
         self.surface.shutdown()
 
     def set_volume(self, value: int):

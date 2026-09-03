@@ -23,6 +23,7 @@ from src.core.keybinds import (
     keybind_from_key_event, keybind_from_mouse_event,
 )
 from src.ui.video_player import VideoPlayer, VideoSurface
+from src.ui.thumbnail_worker import FrameStepWorker
 from src.ui.crop_overlay import CropOverlay
 from src.ui.trim_controls import TrimControls, RangeSlider
 from src.ui.settings_dialog import SettingsDialog
@@ -107,60 +108,6 @@ class LoudnormWorker(QThread):
 
     def cancel(self):
         self._cancelled = True
-
-
-class FrameStepWorker(QThread):
-    """Single-pending-slot background frame extractor for snappy frame
-    stepping. Newer requests overwrite the pending slot, so a user holding
-    the right-arrow key never queues up a backlog of stale subprocess
-    invocations.
-
-    Each request carries (video_path, ms). The worker lives for the
-    lifetime of MainWindow; emit `frame_ready(path, ms, bmp_bytes)` so the
-    receiver can drop results from old clips."""
-    frame_ready = pyqtSignal(str, int, bytes)  # path, ms, BMP bytes
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._lock = threading.Lock()
-        self._cv = threading.Condition(self._lock)
-        self._pending: tuple[str, int] | None = None
-        self._stop = False
-        self._gen = 0
-
-    def request(self, video_path: str, ms: int):
-        with self._cv:
-            self._pending = (video_path, ms)
-            self._gen += 1
-            self._cv.notify_all()
-
-    def stop_worker(self):
-        with self._cv:
-            self._stop = True
-            self._cv.notify_all()
-        self.wait(1500)
-
-    def run(self):
-        from src.core.ffmpeg_runner import extract_frame
-        while True:
-            with self._cv:
-                while self._pending is None and not self._stop:
-                    self._cv.wait()
-                if self._stop:
-                    return
-                path, ms = self._pending
-                gen = self._gen
-                self._pending = None
-            try:
-                bmp = extract_frame(path, ms / 1000.0)
-            except Exception:
-                bmp = None
-            # Drop the result if a newer request landed mid-extract.
-            with self._cv:
-                if gen != self._gen or self._stop:
-                    continue
-            if bmp:
-                self.frame_ready.emit(path, ms, bmp)
 
 
 class ColorPreviewWorker(QThread):
