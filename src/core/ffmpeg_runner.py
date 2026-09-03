@@ -297,6 +297,30 @@ def _safe_float(v, default: float, lo: float = -200.0, hi: float = 200.0) -> flo
     return f
 
 
+# ffmpeg's loudnorm accepts TP (maximum true peak) only in [-9, 0] dBTP.
+#
+# TP is an ABSOLUTE ceiling in dBTP — it is not an offset from the integrated
+# loudness target. The old expression `min(-1.0, target_lufs + 2)` treated it as
+# one, so the shipped default of -14 LUFS produced TP=-12, which ffmpeg rejects
+# outright ("Error applying option 'TP' to filter 'loudnorm': Result too
+# large"). Both passes failed, so "Normalize audio" never ran at any target
+# below -11 LUFS — i.e. at every value the app ships or a user would pick.
+# -1.0 dBTP is the standard ceiling (EBU R128, Spotify, YouTube, Apple).
+LOUDNORM_TP_DB = -1.0
+_LOUDNORM_TP_RANGE = (-9.0, 0.0)
+
+
+def loudnorm_true_peak() -> float:
+    """Maximum true peak for both loudnorm passes, in dBTP.
+
+    Kept as one function because the analyse pass and the filter pass must
+    agree: ffmpeg's second pass uses the first pass's measurements, and a
+    mismatched TP silently changes the result.
+    """
+    lo, hi = _LOUDNORM_TP_RANGE
+    return max(lo, min(hi, LOUDNORM_TP_DB))
+
+
 def loudnorm_analyze(input_path: str, trim_start: float = 0,
                      trim_duration: float = 0,
                      target_lufs: float = -14.0,
@@ -307,7 +331,7 @@ def loudnorm_analyze(input_path: str, trim_start: float = 0,
     failure. On failure, surfaces a human-readable message via `status_cb`
     and logs to the rotating log so the user knows normalization was skipped
     (instead of silently producing wrong loudness)."""
-    tp = min(-1.0, target_lufs + 2)
+    tp = loudnorm_true_peak()
     cmd = [get_ffmpeg(), '-hide_banner']
     if trim_start > 0:
         cmd += ['-ss', f'{trim_start:.3f}']
@@ -315,6 +339,11 @@ def loudnorm_analyze(input_path: str, trim_start: float = 0,
         cmd += ['-t', f'{trim_duration:.3f}']
     cmd += [
         '-i', input_path,
+        # -vn: this pass measures AUDIO. Without it ffmpeg decodes the whole
+        # video stream to throw it away — on 2560x1440 HEVC 10-bit that is the
+        # single most expensive thing in the export, for nothing. The sibling
+        # prerender_audio has always had this flag.
+        '-vn',
         '-af', f'loudnorm=I={target_lufs:.1f}:TP={tp:.1f}:LRA=11:print_format=json',
         '-f', 'null', '-',
     ]
@@ -378,7 +407,7 @@ def loudnorm_filter(measured: dict, target_lufs: float = -14.0) -> str:
     All measurements are coerced through `_safe_float` with bounded ranges.
     This blocks filter injection via crafted media that could cause ffmpeg
     to emit malicious-looking JSON through its stderr output."""
-    tp = min(-1.0, target_lufs + 2)
+    tp = loudnorm_true_peak()
     input_i = _safe_float(measured.get('input_i'), -16.0)
     input_tp = _safe_float(measured.get('input_tp'), -2.0)
     input_lra = _safe_float(measured.get('input_lra'), 7.0, lo=0.0, hi=50.0)
