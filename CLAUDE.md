@@ -44,6 +44,13 @@ python main.py
 # Build exe
 tools\build.bat
 
+# Update the INSTALLED copy — ALWAYS run this after build.bat.
+# C:\Program Files\Video Editor\Video Editor.exe is the one actually launched
+# day to day; build.bat only writes to dist\. Skipping this means testing a
+# stale binary (it was 4 months behind once, which cost two debugging sessions).
+# Needs an elevated shell. Preserves config\ and the uninstaller.
+powershell -ExecutionPolicy Bypass -File tools\deploy-local.ps1
+
 # Install dependencies
 pip install -r requirements.txt
 ```
