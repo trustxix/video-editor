@@ -251,3 +251,45 @@ def test_codec_dropdown_and_settings_validation_agree():
     src = mw.read_text(encoding="utf-8")
     for codec in CODEC_LABELS:
         assert f'"{codec}"' in src, f"{codec} is offered but never validated"
+
+
+# ── loudnorm integrated target ────────────────────────────────────────────
+#
+# The spinbox allowed -50..0 and the settings validator enforced the same
+# bound, but ffmpeg's loudnorm only accepts I in [-70, -5]. One user had -3
+# stored, which passed validation and then made ffmpeg refuse BOTH passes —
+# 25 "Loudness analysis failed" lines in a single session's log.
+
+def test_loudnorm_target_is_clamped_to_what_ffmpeg_accepts():
+    lo, hi = fr.LOUDNORM_I_RANGE
+    assert (lo, hi) == (-70.0, -5.0)
+    assert fr.loudnorm_target(-3.0) == -5.0     # the value that was failing
+    assert fr.loudnorm_target(0.0) == -5.0
+    assert fr.loudnorm_target(-80.0) == -70.0
+    assert fr.loudnorm_target(-14.0) == -14.0
+    assert fr.loudnorm_target(float("nan")) == -14.0
+    assert fr.loudnorm_target("nonsense") == -14.0
+
+
+@pytest.mark.parametrize("requested", [-3.0, 0.0, -80.0, -14.0])
+def test_loudnorm_filter_never_emits_an_out_of_range_target(requested):
+    f = fr.loudnorm_filter({
+        "input_i": -22.3, "input_tp": -2.0, "input_lra": 7.0,
+        "input_thresh": -32.5, "target_offset": 0.5,
+    }, target_lufs=requested)
+    # First segment is "loudnorm=I=-14.0", so strip the filter name.
+    head = f.split(":")[0]
+    assert head.startswith("loudnorm=I="), f
+    i_val = float(head[len("loudnorm=I="):])
+    lo, hi = fr.LOUDNORM_I_RANGE
+    assert lo <= i_val <= hi, f
+
+
+def test_both_ui_spinboxes_match_the_filter_range():
+    """A spinbox that offers a value ffmpeg rejects is a trap: the export
+    looks fine and silently skips normalization."""
+    root = Path(fr.__file__).parent.parent
+    for rel in ("ui/main_window.py", "ui/settings_dialog.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert "setRange(-50.0, 0.0)" not in src, f"{rel} still offers invalid LUFS"
+        assert "LOUDNORM_I_RANGE" in src, f"{rel} does not use the filter's range"

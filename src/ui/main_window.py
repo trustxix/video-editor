@@ -33,6 +33,7 @@ from src.core.presets import ASPECT_PRESETS, calc_preset_crop, calc_stretch_to_f
 from src.core.ffmpeg_runner import (
     build_command, get_output_path, safe_output_path,
     loudnorm_analyze, run_export, export_with_automation, probe_video,
+    loudnorm_target, LOUDNORM_I_RANGE,
 )
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv')
@@ -695,7 +696,10 @@ class MainWindow(QMainWindow):
         norm_row.addWidget(self.btn_normalize)
 
         self.spn_lufs = QDoubleSpinBox()
-        self.spn_lufs.setRange(-50.0, 0.0)
+        # ffmpeg's loudnorm only accepts an integrated target in [-70, -5].
+        # This used to allow up to 0.0, so a perfectly reasonable-looking -3
+        # made ffmpeg refuse both passes and normalization silently did nothing.
+        self.spn_lufs.setRange(*LOUDNORM_I_RANGE)
         self.spn_lufs.setValue(self._settings.get("normalize_lufs", -14.0))
         self.spn_lufs.setSingleStep(1.0)
         self.spn_lufs.setDecimals(1)
@@ -1566,15 +1570,17 @@ class MainWindow(QMainWindow):
             defaults["preview_volume"] = max(0, min(100, int(defaults["preview_volume"])))
         except (ValueError, TypeError):
             defaults["preview_volume"] = 100
-        # normalize_lufs flows directly into ffmpeg's loudnorm filter via
-        # f"{target_lufs:.1f}" — bound it to a sane range so a hand-edited
-        # settings.json with NaN / inf / a huge number can't produce a
-        # filter string that ffmpeg silently rejects (export with no audio).
+        # normalize_lufs flows directly into ffmpeg's loudnorm filter. The
+        # bound here used to be -50..0, which is NOT the filter's range: ffmpeg
+        # accepts only [-70, -5], so a stored -3 passed this check and then
+        # made ffmpeg refuse both passes ("Result too large"), silently
+        # disabling normalization on every export. Clamp to the filter's real
+        # range so an out-of-range value is corrected instead of failing.
         try:
             lufs = float(defaults["normalize_lufs"])
-            if lufs != lufs or lufs < -50.0 or lufs > 0.0:  # NaN check + range
+            if lufs != lufs:                       # NaN
                 raise ValueError
-            defaults["normalize_lufs"] = lufs
+            defaults["normalize_lufs"] = loudnorm_target(lufs)
         except (ValueError, TypeError):
             defaults["normalize_lufs"] = -14.0
         # Validate player numeric settings — corrupt JSON must not crash

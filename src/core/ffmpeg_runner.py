@@ -472,6 +472,25 @@ def _safe_float(v, default: float, lo: float = -200.0, hi: float = 200.0) -> flo
 LOUDNORM_TP_DB = -1.0
 _LOUDNORM_TP_RANGE = (-9.0, 0.0)
 
+# ffmpeg's loudnorm accepts an integrated target only in [-70, -5] LUFS.
+# The settings spinbox used to allow -50..0, so anything louder than -5 — e.g.
+# the -3 one user had set — made ffmpeg reject BOTH passes and normalization
+# silently never ran. Clamp rather than fail: a target the filter refuses is
+# useless, and the nearest legal one is what the user actually meant.
+LOUDNORM_I_RANGE = (-70.0, -5.0)
+
+
+def loudnorm_target(target_lufs: float) -> float:
+    """Integrated loudness target clamped to what ffmpeg will accept."""
+    lo, hi = LOUDNORM_I_RANGE
+    try:
+        v = float(target_lufs)
+    except (TypeError, ValueError):
+        return -14.0
+    if v != v:            # NaN
+        return -14.0
+    return max(lo, min(hi, v))
+
 
 def loudnorm_true_peak() -> float:
     """Maximum true peak for both loudnorm passes, in dBTP.
@@ -494,6 +513,7 @@ def loudnorm_analyze(input_path: str, trim_start: float = 0,
     failure. On failure, surfaces a human-readable message via `status_cb`
     and logs to the rotating log so the user knows normalization was skipped
     (instead of silently producing wrong loudness)."""
+    target_lufs = loudnorm_target(target_lufs)
     tp = loudnorm_true_peak()
     cmd = [get_ffmpeg(), '-hide_banner']
     if trim_start > 0:
@@ -570,6 +590,7 @@ def loudnorm_filter(measured: dict, target_lufs: float = -14.0) -> str:
     All measurements are coerced through `_safe_float` with bounded ranges.
     This blocks filter injection via crafted media that could cause ffmpeg
     to emit malicious-looking JSON through its stderr output."""
+    target_lufs = loudnorm_target(target_lufs)
     tp = loudnorm_true_peak()
     input_i = _safe_float(measured.get('input_i'), -16.0)
     input_tp = _safe_float(measured.get('input_tp'), -2.0)

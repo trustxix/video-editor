@@ -11,6 +11,7 @@ from src.core.auto_presets import get_quality_presets as _get_auto_presets
 from src.core.keybinds import ACTION_DEFS, PLAYER_ACTION_DEFS
 from src.ui.themes import THEMES, DEFAULT_THEME
 from src.ui.keybind_editor import KeybindEditor
+from src.core.ffmpeg_runner import LOUDNORM_I_RANGE
 
 # Export video codecs, in the order they appear in the dropdown.
 # Keep this the single source of truth: the dialog builds the combo from it and
@@ -245,7 +246,9 @@ class SettingsDialog(QDialog):
         )
         norm_row.addWidget(self.chk_normalize)
         self.spn_norm_lufs = QDoubleSpinBox()
-        self.spn_norm_lufs.setRange(-50.0, 0.0)
+        # Must match ffmpeg's loudnorm range [-70, -5]; anything louder makes
+        # the filter fail outright rather than normalize.
+        self.spn_norm_lufs.setRange(*LOUDNORM_I_RANGE)
         self.spn_norm_lufs.setValue(self.settings.get("normalize_lufs", -14.0))
         self.spn_norm_lufs.setSingleStep(1.0)
         self.spn_norm_lufs.setDecimals(1)
