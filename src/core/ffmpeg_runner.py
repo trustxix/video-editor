@@ -14,6 +14,159 @@ _nvenc_available: dict[str, bool] = {}
 # Reason for unavailability (human-readable), set on the first failed probe.
 _nvenc_reason: dict[str, str] = {}
 
+# GPU DECODE probe result. None = not yet probed.
+_cuda_decode: bool | None = None
+_cuda_decode_reason: str = ""
+
+
+def _has_cuda_decode() -> bool:
+    """Can this machine decode video on the GPU? Probed once, cached.
+
+    `ffmpeg -hwaccels` is NOT a usable test: it lists what the binary was
+    COMPILED with, so the bundled build reports "cuda" even on a machine with
+    no NVIDIA hardware at all. Actually creating the device is the only honest
+    check, and it matters more than it does for NVENC: an unavailable NVENC
+    encoder simply isn't listed and we fall back, whereas `-hwaccel cuda` with
+    no usable device does not fall back — it fails the whole export (measured:
+    `-hwaccel_device 99` exits non-zero and writes nothing).
+
+    Codec support is a separate question and needs no probe: when the GPU has
+    no decoder for a stream ffmpeg silently falls back to software for that
+    input (measured on VP8, which NVDEC cannot decode — the export still
+    succeeded).
+    """
+    global _cuda_decode, _cuda_decode_reason
+    if _cuda_decode is not None:
+        return _cuda_decode
+    try:
+        result = subprocess.run(
+            [get_ffmpeg(), '-hide_banner', '-init_hw_device', 'cuda=probe',
+             '-f', 'lavfi', '-i', 'nullsrc', '-frames:v', '1', '-f', 'null', '-'],
+            capture_output=True, text=True, startupinfo=_hide_window(),
+            timeout=15,
+        )
+        _cuda_decode = result.returncode == 0
+        if not _cuda_decode:
+            tail = (result.stderr or "").strip().splitlines()[-1:] or ["no detail"]
+            _cuda_decode_reason = f"CUDA device unavailable: {tail[0]}"
+            log().info(f"GPU decode unavailable — using CPU decode. {_cuda_decode_reason}")
+    except subprocess.TimeoutExpired:
+        _cuda_decode = False
+        _cuda_decode_reason = "CUDA device probe timed out (15s)"
+        log().warning(_cuda_decode_reason)
+    except FileNotFoundError:
+        _cuda_decode = False
+        _cuda_decode_reason = "ffmpeg.exe not found"
+        log().error(_cuda_decode_reason)
+    except OSError as e:
+        _cuda_decode = False
+        _cuda_decode_reason = f"CUDA probe failed to launch: {e}"
+        log().warning(_cuda_decode_reason)
+    return _cuda_decode
+
+
+def hwaccel_args() -> list[str]:
+    """Input-side flags that move video DECODE onto the GPU, or [] if it can't.
+
+    Must be placed before the `-i` they apply to.
+
+    IMPORTANT — this is only worth using when the decoded frames are NOT then
+    handed to a CPU filter. Without `-hwaccel_output_format cuda` every frame is
+    copied back out of VRAM, and on 2560x1440 10-bit that copy costs more than
+    the CPU decode it replaced. Measured, interleaved so file-cache warmth
+    cannot skew it, on a 10 s export with a crop filter:
+
+        CPU decode                     5.64 s, 8.59 cores
+        -hwaccel cuda + CPU crop       8.61 s, 0.42 cores   <- 53% SLOWER
+        crop inside the decoder        5.19 s, 0.48 cores   <- see cuvid_args
+
+    So the export path uses `cuvid_args` instead. This helper is for the
+    single-frame extractors, where exactly one frame is copied back and the
+    cost is the GOP decode, not the transfer.
+    """
+    return ['-hwaccel', 'cuda'] if _has_cuda_decode() else []
+
+
+# NVDEC decoders in the bundled build, keyed by the codec name ffprobe reports.
+_CUVID_DECODERS = {
+    "h264": "h264_cuvid",
+    "hevc": "hevc_cuvid",
+    "h265": "hevc_cuvid",
+    "vp8": "vp8_cuvid",
+    "vp9": "vp9_cuvid",
+    "av1": "av1_cuvid",
+    "mpeg1video": "mpeg1_cuvid",
+    "mpeg2video": "mpeg2_cuvid",
+    "mpeg4": "mpeg4_cuvid",
+    "vc1": "vc1_cuvid",
+    "mjpeg": "mjpeg_cuvid",
+}
+
+_cuvid_present: dict[str, bool] = {}
+
+
+def _has_cuvid(decoder: str) -> bool:
+    """Is this NVDEC decoder compiled into the bundled ffmpeg? Cached."""
+    if decoder in _cuvid_present:
+        return _cuvid_present[decoder]
+    try:
+        result = subprocess.run(
+            [get_ffmpeg(), '-hide_banner', '-decoders'],
+            capture_output=True, text=True, startupinfo=_hide_window(), timeout=10,
+        )
+        _cuvid_present[decoder] = (result.returncode == 0
+                                   and decoder in (result.stdout or ""))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log().warning(f"cuvid decoder probe failed: {e}")
+        _cuvid_present[decoder] = False
+    return _cuvid_present[decoder]
+
+
+def cuvid_args(source_vcodec: str, source_w: int, source_h: int,
+               crop_x: int | None, crop_y: int | None,
+               crop_w: int | None, crop_h: int | None) -> list[str]:
+    """Decoder args that decode AND crop on the GPU, or [] if not applicable.
+
+    NVDEC can crop while decoding (`-crop top x bottom x left x right`), so for
+    the app's core operation — trim + crop to an aspect ratio — the frames never
+    leave VRAM: NVDEC decodes and crops, NVENC encodes, nothing touches system
+    memory. Measured 5.19 s / 0.48 CPU cores versus 5.64 s / 8.59 cores for the
+    CPU path, and the pixels are identical (PSNR = infinity against the same
+    clip cropped by the CPU `crop` filter, same 360 frames).
+
+    Deliberately NOT used when anything other than the crop is in the chain.
+    NVDEC's `-resize` is a different scaler than swscale, so using it for the
+    stretch feature would silently change exported pixels; and eq/exposure are
+    CPU filters, which would force the VRAM round-trip that makes this slower
+    than not bothering. Those cases keep the plain CPU path.
+    """
+    if not _has_cuda_decode():
+        return []
+    decoder = _CUVID_DECODERS.get((source_vcodec or "").lower())
+    if not decoder or not _has_cuvid(decoder):
+        return []
+    if not (source_w > 0 and source_h > 0):
+        return []
+    if any(v is None for v in (crop_x, crop_y, crop_w, crop_h)):
+        return []
+    top, left = crop_y, crop_x
+    bottom = source_h - crop_y - crop_h
+    right = source_w - crop_x - crop_w
+    # A crop that does not sit inside the frame would make NVDEC emit the wrong
+    # size silently; fall back rather than guess.
+    if min(top, left, bottom, right) < 0:
+        return []
+    if top == bottom == left == right == 0:
+        return []          # full frame — nothing to crop, plain decode is fine
+    return ['-c:v', decoder, '-crop', f'{top}x{bottom}x{left}x{right}']
+
+
+def get_decoder_status() -> tuple[str, str]:
+    """('gpu', '') when GPU decode is in use, else ('cpu', reason)."""
+    if _has_cuda_decode():
+        return ("gpu", "")
+    return ("cpu", _cuda_decode_reason or "unknown")
+
 
 def _has_nvenc(encoder: str) -> bool:
     """Probe whether an NVENC encoder is available (cached).
@@ -535,16 +688,9 @@ def build_command(
     container = normalize_container(container) or Path(output_path).suffix.lstrip(".").lower()
     src_container = Path(input_path).suffix.lstrip(".").lower()
 
-    if trim_start is not None and trim_start > 0:
-        cmd += ["-ss", f"{trim_start:.3f}"]
-    if trim_end is not None and trim_end > 0:
-        # With -ss before -i, use -t (duration) not -to (absolute timestamp)
-        duration = trim_end - (trim_start or 0)
-        cmd += ["-t", f"{duration:.3f}"]
-
-    cmd += ["-i", input_path]
-
     # ── Video filters ─────────────────────────────────────────
+    # Built before the input args because whether the video gets re-encoded
+    # decides whether it is worth initialising a GPU decoder below.
     vfilters = []
     has_crop = all(v is not None for v in (crop_x, crop_y, crop_w, crop_h))
     if has_crop:
@@ -561,27 +707,60 @@ def build_command(
     # specific params — but we apply eq first for consistency.
     vfilters.extend(_build_color_filters(brightness, exposure))
 
-    if vfilters:
-        cmd += ["-vf", ",".join(vfilters)]
+    # No video edits: losslessly remux (copy) when the source codec fits the
+    # target container; otherwise re-encode to a compatible codec.
+    copy_video = not vfilters and (
+        container == src_container or _can_copy_video(container, source_vcodec)
+    )
+
+    # When the ONLY video work is the crop, NVDEC can do it during decode and
+    # the frames never leave VRAM. Anything else in the chain (stretch, speed,
+    # colour) is a CPU filter, which would force a copy back out of VRAM that
+    # costs more than the GPU decode saves — those keep the CPU path.
+    crop_only = has_crop and vfilters == [
+        f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+    ]
+    decoder_args = (
+        cuvid_args(source_vcodec, source_w, source_h,
+                   crop_x, crop_y, crop_w, crop_h)
+        if crop_only else []
+    )
+    if decoder_args:
+        # The decoder emits the cropped frames directly, so the filter is gone
+        # — but the output is still the cropped size, which the NVENC minimum
+        # guard below has to see.
+        vfilters = []
+        cmd += decoder_args
+
+    if trim_start is not None and trim_start > 0:
+        cmd += ["-ss", f"{trim_start:.3f}"]
+    if trim_end is not None and trim_end > 0:
+        # With -ss before -i, use -t (duration) not -to (absolute timestamp)
+        duration = trim_end - (trim_start or 0)
+        cmd += ["-t", f"{duration:.3f}"]
+
+    cmd += ["-i", input_path]
+
+    if vfilters or decoder_args:
+        if vfilters:
+            cmd += ["-vf", ",".join(vfilters)]
         # Compute the effective output dimensions when known so _encode_args
         # can detect NVENC's hardware minimum and fall back to software.
         # Fall back to the source dimensions when there's no crop so the
         # NVENC minimum is still enforced for stretch-only (and tiny-source)
         # outputs — without this a heavy downscale-stretch silently produces
-        # a 0-byte NVENC file.
+        # a 0-byte NVENC file. This must still run when the crop moved into
+        # the decoder: the frames are cropped either way.
         base_w = crop_w if crop_w is not None else (source_w or None)
         base_h = crop_h if crop_h is not None else (source_h or None)
         eff_w, eff_h = _effective_output_dims(base_w, base_h, stretch_h, stretch_v)
         cmd += _video_encode_args(container, codec, crf, auto_preset, eff_w, eff_h)
+    elif copy_video:
+        cmd += ["-c:v", "copy"]
     else:
-        # No video edits: losslessly remux (copy) when the source codec fits
-        # the target container; otherwise re-encode to a compatible codec
-        # (e.g. h264→webm must become vp9).
-        if container == src_container or _can_copy_video(container, source_vcodec):
-            cmd += ["-c:v", "copy"]
-        else:
-            cmd += _video_encode_args(container, codec, crf, auto_preset,
-                                      source_w or None, source_h or None)
+        # e.g. h264 → webm must become vp9.
+        cmd += _video_encode_args(container, codec, crf, auto_preset,
+                                  source_w or None, source_h or None)
 
     # ── Audio ─────────────────────────────────────────────────
     # Build the audio filter chain in signal order: speed (vinyl pitch) →
@@ -893,6 +1072,12 @@ def export_with_automation(
         # so the same temp works whether the final container is mp4 or webm;
         # the mux step copies this stream into the real target container.
         video_out = os.path.join(temp_dir, "video.mkv")
+        # Deliberately CPU decode. This graph is entirely CPU filters (split,
+        # trim, setpts, crop, scale, concat), so GPU decode here would copy
+        # every frame back out of VRAM and end up slower — measured 8.61 s vs
+        # 5.64 s on the equivalent single-segment case. NVDEC's decoder-side
+        # crop cannot help either: the crop is inside a filter graph that also
+        # re-times each segment.
         cmd = [
             ffmpeg, "-y", "-i", input_path,
             "-filter_complex", filter_complex,
@@ -1205,6 +1390,7 @@ def extract_frame(input_path: str, timestamp_s: float) -> bytes | None:
     """
     cmd = [
         get_ffmpeg(), '-loglevel', 'quiet',
+        *hwaccel_args(),
         '-ss', f'{timestamp_s:.6f}',
         '-i', input_path,
         '-frames:v', '1',
@@ -1235,6 +1421,7 @@ def extract_thumbnail(input_path: str, timestamp_s: float,
     """
     cmd = [
         get_ffmpeg(), '-loglevel', 'quiet',
+        *hwaccel_args(),
         '-ss', f'{timestamp_s:.3f}',
         '-i', input_path,
         '-frames:v', '1',
