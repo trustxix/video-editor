@@ -809,7 +809,7 @@ class MainWindow(QMainWindow):
             self.cmb_format.addItem(label)
         self.cmb_format.setToolTip(
             "Output format. WebM re-encodes to VP9+Opus; the rest keep your\n"
-            "H.264/H.265 codec. With no edits, a compatible format is remuxed\n"
+            "H.264/H.265/AV1 codec. With no edits, a compatible format is remuxed\n"
             "losslessly (instant); otherwise it's converted.")
         # Restore the persisted choice.
         _saved_fmt = self._settings.get("output_format", "")
@@ -1558,7 +1558,7 @@ class MainWindow(QMainWindow):
             defaults["default_speed"] = max(0.1, min(10.0, float(defaults["default_speed"])))
         except (ValueError, TypeError):
             defaults["default_speed"] = 1.0
-        if defaults.get("codec") not in ("h264", "h265"):
+        if defaults.get("codec") not in ("h264", "h265", "av1"):
             defaults["codec"] = "h264"
         if defaults.get("audio_mode") not in ("copy", "reencode", "mute"):
             defaults["audio_mode"] = "copy"

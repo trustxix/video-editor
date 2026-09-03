@@ -203,3 +203,51 @@ def test_probe_is_cached_not_rerun_per_command():
     for _ in range(50):
         fr.hwaccel_args()
     assert fr._cuda_decode is before
+
+
+# ── AV1 export ────────────────────────────────────────────────────────────
+#
+# av1_nvenc shipped inside the bundled ffmpeg and was listed in the container
+# matrices, but no code path could ever select it: the codec was hard-coded to
+# "hevc_nvenc if h265 else h264_nvenc" and the settings dialog only offered two
+# choices. On a Blackwell GPU that left the best encoder on the card unused.
+
+def test_av1_routes_to_the_hardware_encoder_where_the_container_allows():
+    for container in ("mp4", "mkv", "webm"):
+        args = fr._video_encode_args(container, "av1", 30, None, 1920, 1080)
+        assert args[:2] == ["-c:v", "av1_nvenc"], (container, args)
+
+
+@pytest.mark.parametrize("container", ["mov", "avi", "ts", "flv"])
+def test_av1_falls_back_where_the_container_cannot_carry_it(container):
+    """mov is the interesting one: the matrix used to claim it holds AV1, but
+    the bundled muxer refuses to write the header, so an AV1-in-mov export
+    failed outright — and _can_copy_video would have offered the same
+    impossible remux for an AV1 source."""
+    assert fr._target_video_codec(container, "av1") != "av1"
+    args = fr._video_encode_args(container, "av1", 30, None, 1920, 1080)
+    assert "av1_nvenc" not in args, (container, args)
+
+
+def test_av1_below_the_hardware_minimum_falls_back_to_software():
+    args = fr._video_encode_args("mp4", "av1", 30, None, 120, 50)
+    assert args[:2] == ["-c:v", "libsvtav1"], args
+
+
+def test_av1_software_fallback_is_not_libaom():
+    """libaom at 1440p is minutes-per-second slow — the export watchdog would
+    terminate it and the user would just see a failed export."""
+    args = fr._software_encode_args("av1", 30)
+    assert "libaom-av1" not in args
+    assert args[:2] == ["-c:v", "libsvtav1"]
+
+
+def test_codec_dropdown_and_settings_validation_agree():
+    """A codec offered in the dialog that the settings validator rejects would
+    silently reset itself to h264 on the next launch."""
+    from src.ui.settings_dialog import CODEC_LABELS, CODEC_BY_LABEL
+    assert set(CODEC_BY_LABEL.values()) == set(CODEC_LABELS)
+    mw = Path(fr.__file__).parent.parent / "ui" / "main_window.py"
+    src = mw.read_text(encoding="utf-8")
+    for codec in CODEC_LABELS:
+        assert f'"{codec}"' in src, f"{codec} is offered but never validated"

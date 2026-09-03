@@ -12,6 +12,16 @@ from src.core.keybinds import ACTION_DEFS, PLAYER_ACTION_DEFS
 from src.ui.themes import THEMES, DEFAULT_THEME
 from src.ui.keybind_editor import KeybindEditor
 
+# Export video codecs, in the order they appear in the dropdown.
+# Keep this the single source of truth: the dialog builds the combo from it and
+# reads the selection back through it, so adding a codec is one edit.
+CODEC_LABELS = {
+    "h264": "H.264",
+    "h265": "H.265",
+    "av1": "AV1",
+}
+CODEC_BY_LABEL = {v: k for k, v in CODEC_LABELS.items()}
+
 QUALITY_PRESETS = {
     "Lossless (CRF 0)": 0,
     "High (CRF 17)": 17,
@@ -73,9 +83,15 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel("Codec:"))
         self.cmb_codec = QComboBox()
-        self.cmb_codec.addItems(["H.264", "H.265"])
+        self.cmb_codec.addItems(list(CODEC_LABELS.values()))
         self.cmb_codec.setCurrentText(
-            "H.264" if self.settings.get("codec") == "h264" else "H.265"
+            CODEC_LABELS.get(self.settings.get("codec", "h264"), CODEC_LABELS["h264"])
+        )
+        self.cmb_codec.setToolTip(
+            "H.264 — most compatible.\n"
+            "H.265 — ~30% smaller at the same quality.\n"
+            "AV1 — smallest at the same quality; needs a recent GPU to encode\n"
+            "quickly and a recent player to open."
         )
         row.addWidget(self.cmb_codec, stretch=1)
         vg.addLayout(row)
@@ -504,7 +520,8 @@ class SettingsDialog(QDialog):
         if text in AUTO_PRESETS:
             preset = AUTO_PRESETS[text]
             codec = preset.get("codec", "h264")
-            self.cmb_codec.setCurrentText("H.264" if codec == "h264" else "H.265")
+            self.cmb_codec.setCurrentText(
+                CODEC_LABELS.get(codec, CODEC_LABELS["h264"]))
             self.cmb_codec.setEnabled(False)
             self.cmb_codec.setToolTip("Codec set by auto-optimized preset")
         else:
@@ -522,7 +539,7 @@ class SettingsDialog(QDialog):
             self.txt_archive_dir.setText(folder)
 
     def get_settings(self) -> dict:
-        codec = "h264" if self.cmb_codec.currentText() == "H.264" else "h265"
+        codec = CODEC_BY_LABEL.get(self.cmb_codec.currentText(), "h264")
         quality_name = self.cmb_quality.currentText()
         auto_preset = AUTO_PRESETS.get(quality_name)
         if auto_preset:

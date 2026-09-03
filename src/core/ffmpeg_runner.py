@@ -233,6 +233,8 @@ def get_encoder_status() -> tuple[str, str]:
 NVENC_MIN_DIMS: dict[str, tuple[int, int]] = {
     "h264_nvenc": (145, 49),
     "hevc_nvenc": (256, 144),
+    # AV1 NVENC's documented minimum is 160x64.
+    "av1_nvenc": (160, 64),
 }
 
 
@@ -247,6 +249,11 @@ def _below_nvenc_minimum(encoder: str, output_w: int | None, output_h: int | Non
 
 
 def _software_encode_args(codec: str, crf: int) -> list[str]:
+    if codec == "av1":
+        # SVT-AV1 rather than libaom: libaom at 1440p is minutes-per-second
+        # slow, which the export watchdog would kill. preset 6 is its
+        # speed/quality midpoint.
+        return ["-c:v", "libsvtav1", "-preset", "6", "-crf", str(crf)]
     sw = "libx265" if codec == "h265" else "libx264"
     return ["-c:v", sw, "-preset", "medium", "-crf", str(crf)]
 
@@ -291,7 +298,10 @@ def _encode_args(
     if auto_preset:
         target_encoder = str(auto_preset.get("encoder", "libx264"))
     else:
-        target_encoder = "hevc_nvenc" if codec == "h265" else "h264_nvenc"
+        target_encoder = {
+            "h265": "hevc_nvenc",
+            "av1": "av1_nvenc",
+        }.get(codec, "h264_nvenc")
 
     if _below_nvenc_minimum(target_encoder, output_w, output_h):
         log().info(
@@ -587,7 +597,10 @@ SUPPORTED_CONTAINERS = ("mp4", "mkv", "mov", "webm", "flv", "avi", "ts", "m4v")
 _CONTAINER_VCODECS = {
     "mp4":  {"h264", "hevc", "av1", "mpeg4"},
     "m4v":  {"h264", "hevc", "av1", "mpeg4"},
-    "mov":  {"h264", "hevc", "prores", "mpeg4", "av1"},
+    # No av1 in mov: the bundled mov muxer refuses it — "Could not write header
+    # (incorrect codec parameters ?)". Listing it here would also have made
+    # _can_copy_video offer a remux that cannot actually be written.
+    "mov":  {"h264", "hevc", "prores", "mpeg4"},
     "mkv":  {"h264", "hevc", "vp9", "vp8", "av1", "mpeg4", "mpeg2video", "mjpeg"},
     "flv":  {"h264", "flv1"},
     "avi":  {"h264", "mpeg4", "mjpeg", "mpeg2video"},
@@ -613,12 +626,19 @@ def normalize_container(container: str) -> str:
 
 
 def _target_video_codec(container: str, codec: str) -> str:
-    """The video codec family to ENCODE for a container. webm -> vp9 (software,
-    no NVENC); flv -> h264 (hevc-in-flv is non-standard); else the user's
-    h264/h265 choice."""
-    if container == "webm":
-        return "vp9"
+    """The video codec family to ENCODE for a container.
+
+    flv -> h264 (hevc-in-flv is a non-standard enhanced-RTMP extension that
+    players choke on). webm -> vp9 unless the user explicitly picked AV1, which
+    webm also holds and which — unlike vp9 — has a hardware encoder. Anything
+    the target container cannot carry falls back to h264 rather than producing
+    a file that will not mux.
+    """
     if container == "flv":
+        return "h264"
+    if container == "webm":
+        return "av1" if codec == "av1" else "vp9"
+    if codec == "av1" and "av1" not in _CONTAINER_VCODECS.get(container, set()):
         return "h264"
     return codec
 
