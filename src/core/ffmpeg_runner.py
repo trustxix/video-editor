@@ -187,11 +187,28 @@ def _has_nvenc(encoder: str) -> bool:
             _nvenc_reason[encoder] = f"ffmpeg -encoders exited {result.returncode}"
             log().warning(f"NVENC probe failed for {encoder}: {_nvenc_reason[encoder]}")
             return False
-        if encoder in (result.stdout or ""):
+        if encoder not in (result.stdout or ""):
+            _nvenc_available[encoder] = False
+            _nvenc_reason[encoder] = f"{encoder} not listed in ffmpeg -encoders"
+            log().info(f"NVENC unavailable: {_nvenc_reason[encoder]}")
+            return False
+        # Being listed only means it was compiled in: the bundled build lists
+        # every NVENC encoder on machines with no NVIDIA GPU, and every export
+        # then fails. Encoding one frame is the only honest check (same reason
+        # as _has_cuda_decode). 256x144 clears every NVENC_MIN_DIMS entry.
+        probe = subprocess.run(
+            [get_ffmpeg(), '-hide_banner', '-f', 'lavfi', '-i',
+             'color=black:s=256x144', '-frames:v', '1', '-c:v', encoder,
+             '-f', 'null', '-'],
+            capture_output=True, text=True, startupinfo=_hide_window(),
+            timeout=10,
+        )
+        if probe.returncode == 0:
             _nvenc_available[encoder] = True
             return True
+        tail = (probe.stderr or "").strip().splitlines()[-1:] or ["no detail"]
         _nvenc_available[encoder] = False
-        _nvenc_reason[encoder] = f"{encoder} not listed in ffmpeg -encoders (no NVIDIA GPU?)"
+        _nvenc_reason[encoder] = f"{encoder} test encode failed (no usable NVIDIA GPU?): {tail[0]}"
         log().info(f"NVENC unavailable: {_nvenc_reason[encoder]}")
         return False
     except subprocess.TimeoutExpired:

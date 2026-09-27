@@ -230,6 +230,47 @@ def test_encoder_status_reports_reason_on_ffmpeg_missing(monkeypatch):
     assert "ffmpeg" in reason.lower()
 
 
+def _fake_encoder_probe(monkeypatch, test_encode_rc):
+    """-encoders lists NVENC (as the bundled build always does); the one-frame
+    test encode returns `test_encode_rc`."""
+    from src.core import ffmpeg_runner
+    import subprocess as sp
+    monkeypatch.setattr(ffmpeg_runner, "_nvenc_available", {})
+    monkeypatch.setattr(ffmpeg_runner, "_nvenc_reason", {})
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if "-encoders" in cmd:
+            return sp.CompletedProcess(cmd, 0, stdout=" V....D h264_nvenc  NVIDIA NVENC H.264\n", stderr="")
+        return sp.CompletedProcess(cmd, test_encode_rc, stdout="",
+                                   stderr="Cannot load nvcuda.dll\n")
+
+    monkeypatch.setattr(ffmpeg_runner.subprocess, "run", fake_run)
+    return ffmpeg_runner, calls
+
+
+def test_nvenc_listed_but_unusable_falls_back_to_software(monkeypatch):
+    """No NVIDIA GPU: NVENC is listed but cannot encode. Must NOT be selected —
+    it made every export fail on GPU-less machines (caught by CI)."""
+    ffmpeg_runner, calls = _fake_encoder_probe(monkeypatch, test_encode_rc=1)
+    assert ffmpeg_runner._has_nvenc("h264_nvenc") is False
+    assert any("h264_nvenc" in c and "-frames:v" in c for c in calls)
+    encoder, reason = ffmpeg_runner.get_encoder_status()
+    assert encoder == "software"
+    assert "nvcuda.dll" in reason
+    cmd = ffmpeg_runner.build_command(
+        "in.mp4", "out.mp4", crop_x=0, crop_y=0, crop_w=1920, crop_h=1080,
+        codec="h264", source_vcodec="h264", source_acodec="aac")
+    assert cmd[cmd.index("-c:v") + 1] == "libx264"
+
+
+def test_nvenc_that_passes_test_encode_is_used(monkeypatch):
+    ffmpeg_runner, _ = _fake_encoder_probe(monkeypatch, test_encode_rc=0)
+    assert ffmpeg_runner._has_nvenc("h264_nvenc") is True
+    assert ffmpeg_runner.get_encoder_status() == ("nvenc", "")
+
+
 # ─── NVENC hardware-minimum frame-size fallback ───────────────────────────
 # NVENC silently produces 0-byte output when frame dimensions are below the
 # hardware minimum. Per NVIDIA Video Codec SDK (Turing+), h264_nvenc requires
