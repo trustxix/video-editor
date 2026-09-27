@@ -182,7 +182,8 @@ class ColorPreviewWorker(QThread):
 class MainWindow(QMainWindow):
     # Emitted from the update-check worker thread; Qt queues delivery to the
     # GUI thread so the result dialog is built safely on the main thread.
-    _update_available = pyqtSignal(object)  # dict | None
+    _update_available = pyqtSignal(object)  # dict | None | UpdateCheckError
+    _manual_update_result = pyqtSignal(object)  # same payload, Help menu check
 
     def __init__(self):
         super().__init__()
@@ -296,6 +297,7 @@ class MainWindow(QMainWindow):
         # The worker thread emits _update_available; the queued connection
         # marshals it to the GUI thread (see _on_update_available).
         self._update_available.connect(self._on_update_available)
+        self._manual_update_result.connect(self._on_manual_update_result)
         if self._settings.get("check_for_updates", True):
             from src.core.version import check_for_update_async
             check_for_update_async(self._update_available.emit)
@@ -339,20 +341,35 @@ class MainWindow(QMainWindow):
     # ── Help: updates + bug report ────────────────────────────
 
     def _check_updates_manual(self):
-        """User-initiated update check with feedback either way."""
-        from src.core.version import VERSION, check_for_update
-        info = check_for_update()
-        if info:
-            self._show_update_available(info)
+        """User-initiated update check with feedback either way. Runs off the
+        GUI thread (up to a 5 s timeout); the menu action stays disabled until
+        the result arrives."""
+        from src.core.version import check_for_update_async
+        self._menu_actions["check_updates"].setEnabled(False)
+        check_for_update_async(self._manual_update_result.emit)
+
+    def _on_manual_update_result(self, result):
+        from src.core.version import VERSION, UpdateCheckError
+        self._menu_actions["check_updates"].setEnabled(True)
+        if isinstance(result, UpdateCheckError):
+            QMessageBox.warning(
+                self, "Check for Updates",
+                f"Couldn't check for updates: {result}.")
+        elif result:
+            self._show_update_available(result)
         else:
             QMessageBox.information(
                 self, "Check for Updates",
                 f"You're on the latest version ({VERSION}).")
 
-    def _on_update_available(self, info):
-        """Queued slot for the startup background check — runs on the GUI thread."""
-        if info:
-            self._show_update_available(info)
+    def _on_update_available(self, result):
+        """Queued slot for the silent startup check — runs on the GUI thread."""
+        from src.core.version import UpdateCheckError
+        if isinstance(result, UpdateCheckError):
+            from src.core.log_setup import log
+            log().warning(f"Startup update check failed: {result}")
+        elif result:
+            self._show_update_available(result)
 
     def _show_update_available(self, info: dict):
         from src.core.version import VERSION

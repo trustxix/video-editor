@@ -70,6 +70,37 @@ def test_help_menu_actions_exist(window):
     assert "report_bug" in window._menu_actions
 
 
+@pytest.mark.parametrize("outcome, expected", [
+    ("error", ("warning", "Couldn't check for updates: GitHub returned HTTP 404.")),
+    ("current", ("information", "You're on the latest version")),
+    ("update", ("update", "9.9.9")),
+])
+def test_manual_update_check_reports_each_outcome(window, monkeypatch, outcome, expected):
+    """A failed check must say so, not claim the app is up to date."""
+    import src.core.version as version
+    from src.ui import main_window as mw
+    result = {
+        "error": version.UpdateCheckError("GitHub returned HTTP 404"),
+        "current": None,
+        "update": {"latest": "9.9.9", "url": "", "notes": ""},
+    }[outcome]
+    monkeypatch.setattr(version, "check_for_update_async", lambda cb: cb(result))
+    shown = []
+    monkeypatch.setattr(mw.QMessageBox, "warning",
+                        lambda parent, title, text: shown.append(("warning", text)))
+    monkeypatch.setattr(mw.QMessageBox, "information",
+                        lambda parent, title, text: shown.append(("information", text)))
+    monkeypatch.setattr(window, "_show_update_available",
+                        lambda info: shown.append(("update", info["latest"])))
+
+    window._check_updates_manual()
+
+    assert len(shown) == 1
+    kind, text = shown[0]
+    assert kind == expected[0] and text.startswith(expected[1])
+    assert window._menu_actions["check_updates"].isEnabled()
+
+
 def test_undo_coalesces_a_drag_gesture(window):
     """A continuous drag must collapse to exactly one undo entry holding the
     pre-drag state, so one Ctrl+Z reverts the whole drag (not a single tick)."""

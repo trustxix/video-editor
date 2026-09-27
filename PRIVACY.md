@@ -23,9 +23,9 @@ disabled in **Settings → General**.
 
 ### Update check (default: ON)
 
-When the app starts, it may make a single HTTPS GET request to a small
-JSON file at:
-  `https://raw.githubusercontent.com/trustxix/video-editor/main/release/latest.json`
+When the app starts (and when you choose **Help → Check for Updates**), it
+makes a single HTTPS GET request to GitHub's public release API:
+  `https://api.github.com/repos/trustxix/video-editor/releases/latest`
 
 This request includes only:
 - Your IP address (visible to GitHub by virtue of the connection)
