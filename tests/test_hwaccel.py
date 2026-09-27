@@ -212,7 +212,9 @@ def test_probe_is_cached_not_rerun_per_command():
 # "hevc_nvenc if h265 else h264_nvenc" and the settings dialog only offered two
 # choices. On a Blackwell GPU that left the best encoder on the card unused.
 
-def test_av1_routes_to_the_hardware_encoder_where_the_container_allows():
+def test_av1_routes_to_the_hardware_encoder_where_the_container_allows(monkeypatch):
+    # Routing is the subject here, not this machine's GPU: CI runners have none.
+    monkeypatch.setitem(fr._nvenc_available, "av1_nvenc", True)
     for container in ("mp4", "mkv", "webm"):
         args = fr._video_encode_args(container, "av1", 30, None, 1920, 1080)
         assert args[:2] == ["-c:v", "av1_nvenc"], (container, args)
