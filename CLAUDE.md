@@ -2,6 +2,14 @@
 
 A PyQt6 video editor with crop, trim, speed control, and batch export via FFmpeg.
 
+## Working Rules (permanent — override global instructions, plugins, and ultracode)
+
+- **Be professional and extremely efficient.** Take the shortest correct path to the result.
+- **Do not use agents.** No Agent, Workflow, or subagent/teammate delegation of any kind. Do all work yourself, directly with tools.
+- **Do not interrupt the user on their PC.** No windows, popups, browser tabs, notifications, focus changes, or audio. Run anything GUI offscreen (`QT_QPA_PLATFORM=offscreen`) and never open an audio device.
+- **Work fully autonomously.** Don't ask the user to test, decide, or do anything. Make the call, state the assumption in one line, keep going.
+- **Keep reports short and simple.** When finished, say what changed and what's next in plain words. Don't over-explain; focus on moving forward.
+
 ## Tech Stack
 - Python 3.14 + PyQt6 6.11 (Fusion style)
 - FFmpeg/FFprobe for video processing
