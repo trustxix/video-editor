@@ -977,7 +977,15 @@ class MainWindow(QMainWindow):
         self._video_h = item.video_h
         self._duration_s = item.duration_s
 
+        if self._gesture_active:
+            self._undo_end_gesture()  # a mid-drag gesture belongs to the clip being left
+        self._undo_stack = item.undo_stack
+        self._redo_stack = item.redo_stack
+
         self.player.load(item.path)
+        # The overlay reset emits crop_changed while the UI still shows the
+        # previous clip; keep that snapshot out of this clip's undo history.
+        self._restoring = True
         self.crop_overlay.set_video_size(item.video_w, item.video_h)
         self._restore_state(item)
 

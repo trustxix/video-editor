@@ -82,6 +82,41 @@ def test_undo_coalesces_a_drag_gesture(window):
     assert window._undo_stack[-1]["brightness"] == 0  # the pre-drag value
 
 
+def test_undo_history_is_per_clip(window, monkeypatch):
+    """Undo must never reach into another clip's history. With one shared
+    stack, undoing on clip B past B's own edits applied clip A's snapshot
+    (trim, crop, speed, ...) to B, which then exported with A's edits."""
+    from src.core.video_item import VideoItem
+    monkeypatch.setattr(window.player, "load", lambda path: None)
+
+    def clip(name, w, h):
+        return VideoItem(path=name, video_w=w, video_h=h, duration_s=10.0,
+                         duration_ms=10_000, trim_end_ms=10_000,
+                         crop_w=w, crop_h=h, probed=True)
+
+    a, b = clip("a.mp4", 1920, 1080), clip("b.mp4", 1280, 720)
+    b.trim_start_ms, b.trim_end_ms = 2_000, 6_000
+    window._queue = [a, b]
+    window._queue_index = -1
+    window._navigate_to(0)
+    window._undo_begin_gesture()
+    window.sld_brightness.setValue(40)
+    window._undo_end_gesture()
+    assert len(window._undo_stack) == 1
+
+    window._navigate_to(1)
+    window._undo()
+    window._save_current_state()
+    assert (b.trim_start_ms, b.trim_end_ms) == (2_000, 6_000)
+    assert (b.crop_w, b.crop_h) == (1280, 720)
+
+    window._navigate_to(0)  # A's own history survives the round trip
+    window._undo()
+    window._save_current_state()
+    assert a.brightness == 0.0
+    assert (a.trim_start_ms, a.trim_end_ms) == (0, 10_000)
+
+
 def test_every_keybind_action_has_a_handler(window):
     """No dead keybinds: every declared editor/player action must have a wired
     handler, and there must be no orphan handlers."""

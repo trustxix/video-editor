@@ -39,3 +39,7 @@ class VideoItem:
     audio_normalize: bool = False  # per-clip loudness normalization on export
     normalize_data: dict | None = None  # cached first-pass loudnorm measurements
     speed_keyframes: list = field(default_factory=list)  # [(time_ms, speed), ...]
+    # Per-clip undo history. MainWindow swaps these in on navigation so an
+    # undo can never apply one clip's snapshot to another.
+    undo_stack: list = field(default_factory=list, repr=False, compare=False)
+    redo_stack: list = field(default_factory=list, repr=False, compare=False)
