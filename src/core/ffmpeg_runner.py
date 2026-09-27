@@ -1044,12 +1044,12 @@ def export_with_automation(
     container = normalize_container(container) or Path(output_path).suffix.lstrip(".").lower()
     has_crop = all(v is not None for v in (crop_x, crop_y, crop_w, crop_h))
 
-    temp_dir = tempfile.mkdtemp(prefix="ve_export_")
     segments = build_video_segments(keyframes, base_speed, trim_start_ms, trim_end_ms)
     if not segments:
         return False
     total_out_dur = sum((e - s) / spd for s, e, spd in segments)
 
+    temp_dir = tempfile.mkdtemp(prefix="ve_export_")
     try:
         # ── Step 1: Pre-render audio (unchanged) ────────────
         audio_wav = os.path.join(temp_dir, "audio.wav")

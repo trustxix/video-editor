@@ -510,3 +510,15 @@ def test_safe_output_path_creates_output_dir(tmp_path):
     result = safe_output_path(str(new_dir), r"C:\source\clip.mp4", suffix="_v")
     assert new_dir.exists()
     assert str(new_dir.resolve()) in str(Path(result).resolve())
+
+
+def test_empty_automation_export_leaves_no_temp_dir(tmp_path, monkeypatch):
+    """A zero-length trim yields no segments; the early return must not
+    leave an empty ve_export_* directory behind in %TEMP%."""
+    import tempfile
+    from src.core.ffmpeg_runner import export_with_automation
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    ok = export_with_automation("in.mp4", str(tmp_path / "out.mp4"), [], 1.0,
+                                trim_start_ms=1000, trim_end_ms=1000)
+    assert ok is False
+    assert list(tmp_path.iterdir()) == []
