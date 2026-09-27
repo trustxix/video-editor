@@ -2,10 +2,10 @@
 ; Build with:
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" tools\installer.iss
 ; Or via the release pipeline:
-;   .\tools\release.ps1 -Version 0.1.0
+;   .\tools\release.ps1 -Version 0.1.1
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.1.1"
 #endif
 
 #define MyAppName        "Video Editor"

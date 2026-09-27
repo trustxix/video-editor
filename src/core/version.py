@@ -20,7 +20,7 @@ import json
 import threading
 from typing import Callable, Optional
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Static JSON hosted on GitHub raw — free, no infrastructure to maintain.
 # When the repo exists at this URL with a `release/latest.json`, the update
