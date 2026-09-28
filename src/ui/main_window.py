@@ -1252,11 +1252,13 @@ class MainWindow(QMainWindow):
         # QThread, unresponsive subprocess, audio sink refusing to release),
         # force-exit after 8 seconds so the user never has to kill pythonw
         # manually. Daemon so it can't keep the process alive on its own.
+        # Kept on self so a host that outlives the window (the test suite)
+        # can cancel it; in the app main() os._exit()s long before it fires.
         import os as _os
         import threading as _th
-        _watchdog = _th.Timer(8.0, lambda: _os._exit(1))
-        _watchdog.daemon = True
-        _watchdog.start()
+        self._shutdown_watchdog = _th.Timer(8.0, lambda: _os._exit(1))
+        self._shutdown_watchdog.daemon = True
+        self._shutdown_watchdog.start()
 
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()

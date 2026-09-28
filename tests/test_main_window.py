@@ -34,6 +34,10 @@ def window(qapp, monkeypatch):
         yield w
     finally:
         w.close()
+        # closeEvent arms an 8 s os._exit(1) dead-man's switch for a hung
+        # shutdown. pytest outlives the window, so without this the whole run
+        # silently dies 8 s after the first window test.
+        w._shutdown_watchdog.cancel()
 
 
 def test_semitone_buttons_stay_in_slider_range(window):
