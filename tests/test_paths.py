@@ -78,11 +78,3 @@ def test_config_dir_is_recreated_if_deleted_while_running(fresh_resolution):
     d.rmdir()
     assert paths.get_config_dir() == d
     assert d.is_dir()
-
-
-def test_installation_id_lives_in_the_fallback_dir(fresh_resolution):
-    base, local = fresh_resolution
-    (base / "config").write_text("blocked")
-    iid = paths.installation_id()
-    stored = local / paths.APP_DIR_NAME / "config" / ".installation_id"
-    assert stored.read_text(encoding="utf-8") == iid

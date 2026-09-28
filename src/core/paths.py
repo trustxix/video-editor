@@ -1,5 +1,4 @@
 import functools
-import hashlib
 import os
 import sys
 import tempfile
@@ -76,32 +75,6 @@ def get_ffprobe() -> str:
     if flat.exists():
         return str(flat)
     return "ffprobe"
-
-
-def installation_id() -> str:
-    """Stable per-install id, persisted in `<config dir>/.installation_id`.
-
-    Used for crash-dump correlation (so we can tell two crashes from the
-    same install apart from two unrelated installs). NOT used for the
-    single-instance mutex — that lives in `Local\\` namespace and is
-    naturally per-Windows-session, see `main._is_already_running`.
-    """
-    cfg = get_config_dir()
-    id_file = cfg / ".installation_id"
-    if id_file.exists():
-        try:
-            existing = id_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        except OSError:
-            pass
-    seed = f"{os.environ.get('USERNAME', '')}:{os.environ.get('APPDATA', '')}"
-    iid = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
-    try:
-        id_file.write_text(iid, encoding="utf-8")
-    except OSError:
-        pass
-    return iid
 
 
 # Backwards-compat alias used by Phase 1.5 log_setup.
