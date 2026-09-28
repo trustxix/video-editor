@@ -123,9 +123,9 @@ Each one is OFF or under explicit user control.
 ## Licenses
 
 - **App:** GPL v3 — see [LICENSE](LICENSE)
-- **Bundled FFmpeg:** LGPL v2.1+ / GPL v2+ — see `ffmpeg/licenses/` in the
-  installed app, plus [docs/FFMPEG_SOURCE_OFFER.md](docs/FFMPEG_SOURCE_OFFER.md)
-  for the GPL source offer
+- **Bundled FFmpeg:** GPL version 3 or later — see `ffmpeg/licenses/` in the
+  installed app. Its complete source is the `ffmpeg-<version>-source.tar`
+  asset on each release; see [docs/FFMPEG_SOURCE_OFFER.md](docs/FFMPEG_SOURCE_OFFER.md)
 - **Third-party components:** see [NOTICES.md](NOTICES.md)
 
 ---

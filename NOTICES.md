@@ -5,12 +5,12 @@ Each component retains its own license. See the individual files referenced
 below for full license text.
 
 ## FFmpeg
-- **License:** LGPL v2.1+ / GPL v2+ (depending on build configuration)
-- **Bundled binaries:** `ffmpeg.exe`, `ffprobe.exe`
-- **Build source:** [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds), `win64-gpl` static asset
-- **Bundle metadata:** see `ffmpeg/BUNDLE_INFO.txt` for the exact release name, asset URL, and SHA256 of the bundled binary
-- **License files:** see `ffmpeg/licenses/` (LICENSE.txt, COPYING.GPLv2, COPYING.GPLv3, COPYING.LGPLv2.1, etc.)
-- **Source offer:** see [`docs/FFMPEG_SOURCE_OFFER.md`](docs/FFMPEG_SOURCE_OFFER.md)
+- **License:** GPL version 3 or later (configured with `--enable-gpl --enable-version3`)
+- **Bundled binaries:** `ffmpeg.exe`, `ffprobe.exe`, statically linked
+- **Build:** [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds), target win64, variant gpl
+- **Bundle metadata:** `ffmpeg/BUNDLE_INFO.txt` names the exact version, the FFmpeg and BtbN commits, and the SHA256 of the release archive
+- **License text:** `ffmpeg/licenses/LICENSE.txt` (GPL v3)
+- **Source:** `ffmpeg-<version>-source.tar` on the GitHub release; see [`docs/FFMPEG_SOURCE_OFFER.md`](docs/FFMPEG_SOURCE_OFFER.md)
 
 ## PyQt6
 - **License:** GPL v3

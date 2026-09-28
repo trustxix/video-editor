@@ -1,33 +1,34 @@
-# Written Offer for FFmpeg Source Code
+# FFmpeg source code
 
-This software bundles a binary copy of FFmpeg, which is licensed under the
-GNU General Public License v2 or later (GPL v2+) and the GNU Lesser General
-Public License v2.1 or later (LGPL v2.1+). Per the terms of those licenses,
-we provide the following written offer:
+Video Editor ships `ffmpeg.exe` and `ffprobe.exe` in its `ffmpeg\` folder.
+They are FFmpeg as built by the BtbN/FFmpeg-Builds project (target win64,
+variant gpl): configured with `--enable-gpl --enable-version3` and statically
+linked with GPL-compatible libraries, so they are licensed under the GNU
+General Public License, **version 3 or (at your option) any later version**.
+The license text is `ffmpeg\licenses\LICENSE.txt`. The exact build is named
+on the `Version:` line of `ffmpeg\BUNDLE_INFO.txt`.
 
-> For a period of three (3) years from the date you received the bundled
-> Video Editor software, you may obtain the complete corresponding source
-> code for the bundled FFmpeg version at no charge other than the cost of
-> the physical media (if any).
->
-> The bundled FFmpeg is built from source by the BtbN/FFmpeg-Builds project.
-> The exact build is identified in the file `ffmpeg/BUNDLE_INFO.txt` shipped
-> in your installation. That file records:
->   - the BtbN release name
->   - the asset filename and download URL
->   - the SHA256 of the downloaded archive
->
-> The build sources are available at:
->   https://github.com/BtbN/FFmpeg-Builds
->
-> The upstream FFmpeg source is available at:
->   https://ffmpeg.org/download.html
->   https://git.ffmpeg.org/ffmpeg.git
->
-> To request the source on physical media, open an issue at the project's
-> issue tracker (linked from the README) with the subject
-> "FFmpeg source request" and include the SHA256 from your
-> `ffmpeg/BUNDLE_INFO.txt`.
+## Getting the source
 
-The full text of the GPL v2 is included at `ffmpeg/licenses/COPYING.GPLv2`.
-The full text of the LGPL v2.1 is included at `ffmpeg/licenses/COPYING.LGPLv2.1`.
+The complete corresponding source is published in the same place as the app,
+on the GitHub release you downloaded it from:
+
+  https://github.com/trustxix/video-editor/releases
+
+Every release that ships a given FFmpeg build has an asset named
+`ffmpeg-<version>-source.tar` (plus a `.sha256`), where `<version>` is the
+`Version:` line of `ffmpeg\BUNDLE_INFO.txt`, for example
+`ffmpeg-N-126390-g9fc8c785e2-20260903-source.tar`. It holds FFmpeg at the
+exact commit, the BtbN build scripts and patches at the commit that built it,
+and the source of every library linked into the binaries. Its `README.txt`
+explains the layout, and `MANIFEST.tsv` lists each part's upstream repository,
+commit and SHA256.
+
+## Written offer
+
+For at least three years after we last distribute a version of Video Editor,
+anyone who has it can also get that source from us, at no charge beyond the
+cost of physically performing the transfer: open an issue at
+https://github.com/trustxix/video-editor/issues titled
+"FFmpeg source request" and include the `Version:` line from your
+`ffmpeg\BUNDLE_INFO.txt`.
