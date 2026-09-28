@@ -93,12 +93,10 @@ preset (Settings → Output → Preset).
 silently fail. Workaround: keep crops at least 160×160, or switch the codec
 to software h264 in Settings → Output for tiny exports.
 
-**App won't launch — "another instance is already running".** Check Task
-Manager for an orphaned `Video Editor.exe` and kill it. If the orphan keeps
-appearing, the per-installation mutex id is stuck — delete
-`.installation_id` from the config folder (`<install dir>\config`, or
-`%LOCALAPPDATA%\Video Editor\config` if the install folder is read-only) and
-re-launch.
+**App won't launch (nothing happens).** A second launch exits silently
+while another copy is running. Check Task Manager for an orphaned
+`Video Editor.exe` and end it. The single-instance
+lock is released when that process exits, so no file needs deleting.
 
 **A clip won't play but plays in VLC.** The Qt media stack on Windows uses
 Media Foundation, which has narrower codec coverage than VLC. Convert with

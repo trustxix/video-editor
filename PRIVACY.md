@@ -1,14 +1,14 @@
 # Privacy Policy
 
-**Effective:** 2026-04-25
+**Effective:** 2026-09-28
 **Application:** Video Editor (desktop, Windows)
 
 ## Summary
 
-This app collects **nothing by default**. It runs entirely on your local
-computer. Optional features that send data over the network are listed
-below — each is OFF by default unless noted otherwise, and each can be
-disabled in **Settings → General**.
+This app collects **nothing** about you. It runs entirely on your local
+computer. The only automatic network request is the update check below
+(on by default, and you can turn it off in **Settings → General → Privacy**).
+Official builds contain no crash-report sender.
 
 ## What we do not collect
 
@@ -39,19 +39,24 @@ You can turn off the startup check in **Settings → General → Privacy →
 Check for updates**. **Help → Check for Updates** still works when you
 choose it.
 
-### Crash reports (default: OFF)
+### Crash reports (not in official builds)
 
-If you opt in via **Settings → General → Send anonymous crash reports**, the
-app will transmit minimal crash diagnostics on uncaught exceptions:
+Official builds never transmit crash reports. When the app crashes it only
+writes a local dump (see "Files written to disk" below).
+
+The source code can send reports to Sentry, but only in a build that
+includes the `sentry-sdk` library, only when the `SENTRY_DSN` environment
+variable is set on your computer, and only if you set `crash_reports` to
+`true` in `settings.json` (default `false`). Crashes that happen before your
+settings load are never sent. Such a report contains:
 - The Python exception type and message (with file paths sanitized — your
   Windows username is removed before transmission)
 - The Python traceback (also sanitized)
 - Your operating system name and version (e.g., `Windows-10.0.22631`)
 - The installed app version
 
-It does NOT transmit any video files, video content, settings values,
-or filenames. Crashes that occur **before** the user enables this option
-are never transmitted.
+It does NOT contain any video files, video content, settings values,
+or filenames.
 
 ### "Report a Bug" (manual, never automatic)
 
@@ -59,8 +64,9 @@ When you click **Help → Report a Bug**, the app:
 1. Reads the most recent ~200 lines of `editor.log`
 2. Sanitizes paths (removes your Windows username)
 3. Copies a markdown-formatted report to your clipboard
-4. Opens your default browser to a GitHub issue URL or your default mail
-   client
+4. Saves the same report as `VideoEditor-bug-report-<date>-<time>.md` on
+   your Desktop
+5. Opens the project's GitHub new-issue page in your default browser
 
 Nothing is transmitted automatically — you choose what to send and where.
 
@@ -74,12 +80,14 @@ Program Files). The app logs which one it uses at startup.
 - `<config>/editor.log` (and `.1`, `.2`, `.3` rotations) —
   rotating log file, max ~8 MB total. Paths in the log are sanitized to
   remove your username.
-- `<config>/.installation_id` — random per-install identifier
-  used only to salt the single-instance mutex name (no PII)
 - `<config>/crashes/*.json` — local crash dumps written when
-  uncaught exceptions occur. These are NOT transmitted unless you enable
-  the optional Crash Reports feature above. You can delete this folder
-  any time.
+  uncaught exceptions occur (the newest 20 are kept). Official builds never
+  transmit them. You can delete this folder any time.
+- `<config>/export_error.log` (and `.1`) — the FFmpeg command line and
+  error output of failed exports, including file names, with your username
+  removed from paths. Rotated at ~1 MB.
+- `VideoEditor-bug-report-*.md` on your Desktop — only when you use
+  **Help → Report a Bug**.
 
 ## Children
 

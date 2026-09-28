@@ -117,7 +117,7 @@ main.py                          # Entry: stderr-suppression, mutex,
                                  # log_setup.init, crash_reporter install
 src/core/
     paths.py                     # Frozen vs source path resolution,
-                                 # installation_id for mutex salt
+                                 # config dir + read-only-install fallback
     ffmpeg_runner.py             # Command builder, run_export,
                                  # NVENC fallback, loudnorm, traversal guard
     presets.py                   # Aspect ratio math
