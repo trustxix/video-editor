@@ -17,7 +17,7 @@ cd /d "%~dp0\.."
 
 echo.
 echo ============================================================
-echo   Publish video-editor to GitHub (private repo)
+echo   Publish video-editor to GitHub (public repo, GPL v3)
 echo ============================================================
 echo.
 
@@ -54,8 +54,8 @@ if "%HAS_GH%"=="1" (
         echo [2/3] Repo trustxix/video-editor already exists.
         set REPO_EXISTS=1
     ) else (
-        echo [2/3] Creating private repo via gh CLI...
-        gh repo create trustxix/video-editor --private ^
+        echo [2/3] Creating public repo via gh CLI (GPL v3 — source must be available)...
+        gh repo create trustxix/video-editor --public ^
             --description "PyQt6 video editor with crop, trim, speed control, and batch export via FFmpeg"
         if errorlevel 1 (
             echo.
@@ -75,14 +75,14 @@ echo   MANUAL repo creation step (one-time, ~20 seconds)
 echo ============================================================
 echo.
 echo   1. Your browser will open to GitHub's "New repository" page,
-echo      pre-filled with the repo name set to PRIVATE.
+echo      pre-filled with the repo name set to PUBLIC (GPL v3).
 echo   2. Sign in if prompted, then click the green
 echo      "Create repository" button.
 echo   3. DO NOT add a README, .gitignore, or license — leave
 echo      "Initialize this repository with:" all unchecked.
 echo   4. Come back to this window and press any key to continue.
 echo.
-start "" "https://github.com/new?name=video-editor&visibility=private&description=PyQt6+video+editor+with+crop%%2C+trim%%2C+speed+control%%2C+and+batch+export+via+FFmpeg"
+start "" "https://github.com/new?name=video-editor&visibility=public&description=PyQt6+video+editor+with+crop%%2C+trim%%2C+speed+control%%2C+and+batch+export+via+FFmpeg"
 pause
 
 REM ─── Step 3: Configure local remote + push master ──────────
