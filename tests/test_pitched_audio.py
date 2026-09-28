@@ -7,6 +7,7 @@ from __future__ import annotations
 import array
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -347,3 +348,218 @@ def test_block_speed_lookup_tracks_the_per_sample_curve(qapp):
 
     diff_ms = abs(pos - bpos) * 1000.0 / rate
     assert diff_ms < 5.0, diff_ms
+
+
+# ── Drift correction is a closed loop with 250 ms of dead time ───────────
+#
+# shift_cursor() moves the WRITE cursor, so a correction is heard (and shows
+# up in playback_position_ms) only once the sink backlog ahead of it has
+# played. The loop below runs the real _feed and resync_audio_if_drifting
+# against a virtual-clock sink, ticking both at their real cadences.
+
+class _ClockSink:
+    """A 250 ms QAudioSink draining at 48 kHz on a virtual clock. Doubles as
+    the io device start() returns. Never opens an audio device."""
+
+    def __init__(self, fmt=None):
+        self.now = 0.0
+        self.written = 0
+
+    def start(self):
+        return self
+
+    def _queued(self):
+        return self.written - min(self.written, int(self.now * 48000))
+
+    def bufferSize(self):
+        return _BUF_BYTES
+
+    def bytesFree(self):
+        return (_BUF_FRAMES - self._queued()) * 4
+
+    def write(self, b):
+        self.written += len(b) // 4
+        return len(b)
+
+    def stop(self):
+        pass
+
+    def setVolume(self, v):
+        pass
+
+
+def _run_loop(vp, monkeypatch, speed, video_ms_at, seconds=4.0):
+    """Play from 0 and tick the feed every 15 ms and the position check every
+    48 ms (the measured QMediaPlayer cadence) for `seconds` of virtual time.
+    Returns (shift sizes in ms, heard-minus-video error on every tick)."""
+    import src.ui.video_player as vpm
+    monkeypatch.setattr(vpm, "QAudioSink", _ClockSink)
+    pa = vp._pitched
+    vp._pitched_active = True
+    pa._pcm = array.array('h', bytes(4 * 48000 * 20))
+    pa._automation = None
+    pa.set_speed(speed)
+    pa.play(0)
+    pa._timer.stop()               # the loop below is the clock
+    sink = pa._sink
+    shifts = []
+    real_shift = pa.shift_cursor
+
+    def spy(delta_ms):
+        shifts.append(delta_ms)
+        real_shift(delta_ms)
+
+    pa.shift_cursor = spy
+    errors = []
+    for ms in range(1, int(seconds * 1000) + 1):
+        sink.now = ms / 1000.0
+        if ms % 15 == 0:
+            pa._feed()
+        if ms % 48 == 0:
+            video = video_ms_at(ms)
+            vp.resync_audio_if_drifting(int(video))
+            errors.append(pa.playback_position_ms() - video)
+    return shifts, errors
+
+
+def test_one_disturbance_gets_one_correction_not_an_oscillation(playing_player, monkeypatch):
+    """Regression: every ~50 ms position tick re-measured an error that had
+    already been corrected but was still queued, and applied it again. A
+    single 200 ms offset turned into a growing oscillation (160 ms -> seconds
+    -> tens of seconds), heard as audio glitching that only stopped when
+    playback was restarted."""
+    speed = 1.2
+
+    def video(ms):                 # the video clock jumps 200 ms ahead at t=1 s
+        return ms * speed + (200 if ms >= 1000 else 0)
+
+    shifts, errors = _run_loop(playing_player, monkeypatch, speed, video)
+    assert len(shifts) == 1, shifts
+    assert abs(shifts[0] - 200) < 10, shifts
+    settled = errors[-20:]         # the last ~1 s
+    assert max(abs(e) for e in settled) < 5, settled
+    assert max(abs(e) for e in errors) < 260, max(abs(e) for e in errors)
+
+
+def test_no_correction_while_the_video_settles_after_a_seek(playing_player, monkeypatch):
+    """After a seek the audio restarts at the target instantly, but the video
+    decoder runs forward from the previous keyframe and position() lags for
+    ~200 ms. Correcting that transient jumped the audio after every click."""
+    speed = 1.2
+
+    def video(ms):                 # stalled at the seek target for 200 ms, then caught up
+        return 0 if ms < 200 else ms * speed
+
+    shifts, errors = _run_loop(playing_player, monkeypatch, speed, video)
+    assert shifts == []
+    assert max(abs(e) for e in errors[-20:]) < 5
+
+
+def test_correction_settled_tracks_the_sink_backlog(qapp):
+    pa = _primed_player(1.0, _BUF_FRAMES)
+    pa._written = 48000
+    assert pa.correction_settled()
+    pa.shift_cursor(100.0)
+    assert not pa.correction_settled()       # the whole backlog is ahead of it
+    pa._written += _BUF_FRAMES               # one more buffer written...
+    assert pa.correction_settled()           # ...so the corrected audio is playing
+    pa._sink = None
+    assert not pa.correction_settled()       # nothing is playing at all
+
+
+# ── Scrubbing while playing ──────────────────────────────────────────────
+
+class _StubMediaPlayer:
+    """Just enough QMediaPlayer for VideoPlayer.scrub/seek. Records the pitched
+    sink's state at each setPosition, because setPosition emits positionChanged
+    synchronously and the drift check must not see the new video position
+    against the old audio."""
+
+    def __init__(self, vp, playing=True):
+        from PyQt6.QtMultimedia import QMediaPlayer
+        self._vp = vp
+        self._state = (QMediaPlayer.PlaybackState.PlayingState if playing
+                       else QMediaPlayer.PlaybackState.PausedState)
+        self._pos = 0
+        self.sink_alive_at_set = []
+
+    def playbackState(self):
+        return self._state
+
+    def setPosition(self, ms):
+        self.sink_alive_at_set.append(self._vp._pitched._sink is not None)
+        self._pos = ms
+
+    def position(self):
+        return self._pos
+
+
+@pytest.fixture
+def scrub_player(qapp):
+    from src.ui.video_player import VideoPlayer
+    vp = VideoPlayer()
+    real_player = vp.player
+    vp._pitched_active = True
+    vp._pitched._pcm = array.array('h', bytes(4 * 48000))
+    vp._pitched._sink = _FakeSink(0, _BUF_BYTES)       # "playing"
+    plays = []
+    vp._pitched.play = lambda ms=0: plays.append(ms)   # never builds a real sink
+    yield vp, plays
+    vp._pitched._sink = None
+    vp.player = real_player
+    vp.shutdown()
+    vp.deleteLater()
+
+
+def test_scrub_silences_pitched_audio_before_moving_the_video(scrub_player):
+    vp, plays = scrub_player
+    vp.player = _StubMediaPlayer(vp)
+    vp.scrub(5000)
+    assert vp._pitched._sink is None
+    assert vp.player.sink_alive_at_set == [False]
+    assert vp._scrub_settle.isActive()
+    assert plays == []                 # no sink churn per drag pixel
+
+
+def test_release_restarts_audio_once_at_the_settled_position(scrub_player):
+    vp, plays = scrub_player
+    vp.player = _StubMediaPlayer(vp)
+    vp.scrub(5000)
+    vp.scrub(5400)
+    vp.seek(5400)                      # mouse release
+    assert plays == [5400]
+    assert not vp._scrub_settle.isActive()
+
+
+def test_scrub_without_a_release_still_resumes_audio(scrub_player):
+    """A keyboard nudge emits no release (and a mouse release can be lost), so
+    the settle timer must bring the audio back where the playhead stopped."""
+    vp, plays = scrub_player
+    vp.player = _StubMediaPlayer(vp)
+    vp.scrub(7000)
+    assert plays == []
+    deadline = time.monotonic() + 2.0
+    while not plays and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert plays == [7000]
+
+
+def test_scrub_while_paused_leaves_audio_alone(scrub_player):
+    vp, plays = scrub_player
+    vp.player = _StubMediaPlayer(vp, playing=False)
+    vp.scrub(3000)
+    assert vp._pitched._sink is not None
+    assert not vp._scrub_settle.isActive()
+    vp._resume_pitched_after_scrub()
+    assert plays == []
+
+
+def test_heard_audio_clock_is_withheld_until_trustworthy(playing_player):
+    pa = _prime(playing_player, 1.5)
+    assert playing_player.heard_audio_ms() == pytest.approx(pa.playback_position_ms())
+    pa.shift_cursor(120.0)             # a correction is still queued
+    assert playing_player.heard_audio_ms() is None
+    playing_player._pitched_active = False
+    pa._settle_at = 0
+    assert playing_player.heard_audio_ms() is None

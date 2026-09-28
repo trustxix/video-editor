@@ -2034,7 +2034,14 @@ class MainWindow(QMainWindow):
         if self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             # Smooth automation: only update speed variable, never touch audio pipeline
             if self.automation.get_keyframes():
-                auto_speed = self.automation.get_speed_at(clamped)
+                # Take the video's rate from the curve where the AUDIO is. The
+                # pitched audio follows the curve exactly by its own position,
+                # so with the video reading it at a slightly different position
+                # any offset between them grows on every rising ramp — steep,
+                # dense keyframes compounded that into constant resyncs.
+                heard = self.player.heard_audio_ms()
+                auto_speed = self.automation.get_speed_at(
+                    clamped if heard is None else int(heard))
                 if abs(auto_speed - self.player._speed) > 0.005:
                     self._apply_speed_live(auto_speed)
 

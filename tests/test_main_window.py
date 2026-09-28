@@ -174,6 +174,31 @@ def test_default_keybinds_parse_with_no_conflicts(window):
                 seen[kb] = aid
 
 
+def test_automation_drives_the_video_rate_from_the_heard_audio(window, monkeypatch):
+    """With keyframes, the video's rate must come from the curve at the
+    position being HEARD. The pitched audio follows the curve by its own
+    position; reading it at the video position instead let any A/V offset grow
+    on every rising ramp, and dense keyframes compounded that into constant
+    audible resyncs. Falls back to the video position while the audio clock
+    isn't trustworthy."""
+    from PyQt6.QtMultimedia import QMediaPlayer
+    window.trim.set_duration(10_000)
+    window.trim.set_trim(0, 10_000)
+    window.automation.set_duration(10_000)
+    window.automation.set_keyframes([(0, 1.0), (4000, 1.0), (6000, 2.0)])
+    monkeypatch.setattr(window.player.player, "playbackState",
+                        lambda: QMediaPlayer.PlaybackState.PlayingState)
+    monkeypatch.setattr(window.player, "resync_audio_if_drifting", lambda ms: None)
+
+    monkeypatch.setattr(window.player, "heard_audio_ms", lambda: 5000.0)
+    window._on_playback_position(1000)
+    assert window.player._speed == pytest.approx(1.5)    # curve at 5000, not 1000
+
+    monkeypatch.setattr(window.player, "heard_audio_ms", lambda: None)
+    window._on_playback_position(1000)
+    assert window.player._speed == pytest.approx(1.0)    # curve at the video position
+
+
 def test_aspect_lock_enforced_on_spinbox_entry(window):
     """A locked aspect ratio must constrain typed crop dims, not just drags."""
     window._video_w, window._video_h = 1920, 1080

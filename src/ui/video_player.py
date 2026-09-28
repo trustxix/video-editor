@@ -40,6 +40,12 @@ class PitchedAudioPlayer:
     # does between marks stays a good fit even across the steepest speed ramp,
     # and 128 marks still span 2.7 s of output against the sink queue.
     _MARK_FRAMES = 1024
+    # Output frames that must play after play() before drift is measured. A
+    # seek restarts the audio at the target at once, but the video decoder has
+    # to run forward from the previous keyframe (2 s GOPs on 120 fps OBS clips)
+    # and QMediaPlayer.position() lags for up to ~200 ms while it does. That
+    # transient is not drift; correcting it jumped the audio after a click.
+    _START_SETTLE_FRAMES = _BASE_RATE // 2
 
     def __init__(self):
         self._pcm: array.array | None = None  # array('h'), interleaved stereo
@@ -56,6 +62,9 @@ class PitchedAudioPlayer:
         # ahead of it by whatever is still queued in the sink.
         self._written = 0
         self._marks: deque[tuple[int, float]] = deque(maxlen=128)
+        # Played-frame count from which the heard position reflects the last
+        # play()/shift_cursor() — see correction_settled().
+        self._settle_at = 0
         self._gen = 0
         self._automation = None  # set to AutomationLane for per-sample speed lookup
         self._extract_proc: subprocess.Popen | None = None  # current ffmpeg PCM extraction
@@ -140,6 +149,23 @@ class PitchedAudioPlayer:
         displayed frame — it corrects the error without discarding the lead.
         """
         self._pos = max(0.0, self._pos + delta_ms * self._BASE_RATE / 1000.0)
+        # Everything already queued still carries the old error; the first
+        # corrected frame is the next one written.
+        self._settle_at = max(self._settle_at, self._written)
+
+    def correction_settled(self) -> bool:
+        """Whether the audio being heard reflects the last play()/shift_cursor().
+
+        A correction goes in at the WRITE cursor, so it stays inaudible — and
+        invisible to playback_position_ms — until the whole sink backlog ahead
+        of it has played (250 ms on Windows). Position ticks arrive every
+        ~50 ms, so without this gate each one re-measured the same error and
+        applied it again: a 4-5x overshoot, then an oscillation that grew from
+        160 ms to many seconds and never recovered until playback restarted.
+        """
+        if self._sink is None:
+            return False
+        return self._written - self.queued_frames() >= self._settle_at
 
     def queued_frames(self) -> int:
         """Output frames handed to the sink but not yet played."""
@@ -209,6 +235,7 @@ class PitchedAudioPlayer:
         self._pos = float(position_ms * self._BASE_RATE / 1000)
         self._written = 0
         self._marks.clear()
+        self._settle_at = self._START_SETTLE_FRAMES
         self._feed()  # prime buffer immediately
         self._timer.start(15)
 
@@ -597,6 +624,11 @@ class VideoPlayer(QWidget):
         self._pitched = PitchedAudioPlayer()
         self._speed = 1.0
         self._pitched_active = False
+        # Restarts pitched audio once a scrub stops moving — see scrub().
+        self._scrub_settle = QTimer(self)
+        self._scrub_settle.setSingleShot(True)
+        self._scrub_settle.setInterval(250)
+        self._scrub_settle.timeout.connect(self._resume_pitched_after_scrub)
 
     def set_automation(self, automation_lane):
         """Give the pitched audio player a reference to the automation lane for per-sample speed."""
@@ -722,14 +754,28 @@ class VideoPlayer(QWidget):
         ~1.3x this fired on essentially every position tick and yanked the read
         cursor backwards each time, chopping playback into restarting fragments
         (the "stutter above 1.35x" bug). Correcting by the measured error keeps
-        the lead intact."""
+        the lead intact.
+
+        At most one correction is in flight: until the audio written after it
+        is the audio being heard, the measured error still includes what was
+        already corrected (see PitchedAudioPlayer.correction_settled)."""
         if not (self._pitched_active and self._pitched.ready):
             return
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             return
+        if not self._pitched.correction_settled():
+            return
         error_ms = video_ms - self._pitched.playback_position_ms()
         if abs(error_ms) > threshold_ms:
             self._pitched.shift_cursor(error_ms)
+
+    def heard_audio_ms(self) -> float | None:
+        """Source position of the pitched audio being heard, or None when it
+        isn't a trustworthy clock (not running, just restarted, or a drift
+        correction still queued)."""
+        if not (self._pitched_active and self._pitched.correction_settled()):
+            return None
+        return self._pitched.playback_position_ms()
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -793,15 +839,39 @@ class VideoPlayer(QWidget):
 
     def scrub(self, ms: int):
         """Video-only seek for live scrubbing — moves the displayed frame
-        WITHOUT tearing down and recreating the pitched QAudioSink (which would
-        stutter the audio on every drag pixel). Audio is resynced once when the
-        scrub settles, via seek()."""
+        without restarting the pitched QAudioSink on every drag pixel (which
+        would stutter the audio). Audio is restarted once when the scrub
+        settles, via seek().
+
+        While playing, pitched audio is silenced for the scrub. Left running,
+        it keeps playing the old position while the video jumps, and the drift
+        correction chases every jump with an audible cursor shift. It restarts
+        at the settled position via seek() on mouse release, or from
+        _scrub_settle once the playhead stops moving — a keyboard nudge has no
+        release, and a lost release must not leave playback silent.
+
+        The audio stops BEFORE setPosition: that emits positionChanged
+        synchronously, and the drift check must not see the new video position
+        against the old audio."""
+        if (self._pitched_active
+                and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+            self._pitched.stop()
+            self._scrub_settle.start()
         self.player.setPosition(ms)
 
-    def seek(self, ms: int):
-        self.player.setPosition(ms)
+    def _resume_pitched_after_scrub(self):
         if (self._pitched_active and self._pitched.ready
                 and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+            self._pitched.play(self.player.position())
+
+    def seek(self, ms: int):
+        self._scrub_settle.stop()
+        restart = (self._pitched_active and self._pitched.ready
+                   and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
+        if restart:
+            self._pitched.stop()  # before setPosition — see scrub()
+        self.player.setPosition(ms)
+        if restart:
             self._pitched.play(ms)
 
     def get_duration_ms(self) -> int:
