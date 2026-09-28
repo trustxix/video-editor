@@ -28,7 +28,23 @@ powershell -ExecutionPolicy Bypass -File tools\fetch_ffmpeg.ps1 -Update
 
 That downloads BtbN's newest win64-gpl build, checks it against the SHA256
 digest GitHub publishes for the asset, checks the `rubberband` filter, and
-rewrites the lock. Test the app with it before committing the lock.
+rewrites the lock (including the FFmpeg and BtbN commits). Test the app with
+it before committing the lock.
+
+The bundled FFmpeg is GPL v3-or-later, so every release must also carry its
+complete corresponding source (GPLv3 section 6(d): source offered in the same
+place as the binaries). Build it once per pinned FFmpeg, in Git Bash:
+
+```bash
+tools/make_ffmpeg_source.sh          # -> dist/ffmpeg-<version>-source.tar (+ .sha256)
+```
+
+It needs `git`, `tar`, `xz`, `python`, `cargo` and `svn` on PATH (LAME and
+Xvid are in Subversion; the Apache Subversion command-line zip from
+visualsvn.com works without installing), takes a long time, and fetches
+roughly 100 repositories. It replays BtbN's own per-library download commands
+at the pinned BtbN commit, so the archive matches what that build compiled.
+`release.ps1` refuses to run without it, and `release.bat` uploads it.
 
 The test suite needs FFmpeg on PATH or bundled in `dist` (E2E export tests
 generate fixture videos via `ffmpeg lavfi`).

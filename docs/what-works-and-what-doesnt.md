@@ -53,6 +53,13 @@ commit messages named here.
 - **Reading GitHub Actions job logs weeks later** to recover what BtbN built: they
   return HTTP 410. The run's `head_sha` and FFmpeg's `git describe` version are
   what's left.
+- **A relative output path in a script that `cd`s into a temp dir with an EXIT
+  trap.** The first `make_ffmpeg_source.sh` run (~50 min) wrote its 795 MB tar
+  into the temp dir, and the trap deleted it. Resolve output paths to absolute
+  before any `cd`.
+- **Expecting svn.xvid.org to be quick.** It serves a few files a minute, and a
+  failed checkout restarts from zero; budget about an hour for the source
+  archive.
 
 ### Tests and harnesses
 

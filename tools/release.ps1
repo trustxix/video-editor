@@ -8,6 +8,8 @@
 # Outputs, in dist\:
 #   Video-Editor-v<ver>-win64.zip          (+ .sha256)
 #   installer\VideoEditor-Setup-<ver>.exe  (+ .sha256)
+# Requires dist\ffmpeg-<ffmpeg version>-source.tar (+ .sha256) from
+# tools/make_ffmpeg_source.sh; every release must carry it.
 # Earlier versions' zips and installers in dist\ are left alone.
 #
 # Usage:
@@ -49,6 +51,14 @@ try {
         throw "v$Version is already tagged. Bump VERSION in src\core\version.py first."
     }
     $bundle  = Join-Path $projectRoot "dist\Video Editor"
+    # GPLv3 6(d): the FFmpeg source must be offered in the same place as the
+    # binaries, so every release carries it. Checked first: it takes a while
+    # to build.
+    $ffLock   = Get-Content -Raw "tools\ffmpeg.lock.json" | ConvertFrom-Json
+    $ffSource = Join-Path $projectRoot "dist\ffmpeg-$($ffLock.version)-source.tar"
+    if (-not (Test-Path $ffSource) -or -not (Test-Path "$ffSource.sha256")) {
+        throw "Missing $ffSource (+ .sha256). Build it in Git Bash: tools/make_ffmpeg_source.sh"
+    }
     Write-Host "=== Releasing v$Version ===" -ForegroundColor Cyan
 
     Write-Host ""
@@ -119,6 +129,7 @@ try {
         Write-Host ("  {0} ({1} MB)" -f $artifact[0], $sizeMB)
         Write-Host ("    SHA256 {0}" -f $artifact[1])
     }
+    Write-Host ("  {0} (FFmpeg corresponding source)" -f $ffSource)
 } finally {
     Pop-Location
 }

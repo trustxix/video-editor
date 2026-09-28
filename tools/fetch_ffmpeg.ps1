@@ -131,13 +131,16 @@ function Write-BundleInfo([string]$dir, $lock) {
 FFmpeg bundle info
 ==================
 Version:        $($lock.version)
+License:        GPL version 3 or later (licenses\LICENSE.txt)
+FFmpeg commit:  $($lock.ffmpeg_commit)
+BtbN commit:    $($lock.btbn_commit) (target win64, variant gpl)
 Source release: $($lock.source_release)
 Asset filename: $($lock.asset_name)
 Asset SHA256:   $($lock.asset_sha256)
-Pinned in:      tools\ffmpeg.lock.json
 
-Per the GPL, see FFMPEG_SOURCE_OFFER.md next to the app for how to get the
-corresponding source. Build scripts: https://github.com/BtbN/FFmpeg-Builds
+Complete corresponding source: ffmpeg-$($lock.version)-source.tar on the
+GitHub release page (https://github.com/trustxix/video-editor/releases).
+See FFMPEG_SOURCE_OFFER.md next to the app.
 "@ | Set-Content -Path (Join-Path $dir "BUNDLE_INFO.txt") -Encoding UTF8
 }
 
@@ -161,16 +164,27 @@ if ($Update) {
     $stage = Join-Path $cacheRoot "_staging"
     Expand-Release $asset.browser_download_url $zipSha $stage
     $verLine = Test-Runs $stage
-    if (-not ($verLine -match '^ffmpeg version (\S+)')) { Fail "could not parse the version from '$verLine'." }
+    if (-not ($verLine -match '^ffmpeg version (N-\d+-g([0-9a-f]+)\S*)')) { Fail "could not parse the version from '$verLine'." }
+    $ffVersion = $Matches[1]
+    $ffShort   = $Matches[2]
+    # Full commits for tools\make_ffmpeg_source.sh (the GPL corresponding source).
+    try {
+        $ffCommit   = (Invoke-RestMethod -Uri "https://api.github.com/repos/FFmpeg/FFmpeg/commits/$ffShort" -Headers $headers).sha
+        $btbnCommit = (Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/commits/$($rel.tag_name)" -Headers $headers).sha
+    } catch {
+        Fail "could not resolve the FFmpeg / BtbN commits: $_"
+    }
 
     $lock = [ordered]@{
-        version        = $Matches[1]
+        version        = $ffVersion
         source_release = $rel.tag_name
         asset_name     = $asset.name
         asset_url      = $asset.browser_download_url
         asset_sha256   = $zipSha
         ffmpeg_sha256  = Get-Sha256 (Join-Path $stage "ffmpeg.exe")
         ffprobe_sha256 = Get-Sha256 (Join-Path $stage "ffprobe.exe")
+        ffmpeg_commit  = $ffCommit
+        btbn_commit    = $btbnCommit
     }
     Write-BundleInfo $stage ([pscustomobject]$lock)
     $cacheDir = Join-Path $cacheRoot $lock.version
@@ -210,5 +224,7 @@ if (Test-MatchesLock $distFfmpegDir $lock) {
           "or re-pin with: powershell -File tools\fetch_ffmpeg.ps1 -Update")
 }
 
+# Always from the lock, so an older cached copy can't ship stale source info.
+Write-BundleInfo $distFfmpegDir $lock
 $verLine = Test-Runs $distFfmpegDir
 Write-Host "[fetch_ffmpeg] OK: $verLine"

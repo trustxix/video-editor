@@ -52,7 +52,9 @@ if errorlevel 1 (
 
 set INSTALLER=dist\installer\VideoEditor-Setup-!VER!.exe
 set ZIP=dist\Video-Editor-v!VER!-win64.zip
-for %%f in ("!INSTALLER!" "!INSTALLER!.sha256" "!ZIP!" "!ZIP!.sha256") do (
+for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Get-Content -Raw 'tools\ffmpeg.lock.json' | ConvertFrom-Json).version"`) do set FFVER=%%v
+set FFSRC=dist\ffmpeg-!FFVER!-source.tar
+for %%f in ("!INSTALLER!" "!INSTALLER!.sha256" "!ZIP!" "!ZIP!.sha256" "!FFSRC!" "!FFSRC!.sha256") do (
     if not exist %%f (
         echo.
         echo ERROR: expected artifact not found: %%~f
@@ -85,13 +87,13 @@ goto :done
 
 :do_release
 echo.
-echo [3/3] Tagging v!VER! and uploading the zip, installer and checksums...
+echo [3/3] Tagging v!VER! and uploading the zip, installer, FFmpeg source and checksums...
 git tag v!VER! 2>nul
 git push origin v!VER!
 if errorlevel 1 (
     echo   git push tag failed; continuing anyway.
 )
-gh release create v!VER! "!ZIP!" "!ZIP!.sha256" "!INSTALLER!" "!INSTALLER!.sha256" --title "v!VER!" --generate-notes
+gh release create v!VER! "!ZIP!" "!ZIP!.sha256" "!INSTALLER!" "!INSTALLER!.sha256" "!FFSRC!" "!FFSRC!.sha256" --title "v!VER!" --generate-notes
 if errorlevel 1 (
     echo.
     echo ERROR: gh release create failed. See output above.
