@@ -48,6 +48,23 @@ def _ensure_offscreen_qt():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolated_config_dir(tmp_path_factory):
+    """Give the whole run its own app base dir, so the config dir (settings.json,
+    editor.log, export_error.log, crashes/) is a temp folder: tests neither read
+    the developer's settings nor overwrite them. In source mode get_base_dir()
+    only locates config and a bundled ffmpeg, and the repo root has no ffmpeg,
+    so FFmpeg still comes from PATH. Per-test monkeypatches still override this."""
+    from src.core import paths
+    base = tmp_path_factory.mktemp("app-base")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(paths, "get_base_dir", lambda: base)
+        # Collection may already have resolved the real repo config dir.
+        paths._resolve_config_dir.cache_clear()
+        yield base / "config"
+    paths._resolve_config_dir.cache_clear()
+
+
 @pytest.fixture(scope="session")
 def fixture_video() -> Path:
     """Generate a tiny 5-second 320x240 test video with H.264 + AAC.
