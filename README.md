@@ -32,12 +32,15 @@ adjustment, audio normalization, and batch export — backed by FFmpeg.
 1. Download `VideoEditor-Setup-X.Y.Z.exe` from the project's Releases page.
 2. Double-click the installer.
 3. (First time only) Windows SmartScreen may show "Windows protected your PC"
-   because the build isn't yet code-signed. Click **More info → Run anyway**.
-   (Code signing is on the roadmap — see `docs/BUILD.md`.)
-4. Choose your install dir (default: `%LOCALAPPDATA%\Programs\Video Editor`).
-   No admin rights required.
-5. Optional: tick "Associate .mp4 / .mov / .mkv / .webm files" to use Video
-   Editor as the default opener for those formats.
+   because the build isn't code-signed. Click **More info → Run anyway**.
+4. Choose **Install for me only** (default, no admin rights, installs to
+   `%LOCALAPPDATA%\Programs\Video Editor`) or **Install for all users**
+   (admin, installs to Program Files; each user's settings then live in
+   `%LOCALAPPDATA%\Video Editor\config`).
+
+The portable zip (`Video-Editor-vX.Y.Z-win64.zip`) needs no installer: extract
+it anywhere you can write to and run `Video Editor.exe`. Each download has a
+`.sha256` file next to it for checking the file.
 
 The installer bundles its own FFmpeg — nothing else to install.
 

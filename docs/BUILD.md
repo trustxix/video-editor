@@ -44,11 +44,20 @@ cd video-editor
 # Pinned dependencies (exact versions for reproducibility)
 pip install -r requirements.txt
 
-# Single-command release: tests → PyInstaller → FFmpeg bundle → sign hook → installer
-.\tools\release.ps1 -Version 0.1.0
+# Single-command release: tests → PyInstaller → pinned FFmpeg → sign hook
+#   → portable zip → installer → SHA256 files
+.\tools\release.ps1
 ```
 
-Output: `dist\installer\VideoEditor-Setup-0.1.0.exe` (~140 MB compressed)
+The version comes from `VERSION` in `src/core/version.py`; bump it there and
+nowhere else. Outputs, with a `.sha256` next to each:
+- `dist\Video-Editor-v<version>-win64.zip` (portable, ~190 MB)
+- `dist\installer\VideoEditor-Setup-<version>.exe` (~140 MB)
+
+`release.ps1` refuses to package if `dist\Video Editor\config` contains
+anything (a launched bundle holds that user's settings and logs), and
+`installer.iss` excludes `config\*` as well. `tools\release.bat` runs the
+same pipeline and can then tag and upload all four files to a GitHub release.
 
 The build is gated by `pytest` — any test failure aborts the release. If
 you need to skip the test gate (not recommended for releases), run the
@@ -56,7 +65,7 @@ build steps individually:
 
 ```powershell
 .\tools\build.bat
-& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" "/DMyAppVersion=0.1.0" tools\installer.iss
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" "/DMyAppVersion=<version>" tools\installer.iss
 ```
 
 ---
@@ -71,7 +80,7 @@ the release:
 $env:SIGNCERT_PATH      = "C:\path\to\cert.pfx"
 $env:SIGNCERT_PASSWORD  = "<your password>"
 $env:SIGNCERT_TIMESTAMP = "http://timestamp.digicert.com"  # optional
-.\tools\release.ps1 -Version 0.1.0
+.\tools\release.ps1
 ```
 
 `tools\sign.ps1` locates `signtool.exe` automatically from the latest
