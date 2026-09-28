@@ -1,7 +1,11 @@
+import functools
 import hashlib
 import os
 import sys
+import tempfile
 from pathlib import Path
+
+APP_DIR_NAME = "Video Editor"
 
 
 def get_base_dir() -> Path:
@@ -11,9 +15,43 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+def _is_writable_dir(d: Path) -> bool:
+    """Create `d` if needed and prove a file can be written in it.
+
+    A real write is the only reliable test on Windows: `os.access` ignores
+    NTFS ACLs, so it reports Program Files as writable for standard users."""
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        fd, probe = tempfile.mkstemp(prefix=".write-probe-", dir=d)
+        os.close(fd)
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _user_config_dir() -> Path:
+    local = os.environ.get("LOCALAPPDATA")
+    root = Path(local) if local else Path.home() / "AppData" / "Local"
+    return root / APP_DIR_NAME / "config"
+
+
+@functools.cache
+def _resolve_config_dir() -> Path:
+    portable = get_base_dir() / "config"
+    if _is_writable_dir(portable):
+        return portable
+    return _user_config_dir()
+
+
 def get_config_dir() -> Path:
-    d = get_base_dir() / "config"
-    d.mkdir(exist_ok=True)
+    """`<install>/config` when the install dir is writable (source checkouts,
+    per-user installs, portable zips), else `%LOCALAPPDATA%/Video Editor/config`.
+
+    An all-users install under Program Files is read-only for standard users,
+    and writing there used to crash startup in `log_setup.init`."""
+    d = _resolve_config_dir()
+    d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -41,7 +79,7 @@ def get_ffprobe() -> str:
 
 
 def installation_id() -> str:
-    """Stable per-install id, persisted in `<install>/config/.installation_id`.
+    """Stable per-install id, persisted in `<config dir>/.installation_id`.
 
     Used for crash-dump correlation (so we can tell two crashes from the
     same install apart from two unrelated installs). NOT used for the

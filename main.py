@@ -61,6 +61,7 @@ def main():
     from src.core import log_setup, crash_reporter, version
     log_setup.init(get_config_dir())
     log_setup.log().info(f"Application starting v{version.VERSION}")
+    log_setup.log().info(f"Config dir: {get_config_dir()}")
 
     # Capture uncaught exceptions to local sanitized JSON dumps. Without this
     # users can crash without us ever knowing. With opt-in SENTRY_DSN env var

@@ -64,14 +64,17 @@ Nothing is transmitted automatically — you choose what to send and where.
 
 ## Files written to disk
 
-All data this app stores is on your local computer:
-- `<install dir>/config/settings.json` — your preferences
-- `<install dir>/config/editor.log` (and `.1`, `.2`, `.3` rotations) —
+All data this app stores is on your local computer, in one config folder:
+`<install dir>/config` when the install folder is writable, otherwise
+`%LOCALAPPDATA%/Video Editor/config` (for example, an all-users install under
+Program Files). The app logs which one it uses at startup.
+- `<config>/settings.json` — your preferences
+- `<config>/editor.log` (and `.1`, `.2`, `.3` rotations) —
   rotating log file, max ~8 MB total. Paths in the log are sanitized to
   remove your username.
-- `<install dir>/config/.installation_id` — random per-install identifier
+- `<config>/.installation_id` — random per-install identifier
   used only to salt the single-instance mutex name (no PII)
-- `<install dir>/config/crashes/*.json` — local crash dumps written when
+- `<config>/crashes/*.json` — local crash dumps written when
   uncaught exceptions occur. These are NOT transmitted unless you enable
   the optional Crash Reports feature above. You can delete this folder
   any time.

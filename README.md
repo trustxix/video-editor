@@ -96,7 +96,9 @@ to software h264 in Settings → Output for tiny exports.
 **App won't launch — "another instance is already running".** Check Task
 Manager for an orphaned `Video Editor.exe` and kill it. If the orphan keeps
 appearing, the per-installation mutex id is stuck — delete
-`<install dir>\config\.installation_id` and re-launch.
+`.installation_id` from the config folder (`<install dir>\config`, or
+`%LOCALAPPDATA%\Video Editor\config` if the install folder is read-only) and
+re-launch.
 
 **A clip won't play but plays in VLC.** The Qt media stack on Windows uses
 Media Foundation, which has narrower codec coverage than VLC. Convert with

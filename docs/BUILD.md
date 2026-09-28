@@ -174,7 +174,8 @@ Free for private repos within GitHub's monthly minute allowance.
   works, no scopes needed).
 - **PyInstaller misses a hidden import** → add `--hidden-import <name>` to
   `tools/build.bat`. Verify by running the installed exe and watching for
-  ImportError in `<install dir>/config/editor.log`.
+  ImportError in `editor.log` (in `<install dir>/config`, or
+  `%LOCALAPPDATA%/Video Editor/config` when the install dir is read-only).
 - **`ISCC.exe` not found on PATH** → Inno Setup ships it under
   `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`. `release.ps1` checks
   that path automatically — if it's elsewhere, edit the candidate list in
