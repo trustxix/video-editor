@@ -118,3 +118,73 @@ def test_maybe_send_sentry_no_dsn_is_silent(isolated_crash_dir, monkeypatch):
     monkeypatch.delenv("SENTRY_DSN", raising=False)
     # Must not raise
     crash_reporter._maybe_send_sentry(ValueError, ValueError("x"), None)
+
+
+class _FakeSentry:
+    """Stands in for the sentry_sdk module; records what would be sent."""
+
+    def __init__(self):
+        self.captured = []
+        self.client = None
+        self.Hub = type("Hub", (), {"current": self})
+
+    def init(self, **kwargs):
+        self.client = kwargs
+
+    def capture_exception(self, exc_info):
+        self.captured.append(exc_info)
+
+
+@pytest.fixture
+def fake_sentry(isolated_crash_dir, monkeypatch):
+    from src.core import crash_reporter
+    fake = _FakeSentry()
+    monkeypatch.setitem(sys.modules, "sentry_sdk", fake)
+    monkeypatch.setenv("SENTRY_DSN", "https://key@example.invalid/1")
+    monkeypatch.setattr(crash_reporter, "_remote_consent", False)
+    return fake
+
+
+def test_sentry_sends_nothing_without_consent(fake_sentry):
+    """A DSN and an importable sentry-sdk are not consent."""
+    from src.core import crash_reporter
+    crash_reporter._maybe_send_sentry(ValueError, ValueError("x"), None)
+    assert fake_sentry.captured == []
+    assert fake_sentry.client is None
+
+
+def test_sentry_sends_after_opt_in(fake_sentry):
+    from src.core import crash_reporter
+    crash_reporter.set_remote_reporting(True)
+    crash_reporter._maybe_send_sentry(ValueError, ValueError("x"), None)
+    assert len(fake_sentry.captured) == 1
+    assert fake_sentry.client["send_default_pii"] is False
+
+
+def test_sentry_opt_out_stops_sending(fake_sentry):
+    from src.core import crash_reporter
+    crash_reporter.set_remote_reporting(True)
+    crash_reporter.set_remote_reporting(False)
+    crash_reporter._maybe_send_sentry(ValueError, ValueError("x"), None)
+    assert fake_sentry.captured == []
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes", None])
+def test_only_a_real_true_counts_as_consent(fake_sentry, value):
+    """settings.json is user-editable; anything but JSON true is not an opt-in."""
+    from src.core import crash_reporter
+    crash_reporter.set_remote_reporting(value)
+    crash_reporter._maybe_send_sentry(ValueError, ValueError("x"), None)
+    assert fake_sentry.captured == []
+
+
+def test_uncaught_crash_without_consent_is_only_written_locally(fake_sentry, monkeypatch):
+    from src.core import crash_reporter
+    monkeypatch.setattr(sys, "excepthook", lambda *a: None)
+    crash_reporter.install_global_handler()
+    try:
+        raise RuntimeError("boom")
+    except RuntimeError as e:
+        sys.excepthook(type(e), e, e.__traceback__)
+    assert len(crash_reporter.list_pending_crashes()) == 1
+    assert fake_sentry.captured == []

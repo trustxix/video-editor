@@ -208,3 +208,22 @@ def test_aspect_lock_enforced_on_spinbox_entry(window):
     assert window.spn_h.value() == 450   # 800 * 9/16
     window.spn_h.setValue(360)
     assert window.spn_w.value() == 640   # 360 * 16/9
+
+
+def test_crash_report_consent_follows_the_saved_setting(qapp, monkeypatch):
+    import src.core.version as version
+    from src.core import crash_reporter
+    from src.ui.main_window import MainWindow
+    monkeypatch.setattr(version, "check_for_update_async", lambda cb: None)
+    monkeypatch.setattr(crash_reporter, "_remote_consent", False)
+    real_load = MainWindow._load_settings
+    monkeypatch.setattr(MainWindow, "_load_settings",
+                        lambda self: {**real_load(self), "crash_reports": True})
+    # The patched True must never reach the repo's config/settings.json.
+    monkeypatch.setattr(MainWindow, "_save_settings", lambda self: None)
+    w = MainWindow()
+    try:
+        assert crash_reporter._remote_consent is True
+    finally:
+        w.close()
+        w._shutdown_watchdog.cancel()

@@ -71,19 +71,23 @@ takes weeks/months of downloads to build reputation.
 
 ## Crash reporting integration (when you have a Sentry account)
 
-```powershell
-pip install sentry-sdk
-$env:SENTRY_DSN = "https://<key>@sentry.io/<project>"
-.\tools\release.ps1 -Version 0.1.0
-```
+Official builds don't include `sentry-sdk`, so they never send anything.
+A build sends crash reports only when ALL of these hold at crash time:
 
-The `crash_reporter` module activates the Sentry passthrough automatically
-when `SENTRY_DSN` is set in the runtime environment. Crashes are scrubbed
-through `log_setup.sanitize_path` before transmission so the user's Windows
-username and home directory don't end up in upstream events.
+1. `sentry-sdk` was installed when the exe was built (PyInstaller bundles
+   it because `crash_reporter` imports it);
+2. `SENTRY_DSN` is set in the environment the app **runs** in (it is read
+   at runtime, not baked in at build time);
+3. the user's `crash_reports` setting is JSON `true` (default `false`,
+   applied by `MainWindow` via `crash_reporter.set_remote_reporting`).
+   A crash before the settings load is never sent.
 
-Crash reports must remain opt-in per `PRIVACY.md` — the in-app setting
-`crash_reports` defaults to False. Don't ship a build that hard-codes opt-in.
+Crashes are scrubbed through `log_setup.sanitize_path` before transmission
+so the user's Windows username and home directory don't end up in upstream
+events.
+
+Crash reports must remain opt-in per `PRIVACY.md`. Don't ship a build that
+hard-codes opt-in.
 
 ---
 

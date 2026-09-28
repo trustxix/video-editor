@@ -1,13 +1,13 @@
 """Local crash reporting + optional Sentry pipe.
 
 Default: when an uncaught exception bubbles to sys.excepthook, write a
-sanitized JSON dump to <config>/crashes/. The user is prompted on the next
-launch to attach pending dumps to a bug report.
+sanitized JSON dump to <config>/crashes/ (capped at `_MAX_CRASH_DUMPS`).
 
-Optional Sentry: if `SENTRY_DSN` env var is set AND `sentry-sdk` is
-installable, exceptions are also sent to Sentry. Without either condition
-this module is a local-only writer — no network traffic, no third-party
-dependency required.
+Optional Sentry: exceptions are also sent to Sentry only if the user opted
+in (the `crash_reports` setting, pushed in via `set_remote_reporting`) AND
+the `SENTRY_DSN` env var is set AND `sentry-sdk` is importable. Official
+builds don't bundle sentry-sdk, so they are local-only writers — no network
+traffic, no third-party dependency required.
 
 All transmitted/stored content is run through `sanitize_path` so the
 user's Windows username and home directory don't end up in remote dumps
@@ -104,9 +104,21 @@ def install_global_handler() -> None:
     _installed = True
 
 
+# Off until the user's saved choice says otherwise, so a crash before the
+# settings are loaded is never transmitted.
+_remote_consent = False
+
+
+def set_remote_reporting(enabled: bool) -> None:
+    """Apply the user's `crash_reports` setting. Local dumps are unaffected."""
+    global _remote_consent
+    _remote_consent = enabled is True
+
+
 def _maybe_send_sentry(exc_type, exc_value, exc_tb) -> None:
-    """If SENTRY_DSN env var is set AND sentry-sdk importable, capture exception."""
-    if not os.environ.get("SENTRY_DSN"):
+    """Capture the exception in Sentry if the user opted in, SENTRY_DSN is
+    set, and sentry-sdk is importable."""
+    if not _remote_consent or not os.environ.get("SENTRY_DSN"):
         return
     try:
         import sentry_sdk

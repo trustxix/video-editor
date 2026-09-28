@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt, QByteArray, QEvent, QEventLoop, QThread, QTimer, QU
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer
 
+from src.core import crash_reporter
 from src.core.paths import get_config_dir
 from src.core.video_item import VideoItem
 from src.core.archive import archive_original
@@ -211,6 +212,7 @@ class MainWindow(QMainWindow):
         self._batch_return_to: int = -1  # where to navigate when done
         self._settings_path = get_config_dir() / "settings.json"
         self._settings = self._load_settings()
+        crash_reporter.set_remote_reporting(self._settings.get("crash_reports", False))
         apply_theme(self._settings.get("theme", DEFAULT_THEME),
                     scale=self._settings.get("ui_scale", 90) / 100.0)
         # Stay-on-top is applied *after* the window has been shown — see
