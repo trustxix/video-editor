@@ -5,11 +5,11 @@
 # Usage:
 #   .\tools\release.ps1                    # default version 0.1.0
 #   .\tools\release.ps1 -Version 0.2.0
-#   .\tools\release.ps1 -SkipFfmpegRefresh  # reuse already-bundled ffmpeg
+#
+# FFmpeg is the build pinned in tools\ffmpeg.lock.json (see fetch_ffmpeg.ps1).
 
 param(
-    [string]$Version = "0.1.0",
-    [switch]$SkipFfmpegRefresh
+    [string]$Version = "0.1.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,9 +33,6 @@ try {
 
     Write-Host ""
     Write-Host "=== Building Video Editor (PyInstaller) ===" -ForegroundColor Cyan
-    if ($SkipFfmpegRefresh) {
-        $env:FORCE_FFMPEG_REFRESH = $null
-    }
     & cmd /c "tools\build.bat"
     if ($LASTEXITCODE -ne 0) { throw "build.bat failed (exit $LASTEXITCODE)" }
 

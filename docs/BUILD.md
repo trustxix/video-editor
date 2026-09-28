@@ -12,9 +12,25 @@
   (provides `signtool.exe`)
 - (Optional, for crash-report integration) a Sentry account
 
-The build downloads FFmpeg automatically from the BtbN/FFmpeg-Builds GitHub
-release, so you do not need FFmpeg pre-installed on your dev machine —
-though having it on PATH is required for the test suite (E2E export tests
+The build bundles one pinned FFmpeg build, recorded in
+`tools/ffmpeg.lock.json` (version + SHA256 of `ffmpeg.exe`/`ffprobe.exe`).
+`tools/fetch_ffmpeg.ps1` takes it from `dist` if it already matches, else
+from `.ffmpeg-cache\<version>\` (gitignored), else from the lock's
+`asset_url`. Every source is hash-checked, so a build can never silently
+ship a different FFmpeg. BtbN deletes daily builds after about two weeks,
+so keep `.ffmpeg-cache` (copy it to a new dev machine).
+
+To move to a newer FFmpeg on purpose:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\fetch_ffmpeg.ps1 -Update
+```
+
+That downloads BtbN's newest win64-gpl build, checks it against the SHA256
+digest GitHub publishes for the asset, checks the `rubberband` filter, and
+rewrites the lock. Test the app with it before committing the lock.
+
+The test suite needs FFmpeg on PATH or bundled in `dist` (E2E export tests
 generate fixture videos via `ffmpeg lavfi`).
 
 ---
@@ -146,7 +162,8 @@ src/ui/
     themes.py                    # QSS + scale system
 tools/
     build.bat                    # PyInstaller + license copy + ffmpeg fetch + sign
-    fetch_ffmpeg.ps1             # Download BtbN FFmpeg release
+    fetch_ffmpeg.ps1             # Bundle the pinned FFmpeg (cache/verify)
+    ffmpeg.lock.json             # Pinned FFmpeg version + SHA256s
     sign.ps1                     # Authenticode sign hook (no-op without cert)
     installer.iss                # Inno Setup script
     release.ps1                  # Single-command full pipeline
@@ -173,9 +190,12 @@ Free for private repos within GitHub's monthly minute allowance.
 
 ## Troubleshooting
 
-- **`fetch_ffmpeg.ps1` fails with HTTP 403** → GitHub API rate limit (60/hr
-  unauthenticated). Set `$env:GITHUB_TOKEN` (any personal access token
-  works, no scopes needed).
+- **`fetch_ffmpeg.ps1`: "pinned FFmpeg ... is not in .ffmpeg-cache"** → copy
+  `.ffmpeg-cache\<version>\` from a machine that has it, or re-pin with
+  `-Update` (see above).
+- **`fetch_ffmpeg.ps1 -Update` fails with HTTP 403** → GitHub API rate limit
+  (60/hr unauthenticated). Set `$env:GITHUB_TOKEN` (any personal access
+  token works, no scopes needed).
 - **PyInstaller misses a hidden import** → add `--hidden-import <name>` to
   `tools/build.bat`. Verify by running the installed exe and watching for
   ImportError in `editor.log` (in `<install dir>/config`, or

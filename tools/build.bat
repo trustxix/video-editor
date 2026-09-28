@@ -36,7 +36,7 @@ copy /Y "NOTICES.md"                    "dist\Video Editor\NOTICES.md"         >
 copy /Y "PRIVACY.md"                    "dist\Video Editor\PRIVACY.md"         >nul
 copy /Y "docs\FFMPEG_SOURCE_OFFER.md"   "dist\Video Editor\FFMPEG_SOURCE_OFFER.md" >nul
 
-echo === Bundling FFmpeg (BtbN release) ===
+echo === Bundling the pinned FFmpeg (tools\ffmpeg.lock.json) ===
 powershell -ExecutionPolicy Bypass -NoProfile -File "tools\fetch_ffmpeg.ps1"
 if errorlevel 1 (
     echo [build] FFmpeg bundling failed

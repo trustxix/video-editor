@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 build/
 dist/
+# Verified FFmpeg bundles, keyed by the version in tools/ffmpeg.lock.json
+.ffmpeg-cache/
 *.spec
 config/
 .delegate/
