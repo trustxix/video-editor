@@ -33,6 +33,7 @@ from src.ui.thumbnail_worker import (
 )
 from src.ui.frame_converter import FrameConverter
 from src.core.ffmpeg_runner import probe_video, _probe_cache, extract_frame
+from src.core.log_setup import log
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'}
 
@@ -1792,16 +1793,17 @@ class PlayerMode(QWidget):
         self._save_position()
         self.player.stop()
         self.player.setSource(QUrl())
-        # Stop background extractor threads
+        # Stop background extractor threads. Shutdown must continue past a
+        # failure here, but not silently.
         try:
             self.seek_slider.set_thumbnail_worker(None)
             self._thumb_worker.stop()
         except Exception:
-            pass
+            log().warning("Stopping the thumbnail worker failed", exc_info=True)
         try:
             self._preloader.stop()
         except Exception:
-            pass
+            log().warning("Stopping the first-frame preloader failed", exc_info=True)
         if self._frame_step_worker is not None:
             self._frame_step_worker.stop_worker()
             self._frame_step_worker = None

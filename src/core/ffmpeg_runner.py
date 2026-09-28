@@ -1063,18 +1063,15 @@ def export_with_automation(
                 # capped writer used by run_export, so the user can see why
                 # audio is missing (and so admin/multi-user log inspection
                 # doesn't reveal usernames).
-                try:
-                    from src.core.log_setup import sanitize_path
-                    _write_export_error(
-                        ["(audio pre-render)", sanitize_path(input_path)],
-                        returncode=-1,
-                        stderr_tail=[
-                            "WARNING: Audio pre-render failed; export will "
-                            "continue with video only (no audio).\n"
-                        ],
-                    )
-                except Exception:
-                    pass
+                from src.core.log_setup import sanitize_path
+                _write_export_error(
+                    ["(audio pre-render)", sanitize_path(input_path)],
+                    returncode=-1,
+                    stderr_tail=[
+                        "WARNING: Audio pre-render failed; export will "
+                        "continue with video only (no audio).\n"
+                    ],
+                )
 
         # ── Step 2: Build single filter_complex for all segments ──
         #
@@ -1217,10 +1214,7 @@ def export_with_automation(
         return True
 
     finally:
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 _INVALID_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -1562,7 +1556,9 @@ def _write_export_error(cmd: list[str], returncode: int, stderr_tail: list[str])
             f.write(sanitize_path("".join(stderr_tail)))
             f.write("\n")
     except Exception:
-        pass
+        # Called from failure paths, so it must not raise; editor.log still
+        # records that the export failed.
+        log().warning("Could not write export_error.log", exc_info=True)
 
 
 def run_export(cmd: list[str], duration: float, progress_callback=None, process_callback=None) -> bool:

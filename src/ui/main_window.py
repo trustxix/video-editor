@@ -16,6 +16,7 @@ from PyQt6.QtGui import QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer
 
 from src.core import crash_reporter
+from src.core.log_setup import log
 from src.core.paths import get_config_dir
 from src.core.video_item import VideoItem
 from src.core.archive import archive_original
@@ -278,7 +279,8 @@ class MainWindow(QMainWindow):
                     if primary:
                         self.move(primary.availableGeometry().topLeft())
             except Exception:
-                pass
+                # A corrupt saved geometry just means the default placement.
+                log().warning("Could not restore the saved window geometry", exc_info=True)
 
         QApplication.instance().installEventFilter(self)
 
@@ -1248,7 +1250,8 @@ class MainWindow(QMainWindow):
             self._settings["player_last_dir"] = self.player_mode.get_current_directory()
             self._save_settings()
         except Exception:
-            pass
+            # Closing must go on; the window state is only a convenience.
+            log().warning("Could not save the window state on close", exc_info=True)
 
         # Dead-man's switch: if clean shutdown hangs for any reason (stuck
         # QThread, unresponsive subprocess, audio sink refusing to release),
@@ -1766,7 +1769,8 @@ class MainWindow(QMainWindow):
                 hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                 ctypes.byref(value), ctypes.sizeof(value))
         except Exception:
-            pass
+            # Cosmetic; older Windows builds lack the attribute.
+            log().debug("Dark title bar not applied", exc_info=True)
 
     # ── Undo / Redo ────────────────────────────────────────
 
@@ -2833,7 +2837,7 @@ class MainWindow(QMainWindow):
             try:
                 self.player.load(str(source))
             except Exception:
-                pass
+                log().warning("Could not reload the clip after a failed archive", exc_info=True)
             return f"\nArchive failed: {e}"
 
         new_path_str = str(new_path)

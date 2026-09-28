@@ -133,9 +133,9 @@ def _maybe_send_sentry(exc_type, exc_value, exc_tb) -> None:
                 before_send=_sentry_scrub,
             )
         sentry_sdk.capture_exception((exc_type, exc_value, exc_tb))
-    except Exception:
-        # NEVER raise from a crash handler.
-        pass
+    except Exception as e:
+        # NEVER raise from a crash handler. stderr is routed to the log.
+        sys.stderr.write(f"[crash_reporter] Sentry send failed: {e!r}\n")
 
 
 def _sentry_scrub(event, hint):

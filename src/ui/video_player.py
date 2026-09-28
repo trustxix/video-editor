@@ -9,6 +9,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFra
 from PyQt6.QtCore import Qt, QRect, QPointF, pyqtSignal, QUrl, QTimer
 from PyQt6.QtGui import QPainter, QImage
 
+from src.core.log_setup import log
 from src.core.paths import get_ffmpeg
 from src.core.speed_curve import SPEED_LOOKUP_BLOCK
 from src.ui.frame_converter import FrameConverter
@@ -83,8 +84,8 @@ class PitchedAudioPlayer:
                 try:
                     if self._extract_proc.poll() is None:
                         self._extract_proc.terminate()
-                except Exception:
-                    pass
+                except OSError:
+                    pass  # exited between poll() and terminate()
                 self._extract_proc = None
             self._pcm = None
             self._gen += 1
@@ -127,7 +128,9 @@ class PitchedAudioPlayer:
                 if gen == self._gen:
                     self._pcm = a
         except Exception:
-            pass
+            # Worker thread: raising would only kill the thread. Without PCM
+            # the pitched preview stays silent, so leave a trace of why.
+            log().warning("Audio extraction for pitched playback failed", exc_info=True)
 
     def set_speed(self, speed: float):
         """Update speed smoothly — no sink recreation needed."""
@@ -367,8 +370,8 @@ class PitchedAudioPlayer:
                         proc.wait(timeout=1)
                     except subprocess.TimeoutExpired:
                         proc.kill()
-            except Exception:
-                pass
+            except OSError:
+                pass  # already exited
 
     @property
     def ready(self) -> bool:

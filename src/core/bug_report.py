@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from src.core import paths
-from src.core.log_setup import sanitize_path
+from src.core.log_setup import log, sanitize_path
 from src.core.version import VERSION
 
 ISSUE_URL_TEMPLATE = (
@@ -151,7 +151,7 @@ def open_bug_report(
     try:
         url_opener(ISSUE_URL_TEMPLATE)
     except Exception:
-        pass
+        log().warning("Could not open the GitHub issue page", exc_info=True)
 
     return {
         "report":         report,
