@@ -269,7 +269,24 @@ class SettingsDialog(QDialog):
         if current_theme in THEMES:
             self.cmb_theme.setCurrentText(current_theme)
         apg.addWidget(self.cmb_theme, stretch=1)
-        layout.addWidget(appearance_group)
+
+        # ── Privacy ──────────────────────────────────────────
+        # Shares a row with Appearance: General is the tallest tab, so a new
+        # row would grow the (unscrolled) dialog past a 1080p screen at 120%.
+        privacy_group = QGroupBox("Privacy")
+        pg = QHBoxLayout(privacy_group)
+        self.chk_updates = QCheckBox("Check for updates")
+        self.chk_updates.setChecked(self.settings.get("check_for_updates", True))
+        self.chk_updates.setToolTip(
+            "Asks GitHub for the latest release when the app starts. "
+            "Help → Check for Updates works either way."
+        )
+        pg.addWidget(self.chk_updates)
+
+        appearance_row = QHBoxLayout()
+        appearance_row.addWidget(appearance_group, stretch=1)
+        appearance_row.addWidget(privacy_group)
+        layout.addLayout(appearance_row)
 
         # ── UI Scale ─────────────────────────────────────────
         scale_group = QGroupBox("UI Scale")
@@ -579,6 +596,7 @@ class SettingsDialog(QDialog):
             "normalize_audio": self.chk_normalize.isChecked(),
             "normalize_lufs": self.spn_norm_lufs.value(),
             "ui_scale": self.sld_scale.value(),
+            "check_for_updates": self.chk_updates.isChecked(),
             "editor_keybinds": self.editor_keybind_editor.get_bindings(),
             "player_keybinds": self.player_keybind_editor.get_bindings(),
             "auto_preset_name": quality_name if auto_preset else "",

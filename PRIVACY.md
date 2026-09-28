@@ -35,7 +35,9 @@ This request includes only:
 It does NOT include any filenames, project paths, settings, video data,
 or other identifying information.
 
-You can disable this in **Settings → General → Check for updates**.
+You can turn off the startup check in **Settings → General → Privacy →
+Check for updates**. **Help → Check for Updates** still works when you
+choose it.
 
 ### Crash reports (default: OFF)
 

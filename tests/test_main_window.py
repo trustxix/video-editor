@@ -227,3 +227,16 @@ def test_crash_report_consent_follows_the_saved_setting(qapp, monkeypatch):
     finally:
         w.close()
         w._shutdown_watchdog.cancel()
+
+
+@pytest.mark.parametrize("saved, expected", [(False, False), (True, True), (None, True)])
+def test_settings_dialog_round_trips_the_update_check(qapp, saved, expected):
+    """PRIVACY.md promises the update check can be turned off in Settings."""
+    from src.ui.settings_dialog import SettingsDialog
+    settings = {} if saved is None else {"check_for_updates": saved}
+    dlg = SettingsDialog(settings)
+    try:
+        assert dlg.chk_updates.isChecked() is expected
+        assert dlg.get_settings()["check_for_updates"] is expected
+    finally:
+        dlg.deleteLater()
